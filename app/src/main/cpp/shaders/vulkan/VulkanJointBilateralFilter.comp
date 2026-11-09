@@ -1,0 +1,44 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Vulkan GLSL uses rgb10_a2 for RGBA10A2 storage image contracts.
+layout(binding = 0, rgb10_a2) uniform readonly image2D inputImage;
+layout(binding = 1, r16f) uniform readonly image2D guideImage;
+layout(binding = 2, rgb10_a2) uniform writeonly image2D outputImage;
+
+const float SIGMA_S = 2.4;
+const float SIGMA_R = 0.082;
+const float TWO_SIGMA_S_SQ = 2.0 * SIGMA_S * SIGMA_S;
+const float TWO_SIGMA_R_SQ = 2.0 * SIGMA_R * SIGMA_R;
+
+void main() {
+    ivec2 gID = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inputImage);
+    if (gID.x >= size.x || gID.y >= size.y) {
+        return;
+    }
+
+    float centerGuide = imageLoad(guideImage, gID).r;
+    vec4 sumColor = vec4(0.0);
+    float sumWeight = 0.0;
+
+    for (int dy = -2; dy <= 2; dy++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            ivec2 samplePos = clamp(gID + ivec2(dx, dy), ivec2(0), size - ivec2(1));
+            vec4 sampleColor = imageLoad(inputImage, samplePos);
+            float sampleGuide = imageLoad(guideImage, samplePos).r;
+
+            float dSq = float(dx * dx + dy * dy);
+            float spatialWeight = exp(-dSq / TWO_SIGMA_S_SQ);
+            float diff = sampleGuide - centerGuide;
+            float rangeWeight = exp(-(diff * diff) / TWO_SIGMA_R_SQ);
+            float totalWeight = spatialWeight * rangeWeight;
+
+            sumColor += sampleColor * totalWeight;
+            sumWeight += totalWeight;
+        }
+    }
+
+    imageStore(outputImage, gID, sumColor / max(sumWeight, 1e-6));
+}

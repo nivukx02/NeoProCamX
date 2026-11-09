@@ -1,0 +1,68 @@
+<style>
+  .stage{display:grid;grid-template-columns:minmax(260px,390px) 1fr;gap:22px;align-items:start;margin-top:16px}
+  .phone{height:620px;border-radius:30px;overflow:hidden;background:#070809;position:relative;border:1px solid rgba(255,255,255,.18);box-shadow:0 18px 58px rgba(0,0,0,.45)}
+  .preview{position:absolute;inset:0;background:linear-gradient(145deg,#243230,#111 46%,#20240f);opacity:.94}
+  .topbar{position:absolute;left:14px;right:14px;top:14px;height:38px;display:flex;align-items:center;justify-content:space-between}
+  .pill{border-radius:999px;background:rgba(0,0,0,.48);border:1px solid rgba(255,255,255,.15);color:#fff;padding:6px 9px;font-size:10px}
+  .modebar{position:absolute;left:0;right:0;bottom:82px;text-align:center;color:#fff;font-size:11px;letter-spacing:.6px}.modebar span{display:inline-block;margin:0 6px;opacity:.62}.modebar b{color:#ffd21f}
+  .dock{position:absolute;left:0;right:0;bottom:0;height:76px;background:rgba(0,0,0,.74);display:flex;align-items:center;justify-content:center;gap:34px}
+  .thumb{width:34px;height:34px;border-radius:8px;background:linear-gradient(135deg,#5b7578,#151617);border:1px solid rgba(255,255,255,.22)}
+  .shutter{width:58px;height:58px;border-radius:50%;border:4px solid rgba(255,255,255,.9);box-shadow:inset 0 0 0 14px #e84437;background:#151515}
+  .gear{width:34px;height:34px;border-radius:50%;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22)}
+  .prostrip{position:absolute;left:0;right:0;bottom:108px;height:88px;background:linear-gradient(180deg,rgba(0,0,0,.18),rgba(0,0,0,.72));border-top:1px solid rgba(255,255,255,.1);border-bottom:1px solid rgba(255,255,255,.08)}
+  .auto{position:absolute;left:14px;top:13px;color:#fff;text-align:center;width:44px}.auto .circle{display:inline-flex;width:30px;height:30px;border-radius:50%;align-items:center;justify-content:center;background:#fff;color:#222;font-weight:800;font-size:18px}.auto span{display:block;margin-top:3px;font-size:10px}
+  .scale{position:absolute;left:70px;right:14px;top:4px;height:38px;color:#fff}
+  .scale-value{position:absolute;left:50%;top:-4px;transform:translateX(-50%);font-size:20px;font-weight:500}
+  .ticks{position:absolute;left:0;right:0;top:24px;height:22px;display:flex;align-items:flex-start;justify-content:space-between}.tick{width:2px;height:14px;background:rgba(255,255,255,.86);border-radius:2px}.tick.short{height:7px;opacity:.68}.tick.active{height:30px;background:#ffd21f;box-shadow:0 0 10px rgba(255,210,31,.42);margin-top:-8px}
+  .scale-labels{position:absolute;left:54px;right:54px;top:43px;display:flex;justify-content:space-between;color:rgba(255,255,255,.78);font-size:12px}
+  .divider{position:absolute;top:49px;bottom:0;width:1px;background:rgba(255,255,255,.16)}.d1{left:25%}.d2{left:50%}.d3{left:75%}
+  .tiles{position:absolute;left:0;right:0;bottom:0;height:39px;display:grid;grid-template-columns:repeat(6,1fr);align-items:center;text-align:center;color:#fff}
+  .tile .box{display:inline-flex;align-items:center;justify-content:center;min-width:27px;height:20px;border:2px solid rgba(255,255,255,.82);border-radius:3px;font-size:10px;font-weight:700;padding:0 2px}.tile.active .box{border-color:#ffd21f;color:#ffd21f}.tile .val{display:block;margin-top:2px;font-size:9px;color:rgba(255,255,255,.74);line-height:1}.tile.active .val{color:#ffd21f}
+  .safe{position:absolute;left:14px;right:14px;bottom:206px;height:28px;border-radius:999px;background:rgba(0,0,0,.32);border:1px solid rgba(255,255,255,.1);display:flex;align-items:center;justify-content:space-around;color:rgba(255,255,255,.78);font-size:9px}
+  .notes{padding-top:4px}.notes h3{margin:0 0 8px}.notes p,.notes li{color:rgba(255,255,255,.76);line-height:1.5}.notes ul{padding-left:20px}
+  .step{display:inline-block;border-radius:999px;background:#ffd21f;color:#171717;font-weight:700;font-size:12px;padding:5px 10px;margin-bottom:10px}
+  @media(max-width:900px){.stage{grid-template-columns:1fr}.phone{height:560px}}
+</style>
+
+<h2>Step 1: Pro Controller Size</h2>
+<p class="subtitle">Ultra-compact version, closer to your reference image. This step is only about the pro controller bar.</p>
+
+<div class="stage">
+  <div class="phone">
+    <div class="preview"></div>
+    <div class="topbar"><span class="pill">LOG 4K60</span><span class="pill">10-bit</span><span class="pill">⚙</span></div>
+    <div class="safe"><span>ISO 500</span><span>1/120</span><span>5600K</span><span>AF-C</span></div>
+    <div class="prostrip">
+      <div class="auto"><div class="circle">A</div><span>Manual</span></div>
+      <div class="scale">
+        <div class="scale-value">500</div>
+        <div class="ticks">
+          <div class="tick short"></div><div class="tick"></div><div class="tick short"></div><div class="tick"></div><div class="tick short"></div><div class="tick active"></div><div class="tick short"></div><div class="tick"></div><div class="tick short"></div><div class="tick"></div><div class="tick short"></div>
+        </div>
+        <div class="scale-labels"><span>250</span><span>1000</span></div>
+      </div>
+      <div class="divider d1"></div><div class="divider d2"></div><div class="divider d3"></div>
+      <div class="tiles">
+        <div class="tile"><div class="box">+/-</div><span class="val">0</span></div>
+        <div class="tile active"><div class="box">ISO</div><span class="val">500</span></div>
+        <div class="tile"><div class="box">S</div><span class="val">0.4</span></div>
+        <div class="tile"><div class="box">WB</div><span class="val">☁</span></div>
+        <div class="tile"><div class="box">AF</div><span class="val">AF</span></div>
+        <div class="tile"><div class="box">▣</div><span class="val">Meter</span></div>
+      </div>
+    </div>
+    <div class="modebar"><span>VIDEO</span><b>PRO</b><span>HDR</span><span>LOG</span><span>RAW</span></div>
+    <div class="dock"><div class="thumb"></div><div class="shutter"></div><div class="gear"></div></div>
+  </div>
+
+  <div class="notes">
+    <span class="step">STEP 1 OF 4</span>
+    <h3>Pro Controller Fix</h3>
+    <ul>
+      <li>Bar is now very small, reference-like, and does not cover the center preview.</li>
+      <li>Scale, yellow active tick, value, and parameter tiles stay visible in one strip.</li>
+      <li>Only active in Pro mode; other modes can show a collapsed status capsule.</li>
+    </ul>
+    <p>Approve this pro controller size first. Then I will show Step 2: shutter button.</p>
+  </div>
+</div>

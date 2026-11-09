@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NeoProCamX Reference Pro Controller</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --yellow: #ffd21c;
+      --white: #f8f8f8;
+      --dim: rgba(255, 255, 255, .36);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      background: #020202;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+
+    .screen {
+      width: min(100vw, 1064px);
+      aspect-ratio: 1064 / 476;
+      position: relative;
+      overflow: hidden;
+      background: #050505;
+    }
+
+    .screen svg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .scroll-hotzone {
+      position: absolute;
+      left: 18.6%;
+      right: 5.4%;
+      top: 18.5%;
+      height: 18%;
+      overflow-x: auto;
+      opacity: .01;
+      scrollbar-width: none;
+      cursor: ew-resize;
+    }
+
+    .scroll-hotzone::-webkit-scrollbar {
+      display: none;
+    }
+
+    .scroll-run {
+      width: 170%;
+      height: 100%;
+    }
+
+    @media (max-width: 720px) {
+      body {
+        align-items: start;
+        padding-top: 14px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="screen" aria-label="Reference-matched Pro controller target">
+    <svg viewBox="0 0 1064 476" role="img" aria-label="NeoProCamX Pro controller matched to the reference image">
+      <defs>
+        <filter id="softScene" x="-10%" y="-10%" width="120%" height="120%">
+          <feGaussianBlur stdDeviation="0.45"/>
+          <feColorMatrix type="saturate" values="1.05"/>
+        </filter>
+        <linearGradient id="rightShade" x1="0" x2="1" y1="0" y2="0">
+          <stop offset="0" stop-color="#000" stop-opacity=".05"/>
+          <stop offset=".58" stop-color="#000" stop-opacity=".05"/>
+          <stop offset="1" stop-color="#000" stop-opacity=".55"/>
+        </linearGradient>
+        <style>
+          .ui-white { fill: var(--white); }
+          .ui-stroke { stroke: var(--white); stroke-width: 5.2; fill: none; stroke-linecap: square; stroke-linejoin: round; }
+          .thin-stroke { stroke: rgba(255,255,255,.92); stroke-width: 4; stroke-linecap: square; }
+          .yellow { fill: var(--yellow); }
+          .yellow-stroke { stroke: var(--yellow); stroke-width: 5.2; fill: none; stroke-linejoin: round; }
+          .value-text { font-size: 31px; font-weight: 400; text-anchor: middle; dominant-baseline: middle; }
+          .label-text { font-size: 31px; font-weight: 400; text-anchor: middle; dominant-baseline: middle; }
+          .icon-text { font-size: 31px; font-weight: 700; text-anchor: middle; dominant-baseline: middle; }
+          .dim-stroke { stroke: rgba(255,255,255,.34); stroke-width: 5.2; fill: none; stroke-linecap: round; }
+          .dim-fill { fill: rgba(255,255,255,.34); }
+        </style>
+      </defs>
+
+      <image href="/files/reference-pro-controller.jpg" x="0" y="0" width="1064" height="476" opacity=".76" filter="url(#softScene)" preserveAspectRatio="none"/>
+      <rect x="0" y="0" width="1064" height="476" fill="rgba(0,0,0,.12)"/>
+      <rect x="0" y="0" width="1064" height="476" fill="url(#rightShade)"/>
+
+      <line x1="352" y1="0" x2="352" y2="476" stroke="rgba(255,255,255,.24)" stroke-width="1.5"/>
+      <line x1="724" y1="0" x2="724" y2="476" stroke="rgba(255,255,255,.24)" stroke-width="1.5"/>
+
+      <circle cx="99" cy="135" r="30" class="ui-white"/>
+      <text x="99" y="149" fill="#2f2f2f" font-size="47" font-weight="800" text-anchor="middle">A</text>
+      <text x="101" y="205" class="ui-white" font-size="30" font-weight="400" text-anchor="middle">Manual</text>
+
+      <text x="536" y="58" class="ui-white" font-size="39" font-weight="400" text-anchor="middle">500</text>
+
+      <g id="ruler">
+        <line x1="217" y1="114" x2="217" y2="139" class="thin-stroke"/>
+        <line x1="264" y1="112" x2="264" y2="141" class="thin-stroke"/>
+        <line x1="312" y1="111" x2="312" y2="141" class="thin-stroke"/>
+        <line x1="363" y1="112" x2="363" y2="140" class="thin-stroke"/>
+        <line x1="415" y1="111" x2="415" y2="141" class="thin-stroke"/>
+        <line x1="467" y1="113" x2="467" y2="139" class="thin-stroke"/>
+        <line x1="536" y1="92" x2="536" y2="157" stroke="var(--yellow)" stroke-width="7" stroke-linecap="square"/>
+        <line x1="595" y1="112" x2="595" y2="141" class="thin-stroke"/>
+        <line x1="647" y1="113" x2="647" y2="139" class="thin-stroke"/>
+        <line x1="700" y1="111" x2="700" y2="141" class="thin-stroke"/>
+        <line x1="763" y1="112" x2="763" y2="141" class="thin-stroke"/>
+        <line x1="813" y1="113" x2="813" y2="139" class="thin-stroke"/>
+        <line x1="860" y1="113" x2="860" y2="139" class="thin-stroke"/>
+      </g>
+
+      <text x="369" y="195" class="ui-white label-text">250</text>
+      <text x="705" y="195" class="ui-white label-text">1000</text>
+
+      <g id="ev">
+        <path d="M51 288 H101 V340 H51 Z" class="ui-stroke"/>
+        <line x1="52" y1="340" x2="101" y2="289" class="ui-stroke"/>
+        <text x="64" y="306" class="ui-white" font-size="29" font-weight="800" text-anchor="middle">+</text>
+        <text x="87" y="333" class="ui-white" font-size="29" font-weight="800" text-anchor="middle">-</text>
+        <text x="78" y="393" class="ui-white value-text">0</text>
+      </g>
+
+      <g id="iso">
+        <rect x="227" y="289" width="58" height="50" rx="2" class="yellow-stroke"/>
+        <text x="256" y="317" class="yellow icon-text">ISO</text>
+        <text x="256" y="394" class="yellow value-text">500</text>
+      </g>
+
+      <g id="shutter">
+        <rect x="411" y="289" width="58" height="50" rx="2" class="ui-stroke"/>
+        <text x="440" y="317" class="ui-white icon-text">S</text>
+        <text x="440" y="394" class="ui-white value-text">0.4</text>
+      </g>
+
+      <g id="wb">
+        <rect x="595" y="289" width="58" height="50" rx="2" class="ui-stroke"/>
+        <text x="624" y="317" class="ui-white icon-text">WB</text>
+        <path d="M609 390 C610 382 617 379 623 382 C626 375 637 377 639 386 C645 386 650 390 650 396 C650 402 645 405 638 405 H614 C608 405 604 401 604 396 C604 392 606 390 609 390 Z" fill="none" stroke="var(--white)" stroke-width="4" stroke-linejoin="round"/>
+      </g>
+
+      <g id="af" opacity=".9">
+        <circle cx="811" cy="314" r="27" class="dim-stroke"/>
+        <circle cx="811" cy="314" r="10" class="dim-stroke"/>
+        <line x1="811" y1="286" x2="811" y2="300" class="dim-stroke"/>
+        <line x1="811" y1="328" x2="811" y2="342" class="dim-stroke"/>
+        <text x="811" y="394" class="dim-fill value-text">AF</text>
+      </g>
+
+      <g id="meter">
+        <path d="M967 292 H991 M1013 292 H1037 M967 339 H991 M1013 339 H1037" stroke="var(--white)" stroke-width="8" stroke-linecap="square"/>
+        <path d="M967 292 V312 M1037 292 V312 M967 339 V319 M1037 339 V319" stroke="var(--white)" stroke-width="8" stroke-linecap="square"/>
+        <circle cx="1002" cy="316" r="21" fill="var(--white)"/>
+        <circle cx="1002" cy="316" r="8" fill="#030303"/>
+        <rect x="987" y="378" width="31" height="23" rx="1.5" class="ui-stroke" stroke-width="3.2"/>
+        <line x1="993" y1="384" x2="993" y2="395" stroke="var(--white)" stroke-width="2"/>
+        <line x1="1012" y1="384" x2="1012" y2="395" stroke="var(--white)" stroke-width="2"/>
+        <circle cx="1002" cy="390" r="2.5" fill="var(--white)"/>
+      </g>
+    </svg>
+
+    <div class="scroll-hotzone" aria-label="Scrollable ISO adjust ruler">
+      <div class="scroll-run"></div>
+    </div>
+  </main>
+</body>
+</html>

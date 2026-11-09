@@ -1,0 +1,77 @@
+#version 450
+
+// OmniClarity Engine — §1 Photon HDR Fusion Core (motion-compensated dual-exposure fusion).
+//
+// 100% classical, zero learned weights. Fuses a long and a short exposure (or a dual-conversion-gain
+// readout) scaled to common scene radiance, using the Argus motion field to align the short exposure
+// to the long exposure BEFORE blending (motion-compensated, not a static blend) so moving subjects do
+// not ghost. Runs first, per raw exposure pair, before any tone/colour stage.
+//
+//   confidence_long(px) = smoothstep(highlightThreshold, clipThreshold, luma(long_scaled))
+//   fused(px)           = (1 - confidence_long) * long_scaled + confidence_long * short_scaled
+//
+// long_scaled / short_scaled bring both exposures to a common radiance. Where the long exposure
+// approaches its clip point confidence_long -> 1 and highlight detail comes from the aligned short
+// exposure; elsewhere the cleaner (higher-SNR) long exposure dominates. When motion compensation is
+// disabled (no valid flow) this degrades to a static radiance blend.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly uniform highp image2D uLongExposure;
+layout(binding = 1, rgba16f) readonly uniform highp image2D uShortExposure;
+layout(binding = 2, rg16f) readonly uniform highp image2D uMotionField;
+layout(binding = 3, rgba16f) writeonly uniform highp image2D uFused;
+
+layout(push_constant) uniform PhotonFusionParams {
+    float highlightThreshold; // luma where the short exposure starts taking over
+    float clipThreshold;      // luma at/above which the long exposure is fully clipped
+    float longScale;          // radiance normalization for the long exposure
+    float shortScale;         // radiance normalization for the short exposure (~exposure ratio)
+    float motionCompEnabled;  // 0 => static blend, 1 => warp short by the Argus flow first
+    float maxFlow;            // clamp on |flow| used to align the short exposure, px
+} uParams;
+
+float lumaOf(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+ivec2 clampCoord(ivec2 c, ivec2 s) {
+    return clamp(c, ivec2(0), s - ivec2(1));
+}
+
+vec3 shortBilinear(vec2 c, ivec2 s) {
+    ivec2 b = ivec2(floor(c));
+    vec2 f = fract(c);
+    vec3 a = imageLoad(uShortExposure, clampCoord(b, s)).rgb;
+    vec3 bx = imageLoad(uShortExposure, clampCoord(b + ivec2(1, 0), s)).rgb;
+    vec3 cy = imageLoad(uShortExposure, clampCoord(b + ivec2(0, 1), s)).rgb;
+    vec3 d = imageLoad(uShortExposure, clampCoord(b + ivec2(1, 1), s)).rgb;
+    return mix(mix(a, bx, f.x), mix(cy, d, f.x), f.y);
+}
+
+void main() {
+    ivec2 s = imageSize(uFused);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= s.x || p.y >= s.y) {
+        return;
+    }
+
+    vec3 longRgb = imageLoad(uLongExposure, p).rgb;
+
+    // Align the short exposure to the long-exposure grid using the Argus motion field.
+    vec2 flow = imageLoad(uMotionField, clampCoord(p, s)).rg;
+    float mag = length(flow);
+    if (mag > uParams.maxFlow && mag > 1e-5) {
+        flow *= uParams.maxFlow / mag;
+    }
+    vec2 src = uParams.motionCompEnabled > 0.5 ? (vec2(p) - flow) : vec2(p);
+    vec3 shortRgb = shortBilinear(src, s);
+
+    vec3 longScaled = longRgb * uParams.longScale;
+    vec3 shortScaled = shortRgb * uParams.shortScale;
+
+    float c = smoothstep(uParams.highlightThreshold, uParams.clipThreshold, lumaOf(longScaled));
+    vec3 fused = mix(longScaled, shortScaled, c);
+
+    imageStore(uFused, p, vec4(fused, 1.0));
+}

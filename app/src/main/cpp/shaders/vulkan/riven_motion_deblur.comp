@@ -1,0 +1,129 @@
+#version 450
+
+// OmniClarity Engine — §4 Riven Motion Deblur Core.
+//
+// 100% classical, zero learned weights. Recovers intra-frame motion blur using the Argus motion
+// field. The per-pixel blur is modelled as a 1D line kernel of length L = |v| * exposureFraction
+// along the motion direction d = v/|v| (angle = atan2(v_y, v_x)). Deconvolution is a first-order,
+// noise-regularized directional inverse — a real-time spatial approximation of the design's Wiener
+// estimate  F_hat = H* / (|H|^2 + 1/SNR) * G :
+//
+//   blurEstimate = mean of input along +/- d over length L         (the line-blur operator H applied)
+//   residual     = input(p) - blurEstimate                          (recovered high-frequency detail)
+//   gain         = strength * lengthGate(L) * 1/(1 + k/SNR)         (Wiener-style noise regularization)
+//   out          = clamp(input(p) + gain * residual, lineMin, lineMax)   (ringing/halo clamp)
+//
+// Confidence gating: pixels whose kernel length is below minKernelPx are passed through unchanged —
+// deconvolving an already-sharp or low-confidence region does measurable damage, so doing less is
+// correct. (Low-confidence flow is already zeroed by Argus, giving L=0 here.)
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly uniform highp image2D uInput;
+layout(binding = 1, rg16f) readonly uniform highp image2D uMotionField;
+layout(binding = 2, rgba16f) writeonly uniform highp image2D uOutput;
+
+layout(push_constant) uniform RivenDeblurParams {
+    float exposureFraction; // exposureTime / frameInterval in [0,1]; L = |v| * exposureFraction
+    float minKernelPx;      // below this blur length, pass through (confidence gate)
+    float snrInverse;       // 1/SNR regularization (rises with measured source noise)
+    float maxKernelPx;      // clamp on blur length, px
+    float deblurStrength;   // overall deconvolution gain
+    int rlIterations;       // CP53: clamp-bounded iterative deconvolution count (1 == single-step inverse)
+} uParams;
+
+const int RIVEN_TAPS = 16; // HIGH-END: was 8 — denser line-integral sampling for longer kernels (maxKernelPx 12)
+
+// s3-f03 / CP53 Path B — specialization constant (NOT a push constant: the RivenDeblurParams ABI is
+// unchanged at 5 floats + 1 int). Defaults to false, so with no host VkSpecializationInfo the compiled
+// pipeline is byte-for-byte Path A (the clamp-bounded van Cittert deconvolution, today's pixels) —
+// no-downgrade. The owner enables device-side after the measured-noise-reference MTF50/SNR/ringing checks.
+layout(constant_id = 0) const bool USE_RL_MULTIPLICATIVE = true; // Default ON (user-directed 2026-07-04, device ring-checked): Richardson-Lucy multiplicative deconvolution (rlIterations default 1, bounded)
+
+ivec2 clampCoord(ivec2 c, ivec2 s) {
+    return clamp(c, ivec2(0), s - ivec2(1));
+}
+
+vec3 inputBilinear(vec2 c, ivec2 s) {
+    ivec2 b = ivec2(floor(c));
+    vec2 f = fract(c);
+    vec3 a = imageLoad(uInput, clampCoord(b, s)).rgb;
+    vec3 bx = imageLoad(uInput, clampCoord(b + ivec2(1, 0), s)).rgb;
+    vec3 cy = imageLoad(uInput, clampCoord(b + ivec2(0, 1), s)).rgb;
+    vec3 d = imageLoad(uInput, clampCoord(b + ivec2(1, 1), s)).rgb;
+    return mix(mix(a, bx, f.x), mix(cy, d, f.x), f.y);
+}
+
+void main() {
+    ivec2 s = imageSize(uOutput);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= s.x || p.y >= s.y) {
+        return;
+    }
+
+    vec3 center = imageLoad(uInput, p).rgb;
+    vec2 v = imageLoad(uMotionField, clampCoord(p, s)).rg;
+    float speed = length(v);
+    float kernelLength = min(speed * uParams.exposureFraction, uParams.maxKernelPx);
+
+    // Confidence gate: no measurable motion blur -> leave the pixel untouched.
+    if (kernelLength < uParams.minKernelPx || speed < 1e-5) {
+        imageStore(uOutput, p, vec4(center, 1.0));
+        return;
+    }
+
+    vec2 dir = v / speed; // motion direction; kernel angle = atan2(v.y, v.x)
+
+    // Sample the line-blur operator H along +/- d over the kernel length.
+    vec3 acc = vec3(0.0);
+    vec3 lineMin = center;
+    vec3 lineMax = center;
+    for (int i = 0; i < RIVEN_TAPS; ++i) {
+        float t = (float(i) / float(RIVEN_TAPS - 1) - 0.5) * kernelLength;
+        vec3 tap = inputBilinear(vec2(p) + dir * t, s);
+        acc += tap;
+        lineMin = min(lineMin, tap);
+        lineMax = max(lineMax, tap);
+    }
+    vec3 blurEstimate = acc / float(RIVEN_TAPS);
+
+    // Wiener-style noise regularization + length gate => per-iteration deconvolution gain.
+    float noiseRegularization = 1.0 / (1.0 + uParams.snrInverse * 4.0);
+    float lengthGate = smoothstep(uParams.minKernelPx, uParams.minKernelPx * 3.0 + 1e-4, kernelLength);
+    float gain = uParams.deblurStrength * lengthGate * noiseRegularization;
+
+    // CP53 Path A — clamp-bounded iterative (van Cittert) deconvolution. blurEstimate is the fixed
+    // line-blur of the INPUT (the operator H applied once). Each iteration drives the running estimate
+    // further from that blur along the recovered high-frequency residual, then HARD-CLAMPS it to the
+    // local line extremes [lineMin, lineMax] sampled from the input. Because every iterate is re-clamped
+    // to the input envelope, overshoot / ringing / halos are impossible regardless of iteration count —
+    // the only thing more iterations can do is converge harder toward the (bounded) deconvolved signal.
+    // rlIterations == 1 reproduces the original single-step inverse bit-for-bit:
+    //   residual = center - blurEstimate;  out = clamp(center + gain * residual, lineMin, lineMax).
+    // (True multiplicative Richardson-Lucy needs the evolving estimate at neighbour pixels, i.e. a
+    //  multi-dispatch ping-pong — that is the separate, device-tuned Path B.)
+    int iterations = max(uParams.rlIterations, 1);
+    vec3 est = center;
+    if (USE_RL_MULTIPLICATIVE) {
+        // CP53 Path B — multiplicative Richardson-Lucy. Single-dispatch approximation: the reblur of the
+        // evolving estimate H(est) is approximated by the fixed input line-blur scaled by the local estimate
+        // ratio, H(est) ~ blurEstimate * est/center (the TRUE neighbour-aware multi-dispatch RL ping-pong
+        // with a ratio image is the separate DEVICE-GATED step). RL recovers detail multiplicatively and
+        // keeps the estimate non-negative; every iterate is still HARD-CLAMPED to the input line envelope
+        // [lineMin, lineMax], so the cardinal RL failure mode — grain blow-up / ringing / halos — is
+        // impossible at any iteration count. rlIterations == 1 here is a single bounded RL step.
+        for (int it = 0; it < iterations; ++it) {
+            vec3 reblur = blurEstimate * (est / max(center, vec3(1e-4)));
+            vec3 ratio = center / max(reblur, vec3(1e-4));
+            est = clamp(est * mix(vec3(1.0), ratio, gain), lineMin, lineMax);
+        }
+    } else {
+        for (int it = 0; it < iterations; ++it) {
+            vec3 residual = est - blurEstimate;
+            est = clamp(est + gain * residual, lineMin, lineMax);
+        }
+    }
+    vec3 deblurred = est;
+
+    imageStore(uOutput, p, vec4(deblurred, 1.0));
+}

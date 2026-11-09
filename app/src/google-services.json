@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "5417040768",
+    "project_id": "nivukx-camx",
+    "storage_bucket": "nivukx-camx.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:5417040768:android:2245d144b7c270107bdf65",
+        "android_client_info": {
+          "package_name": "com.neoproc.neoproccamx"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBTVQiZTyyuQKF6K7GM86-2dzXknl15r64"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

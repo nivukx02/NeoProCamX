@@ -1,0 +1,15 @@
+{
+  "com.neoproc.neoproccamx.ui.PlaybackEnduranceFixtureInstrumentedTest#validateContinuousVideoOnlyPacketExactFixture": {
+    "neoPlaybackFixtureOutputPath": "/sdcard/Android/data/com.neoproc.neoproccamx/files/neo-qa-playback/lq034-original-4k-video-only-continuous-10min.mp4"
+  },
+  "com.neoproc.neoproccamx.ui.PlaybackEnduranceFixtureInstrumentedTest#buildContinuousVideoOnlyPacketExactFixture": {
+    "neoPlaybackFixtureSourceUri": "file:///sdcard/Android/data/com.neoproc.neoproccamx/files/neo-qa-playback/lq034-original-4k-short.mp4",
+    "neoPlaybackFixtureDurationSeconds": "600",
+    "neoPlaybackFixtureOutputName": "lq034-original-4k-video-only-continuous-10min.mp4"
+  },
+  "com.neoproc.neoproccamx.ui.PlaybackEnduranceFixtureInstrumentedTest#buildContinuousPacketExactFixture": {
+    "neoPlaybackFixtureSourceUri": "file:///sdcard/Android/data/com.neoproc.neoproccamx/files/neo-qa-playback/lq034-original-4k-short.mp4",
+    "neoPlaybackFixtureDurationSeconds": "600",
+    "neoPlaybackFixtureOutputName": "lq034-original-4k-av-continuous-10min.mp4"
+  }
+}

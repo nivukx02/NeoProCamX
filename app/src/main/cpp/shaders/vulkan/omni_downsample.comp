@@ -1,0 +1,37 @@
+#version 450
+
+// OmniClarity — box-downsample a full-res frame to reduced resolution so Argus optical flow runs
+// cheaply (cost ~1/divisor^2) while covering divisor x the real-world motion range. Classical.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly uniform highp image2D uFull;
+layout(binding = 1, rgba16f) writeonly uniform highp image2D uReduced;
+
+layout(push_constant) uniform OmniDownsampleParams {
+    int divisor;
+} uParams;
+
+ivec2 clampCoord(ivec2 c, ivec2 s) {
+    return clamp(c, ivec2(0), s - ivec2(1));
+}
+
+void main() {
+    ivec2 reducedSize = imageSize(uReduced);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= reducedSize.x || p.y >= reducedSize.y) {
+        return;
+    }
+    int d = max(uParams.divisor, 1);
+    ivec2 fullSize = imageSize(uFull);
+    ivec2 base = p * d;
+    vec4 acc = vec4(0.0);
+    float n = 0.0;
+    for (int y = 0; y < d; ++y) {
+        for (int x = 0; x < d; ++x) {
+            acc += imageLoad(uFull, clampCoord(base + ivec2(x, y), fullSize));
+            n += 1.0;
+        }
+    }
+    imageStore(uReduced, p, acc / max(n, 1.0));
+}

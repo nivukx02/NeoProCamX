@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CamX</string>
+    <string name="app_version">v1.0</string>
+
+    <!-- Permissions -->
+    <string name="permission_camera_required">Camera permission is required to use this app.</string>
+    <string name="permission_audio_required">Microphone permission is required for video recording.</string>
+    <string name="permission_storage_required">Storage permission is required to save photos and videos.</string>
+    <string name="permission_camera_title">Camera access required</string>
+    <string name="permission_camera_rationale">Camera access is required for preview, focus, capture, and recording. Grant it to continue.</string>
+    <string name="permission_camera_permanently_denied">Camera access is disabled for CamX. Open App Info and allow Camera to restore the preview.</string>
+    <string name="permission_try_again">Try again</string>
+    <string name="not_now">Not now</string>
+    <string name="go_to_settings">Go to Settings</string>
+
+    <!-- Modes -->
+    <string name="mode_auto">AUTO</string>
+    <string name="mode_photo">PHOTO</string>
+    <string name="mode_video">Video</string>
+    <string name="mode_pro">Pro</string>
+    <string name="mode_raw">Raw</string>
+    <string name="mode_hdr">XDR</string>
+    <string name="mode_slo_mo">SLO-MO</string>
+    <string name="mode_timelapse">TIMELAPSE</string>
+
+    <!-- Controls -->
+    <string name="control_ai">AI</string>
+    <string name="control_iso">ISO</string>
+    <string name="control_shutter">SHUTTER</string>
+    <string name="control_shutter_short">S</string>
+    <string name="control_wb">WB</string>
+    <string name="control_focus">FOCUS</string>
+    <string name="control_ev">EV</string>
+    <string name="control_ev_adjust">+/-</string>
+    <string name="control_ev_zero">0 EV</string>
+    <string name="control_ae">AE</string>
+    <string name="control_auto">AUTO</string>
+    <string name="control_auto_short">A</string>
+    <string name="control_af">AF</string>
+    <string name="control_meter">Meter</string>
+    <string name="control_grid">Grid</string>
+    <string name="control_raw">RAW</string>
+    <string name="control_raw_video">RAW VIDEO</string>
+    <string name="control_iso_auto">ISO AUTO</string>
+    <string name="control_shutter_default">1/60</string>
+    <string name="control_wb_default">6500K</string>
+    <string name="control_focus_infinity">INF</string>
+    <string name="metering_matrix">MATRIX</string>
+    <string name="color_profile_rec709">709</string>
+
+    <!-- Flash -->
+    <string name="flash_off">Flash Off</string>
+    <string name="flash_auto">Flash Auto</string>
+    <string name="flash_on">Flash On</string>
+    <string name="flash_torch">Torch</string>
+
+    <!-- Recording -->
+    <string name="rec_start">Start Recording</string>
+    <string name="rec_stop">Stop Recording</string>
+    <string name="rec_pause">Pause</string>
+    <string name="rec_resume">Resume</string>
+    <string name="media_export_mov">EXPORT MOV</string>
+    <string name="media_exporting_progress">EXPORTING %1$d%%</string>
+
+    <!-- Capture -->
+    <string name="capture_photo">Capture Photo</string>
+    <string name="capture_raw">Capture RAW</string>
+    <string name="capture_hdr">XDR Capture</string>
+    <string name="capture_night">Night Mode</string>
+
+    <!-- Color Profiles -->
+    <string name="profile_natural">Natural</string>
+    <string name="profile_cinematic">Cinematic</string>
+    <string name="profile_log">LOG</string>
+    <string name="profile_bleach">Bleach Bypass</string>
+    <string name="profile_vintage">Warm Vintage</string>
+    <string name="profile_teal">Cool Teal</string>
+
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_camera_title">Camera Settings</string>
+    <string name="settings_camera_subtitle">Record, focus, monitoring, and system controls</string>
+    <string name="settings_video">Video Settings</string>
+    <string name="settings_resolution">Resolution</string>
+    <string name="settings_fps">Frame Rate</string>
+    <string name="settings_bitrate">Bitrate</string>
+    <string name="settings_codec">Video Codec</string>
+    <string name="settings_audio">Audio Source</string>
+    <string name="settings_stabilization">Stabilization</string>
+    <string name="settings_noise_reduction">Noise Reduction</string>
+    <string name="settings_preparing">Preparing…</string>
+    <string name="settings_estimating">estimating…</string>
+
+    <!-- Runtime health -->
+    <string name="health_chip_format">%1$s %2$s</string>
+    <string name="health_live_metrics">Live metrics</string>
+    <string name="health_state_format">State: %1$s</string>
+    <string name="health_metric_format">%1$s: %2$s</string>
+    <string name="close">Close</string>
+    <string name="zoom_default">1.0x</string>
+
+    <!-- Messages -->
+    <string name="msg_saved_photo">Photo saved</string>
+    <string name="msg_photo_capture_unavailable">Photo capture is temporarily unavailable</string>
+    <string name="msg_saved_raw">RAW DNG saved</string>
+    <string name="msg_video_saved_banner">VIDEO SAVED</string>
+    <string name="msg_video_saving_banner">Saving video…</string>
+    <string name="msg_recording_started">Recording started</string>
+    <string name="msg_recording_stopped">Recording saved</string>
+    <string name="msg_hdr_processing">Processing XDR…</string>
+    <string name="msg_night_processing">Processing Night Mode…</string>
+    <string name="msg_lut_loaded">LUT loaded</string>
+    <string name="msg_no_raw_support">RAW not supported on this device</string>
+
+    <!-- Focus -->
+    <string name="af_mode_continuous">CAF</string>
+    <string name="af_mode_continuous_video">AF-C</string>
+    <string name="af_mode_single">AF-S</string>
+    <string name="af_mode_manual">MF</string>
+    <string name="af_mode_face">FACE</string>
+    <string name="focus_assist_tap">Tap focus</string>
+    <string name="focus_assist_face">Face autofocus</string>
+    <string name="focus_assist_eye">Eye autofocus</string>
+
+    <!-- Content descriptions -->
+    <string name="cd_shutter_button">Shutter/Record button</string>
+    <string name="cd_flip_camera">Switch camera</string>
+    <string name="cd_gallery">Open gallery</string>
+    <string name="cd_flash_button">Flash mode</string>
+    <string name="cd_settings">Camera settings</string>
+    <string name="cd_grid_toggle">Toggle grid overlay</string>
+    <string name="cd_raw_toggle">Toggle RAW capture</string>
+    <string name="playback_muted">Muted</string>
+    <string name="player_back">Back</string>
+    <string name="player_previous">Previous video</string>
+    <string name="player_play">Play</string>
+    <string name="player_pause">Pause</string>
+    <string name="player_next">Next video</string>
+    <string name="player_mute">Mute</string>
+    <string name="player_unmute">Unmute</string>
+    <string name="player_speed">Playback speed: %1$s</string>
+    <string name="player_playback_failed">This video cannot be played on this device.</string>
+    <string name="media_export_started">MOV export started</string>
+    <string name="player_seek_backward_feedback">↶ 10 sec</string>
+    <string name="player_seek_forward_feedback">10 sec ↷</string>
+    <string name="player_preview">Play video preview</string>
+    <string name="player_time_zero" translatable="false">00:00</string>
+    <string name="media_index_format">%1$d/%2$d</string>
+    <string name="settings_bitrate_mbps_format">%1$d Mbps</string>
+</resources>

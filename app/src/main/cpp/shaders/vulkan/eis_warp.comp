@@ -1,0 +1,79 @@
+#version 450
+
+// OmniClarity Engine — §Stabilization: gyro-EIS per-scanline warp (s3-f06 / CP60-64).
+//
+// 100% classical, zero learned weights. Resamples the input frame through a per-scanline EIS correction
+// grid (dx, dy pixels + in-plane roll radians per output row) produced on the CPU from the gyro
+// orientation path (smoother residual -> rolling-shutter per-row refinement -> OIS fusion -> mode policy,
+// all in com.neoproc.neoproccamx.stabilization). Each output row is corrected against its own readout-time
+// orientation, removing jello/skew, and the source fetch is HARD-CLAMPED to a fixed crop margin so a black
+// border can never be revealed regardless of correction magnitude.
+//
+// NO-DOWNGRADE: gated behind USE_EIS_WARP (default false). With no host VkSpecializationInfo the compiled
+// pipeline is a bit-for-bit identity resample == today's pixels. The owner enables EIS device-side via
+// VkSpecializationInfo only after the gyro<->SENSOR_TIMESTAMP clock, OIS sign/scale and rolling-shutter
+// skew calibrations. FOUNDATION: the pipeline is created dormant and is NOT dispatched in the live render
+// path yet (the grid producer + dispatch wiring are the device-gated activation step).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly uniform highp image2D uInput;
+layout(binding = 1, rgba16f) readonly uniform highp image2D uRowGrid;   // per-scanline correction: .r=dx px, .g=dy px, .b=roll rad
+layout(binding = 2, rgba16f) writeonly uniform highp image2D uOutput;
+
+layout(push_constant) uniform EisWarpParams {
+    float cropMarginPixels;  // EIS crop margin; the source fetch is clamped within it so a border is never revealed
+    float centerX;           // roll pivot (frame centre x)
+    float centerY;           // roll pivot (frame centre y)
+    int gridRows;            // number of valid rows in uRowGrid
+} uParams;
+
+// s3-f06 — default OFF == identity resample == today's pixels bit-for-bit (no-downgrade).
+layout(constant_id = 0) const bool USE_EIS_WARP = false;
+
+vec3 sampleInputBilinear(vec2 c, ivec2 size) {
+    vec2 cl = clamp(c, vec2(0.0), vec2(size) - vec2(1.0));
+    ivec2 b = ivec2(floor(cl));
+    vec2 f = cl - vec2(b);
+    ivec2 b1 = min(b + ivec2(1), size - ivec2(1));
+    vec3 a = imageLoad(uInput, b).rgb;
+    vec3 bx = imageLoad(uInput, ivec2(b1.x, b.y)).rgb;
+    vec3 cy = imageLoad(uInput, ivec2(b.x, b1.y)).rgb;
+    vec3 d = imageLoad(uInput, b1).rgb;
+    return mix(mix(a, bx, f.x), mix(cy, d, f.x), f.y);
+}
+
+void main() {
+    ivec2 size = imageSize(uOutput);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= size.x || p.y >= size.y) {
+        return;
+    }
+
+    if (!USE_EIS_WARP) {
+        // Identity resample — bit-for-bit passthrough of the input (the no-downgrade default).
+        imageStore(uOutput, p, imageLoad(uInput, p));
+        return;
+    }
+
+    // Per-scanline correction (dx, dy px; roll rad) for this output row.
+    int row = clamp(p.y, 0, max(uParams.gridRows - 1, 0));
+    vec3 corr = imageLoad(uRowGrid, ivec2(0, row)).rgb;
+
+    // Inverse warp: counter-rotate about the frame centre, then counter-translate, to fetch where this
+    // output pixel came from in the stabilised input.
+    float cr = cos(corr.z);
+    float sr = sin(corr.z);
+    vec2 d = vec2(p) - vec2(uParams.centerX, uParams.centerY);
+    vec2 rotated = vec2(cr * d.x - sr * d.y, sr * d.x + cr * d.y) + vec2(uParams.centerX, uParams.centerY);
+    vec2 src = rotated - corr.xy;
+
+    // Crop-margin clamp: the fetch can never leave [margin, size-1-margin], so a black border is never
+    // revealed regardless of how large the correction is (impossible-by-construction).
+    float m = max(uParams.cropMarginPixels, 0.0);
+    vec2 lo = vec2(m);
+    vec2 hi = max(vec2(size) - vec2(1.0) - vec2(m), lo);
+    src = clamp(src, lo, hi);
+
+    imageStore(uOutput, p, vec4(sampleInputBilinear(src, size), 1.0));
+}

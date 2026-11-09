@@ -1,0 +1,28 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// :core-math — Pure Kotlin math module (no Android framework dependencies)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Contains: ACES color science, tone mapping, perceptual signal math,
+//           HDR imaging math, quality policy, thermal state, runtime tiers.
+// ═══════════════════════════════════════════════════════════════════════════════
+// :core-math — Pure Kotlin math module (no Android framework dependencies)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Contains: ACES color science, tone mapping, perceptual signal math,
+//           HDR imaging math, quality policy, thermal state, runtime tiers.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+plugins {
+    id 'org.jetbrains.kotlin.jvm'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+kotlin {
+    jvmToolchain(21)
+}
+
+dependencies {
+    implementation libs.kotlin.stdlib
+}

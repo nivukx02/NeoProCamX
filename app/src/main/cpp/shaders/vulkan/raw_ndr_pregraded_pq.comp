@@ -1,0 +1,576 @@
+#version 450
+
+// LQ-034: full-resolution RAW-derived ACEScg -> project-owned BT.2020/PQ compute grade.
+//
+// This shader is deliberately not wired to the live recorder yet.  Its output has a different
+// semantic contract from NEO-SCENE-LOG10: it is already graded, already converted to Rec.2020 and
+// already encoded as ST.2084 PQ.  A future consumer must therefore perform an identity/code-
+// preserving copy only.  Until that consumer proves the versioned profile receipt, native code
+// leaves this pipeline dormant and the established FP16/scene-log route remains unchanged.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D currentAcesCg;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D previousAcesCg;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D nextAcesCg;
+layout(set = 0, binding = 3, rgb10_a2) uniform writeonly image2D pregradedBt2020Pq;
+layout(set = 0, binding = 5) uniform sampler2D sensorTonePqLut;
+
+// std140 ABI v1.  Every row is exactly one 16-byte slot; matching native offset assertions live in
+// vulkan_bridge.cpp.  64-bit identities are split into little-endian low/high uint32 words so this
+// shader does not require shaderInt64.
+layout(std140, set = 0, binding = 4) uniform RawNdrPregradedPqParams {
+    uvec4 header;              // abiVersion, byteSize, width, height
+    uvec4 profileIdentity;     // generationLo, generationHi, revisionLo, revisionHi
+    uvec4 frameIdentity;       // fingerprintLo, fingerprintHi, detailProfile, deliveryMode
+    uvec4 controls;            // historyValid, correctionActive, flipX, flipY
+    vec4 gradeRow0;            // row-major 3x3, w reserved
+    vec4 gradeRow1;
+    vec4 gradeRow2;
+    vec4 cleanup;              // sharpness, denoise, chromaDenoise, temporalBlend
+    vec4 delivery;             // gradeContrast, warmSkinRedTame, targetPeakNits, tonePqLutReady
+    vec4 measuredRgbScale;     // r, g, b, reserved
+    vec4 measuredTone;         // highlightRolloffBias, shadowLiftBias, saturationScale, reserved
+    vec4 measuredHue;          // skinDegrees, skyDegrees, reserved, reserved
+    vec4 toneProfile;          // sensorDiffuseScene, gamma, toeWidth, toeAmount
+    vec4 characterProfile;     // highlightDesat, shadowLift, midtoneContrast, chromaBoost
+    vec4 detailProfile;        // skyChromaBonus, detailStrength, detailLower, detailUpper
+} p;
+
+const uint RAW_NDR_PREGRaded_PQ_ABI_V1 = 1u;
+const uint RAW_NDR_PREGRaded_PQ_ABI_V1_BYTES = 240u;
+const float NEO_SENSOR_TONE_PQ_LUT_SIZE = 2048.0;
+const float NEO_SENSOR_TONE_PQ_LUT_ROWS = 17.0;
+const float NEO_SENSOR_TONE_LUT_MIN_SIGNAL = 0.000001;
+const float NEO_SENSOR_TONE_DOMAIN = 256.0;
+const float NEO_SENSOR_PQ_NITS_DOMAIN = 10000.0;
+
+float acesCgLuma(vec3 c) {
+    return dot(c, vec3(0.2722287, 0.6740818, 0.0536895));
+}
+
+float bt2020Luma(vec3 c) {
+    return dot(c, vec3(0.2627, 0.6780, 0.0593));
+}
+
+float neoSmoothstep(float e0, float e1, float x) {
+    if (e0 == e1) return x >= e1 ? 1.0 : 0.0;
+    float t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+float neoSignalShape(float x, float gammaValue, float toeWidth, float toeAmount) {
+    if (x <= 0.0) return 0.0;
+    if (x <= 1.0) {
+        return pow(x, gammaValue) +
+            neoSmoothstep(0.0, toeWidth, x) * toeAmount * (1.0 - x);
+    }
+    return 1.0 + (gammaValue - toeAmount) * (x - 1.0);
+}
+
+float neoSignalToNits(float signal, float diffuseNits, float peakNits) {
+    float s = max(signal, 0.0);
+    float rawNits = s * diffuseNits;
+    if (rawNits <= diffuseNits) return rawNits;
+    float range = peakNits - diffuseNits;
+    return min(
+        diffuseNits + range * (1.0 - exp(-(rawNits - diffuseNits) / range)),
+        peakNits
+    );
+}
+
+float neoPqFromNits(float nits) {
+    float y = clamp(nits / 10000.0, 0.0, 1.0);
+    float ym = pow(y, 0.1593017578125);
+    return pow(
+        (0.8359375 + 18.8515625 * ym) / (1.0 + 18.6875 * ym),
+        78.84375
+    );
+}
+
+vec3 compressPeakColorVolume(vec3 rgbNits, float luminanceNits, float peakNits) {
+    float peak = clamp(peakNits, 203.0, 10000.0);
+    float y = clamp(luminanceNits, 0.0, peak);
+    vec3 rgb = max(rgbNits, vec3(0.0));
+    float hi = max(max(rgb.r, rgb.g), rgb.b);
+    if (hi <= peak || hi <= y + 1e-8) return rgb;
+    float chromaScale = clamp((peak - y) / (hi - y), 0.0, 1.0);
+    return clamp(vec3(y) + (rgb - vec3(y)) * chromaScale, 0.0, peak);
+}
+
+float blackPreservingMidtoneLift(float signal, float strength) {
+    float x = max(signal, 0.0);
+    if (x <= 0.0 || x >= 1.0) return x;
+    float window = neoSmoothstep(0.025, 0.20, x) *
+        (1.0 - neoSmoothstep(0.78, 1.20, x));
+    return x + strength * sqrt(x) * (1.0 - x) * window;
+}
+
+float profileMidtoneContrast(float signal, float strength) {
+    float x = max(signal, 0.0);
+    if (x <= 0.0 || x >= 1.0) return x;
+    float window = neoSmoothstep(0.055, 0.24, x) *
+        (1.0 - neoSmoothstep(0.76, 1.0, x));
+    float signedContrast = (x - 0.50) * 4.0 * x * (1.0 - x);
+    return max(x + strength * signedContrast * window, 0.0);
+}
+
+vec3 profileChroma(
+    vec3 color,
+    vec3 source,
+    float mappedY,
+    float baseBoost,
+    float skyBonusStrength
+) {
+    float peakValue = max(color.r, max(color.g, color.b));
+    float floorValue = min(color.r, min(color.g, color.b));
+    float relativeChroma = (peakValue - floorValue) / max(mappedY, 0.04);
+    float colorConfidence = neoSmoothstep(0.035, 0.22, relativeChroma);
+    float inverseSourceGreen = 1.0 / max(source.g, 1e-8);
+    float rg = source.r * inverseSourceGreen;
+    float bg = source.b * inverseSourceGreen;
+    float skin = neoSmoothstep(1.02, 1.16, rg) *
+        (1.0 - neoSmoothstep(1.58, 2.10, rg)) *
+        (1.0 - neoSmoothstep(0.98, 1.18, bg));
+    float sky = neoSmoothstep(1.03, 1.22, bg) *
+        (1.0 - neoSmoothstep(1.00, 1.22, rg));
+    float tonalWindow = neoSmoothstep(0.035, 0.16, mappedY) *
+        (1.0 - neoSmoothstep(0.88, 1.65, mappedY));
+    float skinProtection = mix(1.0, 0.45, skin);
+    float gain = 1.0 + (baseBoost + skyBonusStrength * sky) *
+        colorConfidence * tonalWindow * skinProtection;
+    return vec3(mappedY) + (color - vec3(mappedY)) * gain;
+}
+
+vec3 rotateHueNeutralAxis(vec3 color, float degrees) {
+    const vec3 axis = vec3(0.5773502691896258);
+    float angle = radians(degrees);
+    float angle2 = angle * angle;
+    float cs = 1.0 - 0.5 * angle2 + (angle2 * angle2) * (1.0 / 24.0);
+    float sn = angle * (1.0 - angle2 * (1.0 / 6.0) +
+        (angle2 * angle2) * (1.0 / 120.0));
+    return color * cs + cross(axis, color) * sn + axis * dot(axis, color) * (1.0 - cs);
+}
+
+vec3 applyMeasuredCorrection(vec3 inputColor) {
+    vec3 source = max(inputColor, vec3(0.0));
+    if (p.controls.y == 0u) return source;
+
+    float originalY = max(acesCgLuma(source), 1e-7);
+    source *= clamp(p.measuredRgbScale.xyz, vec3(0.85), vec3(1.15));
+    source *= clamp(originalY / max(acesCgLuma(source), 1e-7), 0.85, 1.15);
+
+    float inverseSourceGreen = 1.0 / max(source.g, 1e-7);
+    float rg = source.r * inverseSourceGreen;
+    float rb = source.r / max(source.b, 1e-7);
+    float bg = source.b * inverseSourceGreen;
+    float skin = smoothstep(1.04, 1.24, rg) *
+        (1.0 - smoothstep(1.70, 2.25, rg)) *
+        smoothstep(1.02, 1.32, rb) *
+        smoothstep(0.035, 0.16, originalY) *
+        (1.0 - smoothstep(0.75, 1.10, originalY));
+    float sky = smoothstep(1.02, 1.24, bg) *
+        (1.0 - smoothstep(1.00, 1.28, rg)) *
+        smoothstep(0.045, 0.20, originalY) *
+        (1.0 - smoothstep(1.00, 1.45, originalY));
+    float hueDegrees = p.measuredHue.x * skin + p.measuredHue.y * sky;
+    if (abs(hueDegrees) > 1e-5) {
+        source = rotateHueNeutralAxis(source, hueDegrees);
+        source *= clamp(originalY / max(acesCgLuma(source), 1e-7), 0.85, 1.15);
+    }
+
+    float y = acesCgLuma(source);
+    source = vec3(y) +
+        (source - vec3(y)) * clamp(p.measuredTone.z, 0.85, 1.15);
+    float shadowWindow = 1.0 - smoothstep(0.035, 0.22, originalY);
+    source += vec3(clamp(p.measuredTone.y, -0.08, 0.08) * shadowWindow);
+    return max(source, vec3(0.0));
+}
+
+float applyMeasuredHighlightRolloff(float signal) {
+    float x = max(signal, 0.0);
+    float bias = clamp(p.measuredTone.x, 0.0, 0.12);
+    if (x <= 1.0 || bias <= 0.0 || p.controls.y == 0u) return x;
+    float excess = x - 1.0;
+    return 1.0 + excess / (1.0 + 4.0 * bias * excess);
+}
+
+vec3 acesCgToRec2020(vec3 aces) {
+    return vec3(
+        dot(aces, vec3( 1.02582, -0.02005, -0.00577)),
+        dot(aces, vec3(-0.00386,  1.01040, -0.00654)),
+        dot(aces, vec3(-0.01784, -0.07404,  1.09188))
+    );
+}
+
+vec3 sensorToneSegment(float value) {
+    float x = clamp(value, 0.0, NEO_SENSOR_TONE_DOMAIN);
+    if (x <= 0.00001) {
+        if (x <= 0.0000001) {
+            if (x <= 0.00000001) return vec3(0.0, 0.0, 100000000.0);
+            return vec3(1.0, 0.00000001, 11111111.11111111);
+        }
+        if (x <= 0.000001) return vec3(2.0, 0.0000001, 1111111.11111111);
+        return vec3(3.0, 0.000001, 111111.11111111);
+    }
+    if (x <= 0.01) {
+        if (x <= 0.0001) return vec3(4.0, 0.00001, 11111.11111111);
+        if (x <= 0.001) return vec3(5.0, 0.0001, 1111.11111111);
+        return vec3(6.0, 0.001, 111.11111111);
+    }
+    if (x <= 1.0) {
+        if (x <= 0.1) return vec3(7.0, 0.01, 11.11111111);
+        return vec3(8.0, 0.1, 1.11111111);
+    }
+    if (x <= 16.0) return vec3(9.0, 1.0, 0.0666666667);
+    return vec3(10.0, 16.0, 0.00416666667);
+}
+
+vec3 sensorPqSegment(float value) {
+    float x = clamp(value, 0.0, NEO_SENSOR_PQ_NITS_DOMAIN);
+    if (x <= 10.0) {
+        if (x <= 0.1) return vec3(0.0, 0.0, 10.0);
+        if (x <= 1.0) return vec3(1.0, 0.1, 1.11111111);
+        return vec3(2.0, 1.0, 0.111111111);
+    }
+    if (x <= 1000.0) {
+        if (x <= 100.0) return vec3(3.0, 10.0, 0.0111111111);
+        return vec3(4.0, 100.0, 0.00111111111);
+    }
+    return vec3(5.0, 1000.0, 0.000333333333);
+}
+
+vec2 segmentedLutCoord(float value, vec3 segment, float rowOffset) {
+    float normalized = clamp((value - segment.y) * segment.z, 0.0, 1.0);
+    float u = (normalized * (NEO_SENSOR_TONE_PQ_LUT_SIZE - 1.0) + 0.5) /
+        NEO_SENSOR_TONE_PQ_LUT_SIZE;
+    float v = (rowOffset + segment.x + 0.5) / NEO_SENSOR_TONE_PQ_LUT_ROWS;
+    return vec2(u, v);
+}
+
+vec4 sampleSensorTone(float sceneLuma) {
+    vec3 segment = sensorToneSegment(sceneLuma);
+    return textureLod(
+        sensorTonePqLut,
+        segmentedLutCoord(sceneLuma, segment, 0.0),
+        0.0
+    );
+}
+
+float sampleSensorPq(float nits) {
+    vec3 segment = sensorPqSegment(nits);
+    vec4 encoded = textureLod(
+        sensorTonePqLut,
+        segmentedLutCoord(nits, segment, 11.0),
+        0.0
+    );
+    return encoded.r + encoded.g;
+}
+
+vec3 deliverSensorLinearPq(vec3 source) {
+    float gammaValue = clamp(p.toneProfile.y, 0.10, 1.0);
+    float toeWidth = clamp(p.toneProfile.z, 0.001, 0.90);
+    float toeAmount = clamp(p.toneProfile.w, 0.0, 0.20);
+    float baselinePeak = p.frameIdentity.w != 0u ? 10000.0 : 5000.0;
+    float peak = clamp(max(p.delivery.z, baselinePeak), baselinePeak, 10000.0);
+    float desat = clamp(p.characterProfile.x, 0.0, 0.50);
+
+    vec3 calibratedAcesCg = applyMeasuredCorrection(source);
+    float sensorDiffuseScene = clamp(p.toneProfile.x, 0.02, 0.30);
+    vec3 linear2020 = max(acesCgToRec2020(calibratedAcesCg), vec3(0.0)) /
+        sensorDiffuseScene;
+    float sourceY = max(bt2020Luma(linear2020), 1e-8);
+    bool useTonePqLut = p.delivery.w > 0.5 &&
+        sourceY >= NEO_SENSOR_TONE_LUT_MIN_SIGNAL &&
+        sourceY <= NEO_SENSOR_TONE_DOMAIN;
+    vec4 sensorTone = useTonePqLut ? sampleSensorTone(sourceY) : vec4(0.0);
+    float mappedY = useTonePqLut
+        ? sensorTone.r + sensorTone.g
+        : profileMidtoneContrast(
+            blackPreservingMidtoneLift(
+                neoSignalShape(sourceY, gammaValue, toeWidth, toeAmount),
+                clamp(p.characterProfile.y, 0.0, 0.35)
+            ),
+            clamp(p.characterProfile.z, 0.0, 0.30)
+        );
+    vec3 toneColor = linear2020 * (mappedY / sourceY);
+    toneColor = profileChroma(
+        toneColor,
+        linear2020,
+        mappedY,
+        clamp(p.characterProfile.w, 0.0, 0.25),
+        clamp(p.detailProfile.x, 0.0, 0.08)
+    );
+    float highlightDesat = clamp(
+        desat * neoSmoothstep(0.55, 1.0, mappedY),
+        0.0,
+        desat
+    );
+    toneColor = mix(toneColor, vec3(mappedY), highlightDesat);
+    bool colorPathClipped = useTonePqLut && any(lessThan(toneColor, vec3(0.0)));
+
+    if (p.delivery.y > 0.0) {
+        float originalToneY = max(bt2020Luma(max(toneColor, vec3(0.0))), 1e-8);
+        float inverseLinearGreen = 1.0 / max(linear2020.g, 1e-8);
+        float rgRatio = linear2020.r * inverseLinearGreen;
+        float bgRatio = linear2020.b * inverseLinearGreen;
+        float moderateRed = neoSmoothstep(1.18, 1.55, rgRatio) *
+            (1.0 - neoSmoothstep(2.80, 4.00, rgRatio));
+        float bluePresent = neoSmoothstep(0.28, 0.55, bgRatio) *
+            (1.0 - neoSmoothstep(1.08, 1.35, bgRatio));
+        float exposureWindow = neoSmoothstep(0.04, 0.16, mappedY) *
+            (1.0 - neoSmoothstep(6.5, 8.0, mappedY));
+        float redOverflow = neoSmoothstep(1.30, 2.10, rgRatio);
+        float weight = clamp(
+            p.delivery.y * moderateRed * bluePresent * exposureWindow *
+                (0.45 + 0.55 * redOverflow),
+            0.0,
+            p.delivery.y
+        );
+        vec3 corrected = toneColor;
+        corrected.r = mix(corrected.r, min(corrected.r, corrected.g * 1.42), weight);
+        corrected.b = mix(
+            corrected.b,
+            max(corrected.b, corrected.g * 0.64),
+            weight * 0.68
+        );
+        float correctedY = max(bt2020Luma(max(corrected, vec3(0.0))), 1e-8);
+        toneColor = corrected * (originalToneY / correctedY);
+        colorPathClipped = colorPathClipped ||
+            (useTonePqLut && any(lessThan(toneColor, vec3(0.0))));
+    }
+
+    toneColor = max(toneColor, vec3(0.0));
+    float preRolloffY = max(bt2020Luma(toneColor), 1e-8);
+    float rolledY = applyMeasuredHighlightRolloff(preRolloffY);
+    toneColor *= rolledY / preRolloffY;
+    float nits = useTonePqLut && !colorPathClipped
+        ? sensorTone.b + sensorTone.a
+        : neoSignalToNits(rolledY, 203.0, peak);
+    vec3 peakSafe = compressPeakColorVolume(toneColor * (nits / rolledY), nits, peak);
+    return useTonePqLut
+        ? vec3(
+            sampleSensorPq(peakSafe.r),
+            sampleSensorPq(peakSafe.g),
+            sampleSensorPq(peakSafe.b)
+        )
+        : vec3(
+            neoPqFromNits(peakSafe.r),
+            neoPqFromNits(peakSafe.g),
+            neoPqFromNits(peakSafe.b)
+        );
+}
+
+float boundedDetailLog2(float ratio) {
+    float x = clamp(ratio, 0.858565436437754, 1.16473358646846) - 1.0;
+    float polynomial = -0.166666666666667;
+    polynomial = 0.2 + x * polynomial;
+    polynomial = -0.25 + x * polynomial;
+    polynomial = 0.333333333333333 + x * polynomial;
+    polynomial = -0.5 + x * polynomial;
+    polynomial = 1.0 + x * polynomial;
+    return 1.4426950408889634 * x * polynomial;
+}
+
+float boundedDetailExp2(float stops) {
+    float z = 0.6931471805599453 * clamp(stops, -0.20, 0.20);
+    return 1.0 + z *
+        (1.0 + z * (0.5 + z * (0.166666666666667 + z * 0.041666666666667)));
+}
+
+float ditherHash(vec2 coord) {
+    return fract(52.9829189 * fract(0.06711056 * coord.x + 0.00583715 * coord.y));
+}
+
+ivec2 clampCoord(ivec2 coord, ivec2 extent) {
+    return clamp(coord, ivec2(0), extent - ivec2(1));
+}
+
+vec3 readCurrent(ivec2 coord, ivec2 extent) {
+    return imageLoad(currentAcesCg, clampCoord(coord, extent)).rgb;
+}
+
+bool hasNonZeroIdentity(uvec4 value) {
+    return any(notEqual(value, uvec4(0u)));
+}
+
+void main() {
+    ivec2 outputCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = ivec2(p.header.zw);
+    if (any(greaterThanEqual(outputCoord, extent))) return;
+
+    // Fail closed before touching either transport if the host/shader ABI or proof identity differs.
+    if (p.header.x != RAW_NDR_PREGRaded_PQ_ABI_V1 ||
+        p.header.y != RAW_NDR_PREGRaded_PQ_ABI_V1_BYTES ||
+        extent.x <= 0 || extent.y <= 0 ||
+        imageSize(currentAcesCg) != extent ||
+        imageSize(previousAcesCg) != extent ||
+        imageSize(nextAcesCg) != extent ||
+        imageSize(pregradedBt2020Pq) != extent ||
+        !hasNonZeroIdentity(p.profileIdentity) ||
+        (p.frameIdentity.x == 0u && p.frameIdentity.y == 0u) ||
+        p.frameIdentity.z > 2u || p.frameIdentity.w > 1u) {
+        return;
+    }
+
+    ivec2 sourceCoord = outputCoord;
+    if (p.controls.z != 0u) sourceCoord.x = extent.x - 1 - sourceCoord.x;
+    if (p.controls.w != 0u) sourceCoord.y = extent.y - 1 - sourceCoord.y;
+
+    vec3 current = readCurrent(sourceCoord, extent);
+    // The temporal reference is an independent scene-linear image.  It is never an externally-owned
+    // RGB10_A2 transport slot, so an encoder consumer cannot race or overwrite pre-grade history.
+    imageStore(nextAcesCg, sourceCoord, vec4(current, 1.0));
+
+    float calibrationSignalScale = 1.0 / clamp(p.toneProfile.x, 0.02, 0.30);
+    vec3 center = current;
+    if (p.controls.x != 0u && p.cleanup.w > 0.0) {
+        vec3 history = imageLoad(previousAcesCg, sourceCoord).rgb;
+        float centerY = acesCgLuma(center);
+        float historyY = acesCgLuma(history);
+        vec3 centerChroma = center - vec3(centerY);
+        vec3 historyChroma = history - vec3(historyY);
+        float motion = (abs(centerY - historyY) +
+            0.6 * length(centerChroma - historyChroma)) * calibrationSignalScale;
+        float guard = 1.0 - smoothstep(0.012, 0.06, motion);
+        center = mix(center, history, clamp(p.cleanup.w, 0.0, 1.0) * guard);
+    }
+
+    float centerLuma = acesCgLuma(center);
+    vec3 east = readCurrent(sourceCoord + ivec2(1, 0), extent);
+    vec3 west = readCurrent(sourceCoord + ivec2(-1, 0), extent);
+    vec3 north = readCurrent(sourceCoord + ivec2(0, 1), extent);
+    vec3 south = readCurrent(sourceCoord + ivec2(0, -1), extent);
+    vec4 cardinalLuma = vec4(
+        acesCgLuma(east),
+        acesCgLuma(west),
+        acesCgLuma(north),
+        acesCgLuma(south)
+    );
+
+    float denoise = clamp(p.cleanup.y, 0.0, 1.0);
+    float sigmaR = clamp(0.010 + 0.045 * denoise, 0.010, 0.05);
+    float invR2 = 1.0 / (2.0 * sigmaR * sigmaR);
+    vec4 lumaDelta = (cardinalLuma - vec4(centerLuma)) * calibrationSignalScale;
+    vec4 bilateralX = lumaDelta * lumaDelta * invR2;
+    vec4 reciprocal = 1.0 / (vec4(1.0) + bilateralX);
+    vec4 bilateralWeight = 1.11 * reciprocal * reciprocal;
+    vec3 bilateralAccum = center + east * bilateralWeight.x + west * bilateralWeight.y +
+        north * bilateralWeight.z + south * bilateralWeight.w;
+    float bilateralWeightSum = 1.0 + dot(bilateralWeight, vec4(1.0));
+    vec3 gaussian = (center + 1.11 * (east + west + north + south)) * (1.0 / 5.44);
+    vec3 denoised = mix(center, bilateralAccum / bilateralWeightSum, denoise);
+
+    vec3 detail = denoised - gaussian;
+    float sharpness = clamp(p.cleanup.x, 0.0, 1.0) * 0.85;
+    float detailLuma = abs(acesCgLuma(detail));
+    float detailLumaMetric = detailLuma * calibrationSignalScale;
+    float haloGuard = 1.0 - smoothstep(0.06, 0.20, detailLumaMetric);
+    float detailCap = 0.05 + 0.05 * sharpness;
+    vec3 sharpened = denoised + clamp(
+        detail * sharpness * haloGuard,
+        -detailCap,
+        detailCap
+    );
+
+    float outputLuma = acesCgLuma(sharpened);
+    vec3 chroma = sharpened - vec3(outputLuma);
+    float gaussianLuma = acesCgLuma(gaussian);
+    vec3 consensusChroma = gaussian - vec3(gaussianLuma);
+    vec3 eastChroma = east - vec3(cardinalLuma.x);
+    vec3 westChroma = west - vec3(cardinalLuma.y);
+    vec3 northChroma = north - vec3(cardinalLuma.z);
+    vec3 southChroma = south - vec3(cardinalLuma.w);
+    vec3 neighbourConsensusChroma =
+        (eastChroma + westChroma + northChroma + southChroma) * 0.25;
+    float localStructure = max(abs(centerLuma - gaussianLuma), detailLuma);
+    vec3 northSouthDelta = northChroma - southChroma;
+    vec3 eastWestDelta = eastChroma - westChroma;
+    float chromaStructure = sqrt(max(
+        dot(northSouthDelta, northSouthDelta),
+        dot(eastWestDelta, eastWestDelta)
+    ));
+
+    float calibrationY = outputLuma * calibrationSignalScale;
+    float edgeProtect = max(
+        smoothstep(0.006, 0.045, localStructure * calibrationSignalScale),
+        smoothstep(0.018, 0.100, chromaStructure * calibrationSignalScale)
+    );
+    float consensusMagnitude = length(consensusChroma) * calibrationSignalScale;
+    float coherentColorProtect = smoothstep(0.018, 0.085, consensusMagnitude);
+    float disagreement = length(chroma - consensusChroma) * calibrationSignalScale;
+    float outlierConfidence = smoothstep(0.0008, 0.018, disagreement);
+    float deepShadow = 1.0 - smoothstep(0.018, 0.090, calibrationY);
+    float shadowBlend = clamp(
+        deepShadow * (1.0 - edgeProtect) * mix(0.42, 0.96, outlierConfidence) *
+            (1.0 - coherentColorProtect * 0.82),
+        0.0,
+        0.96
+    );
+    vec3 calibratedChroma = mix(chroma, consensusChroma, shadowBlend);
+
+    float neighbourMagnitude = length(neighbourConsensusChroma) * calibrationSignalScale;
+    float surfaceNeutral = 1.0 - smoothstep(0.020, 0.090, neighbourMagnitude);
+    float visibleSurface = smoothstep(0.075, 0.240, calibrationY);
+    float surfaceDisagreement =
+        length(chroma - neighbourConsensusChroma) * calibrationSignalScale;
+    float surfaceOutlierConfidence = smoothstep(0.0020, 0.0280, surfaceDisagreement);
+    float surfaceBlend = clamp(
+        visibleSurface * (1.0 - edgeProtect) * surfaceNeutral *
+            surfaceOutlierConfidence * 0.92,
+        0.0,
+        0.92
+    );
+    calibratedChroma = mix(calibratedChroma, neighbourConsensusChroma, surfaceBlend);
+    float blackUncertainty = 1.0 - smoothstep(0.012, 0.065, calibrationY);
+    float tinyChroma = 1.0 - smoothstep(
+        0.012,
+        0.070,
+        length(calibratedChroma) * calibrationSignalScale
+    );
+    float neutralize = clamp(
+        blackUncertainty * tinyChroma * (1.0 - edgeProtect) *
+            (1.0 - coherentColorProtect) * mix(0.96, 1.0, outlierConfidence),
+        0.0,
+        0.995
+    );
+    calibratedChroma *= 1.0 - neutralize;
+    float chromaFlat = 1.0 - smoothstep(0.02, 0.10, detailLumaMetric);
+    float chromaGuard = clamp(p.cleanup.z, 0.0, 1.0) * 0.30 * chromaFlat;
+    vec3 cleaned = vec3(outputLuma) + mix(
+        calibratedChroma,
+        neighbourConsensusChroma,
+        chromaGuard
+    );
+
+    vec3 graded = vec3(
+        dot(p.gradeRow0.xyz, cleaned),
+        dot(p.gradeRow1.xyz, cleaned),
+        dot(p.gradeRow2.xyz, cleaned)
+    );
+    float gradePivot = clamp(p.toneProfile.x, 0.02, 0.30);
+    graded = (graded - vec3(gradePivot)) * p.delivery.x + vec3(gradePivot);
+
+    float gradedY = max(acesCgLuma(max(graded, vec3(0.0))), 0.0);
+    float localY = max(acesCgLuma(max(gaussian, vec3(0.0))), 0.0);
+    float localDetailStops = boundedDetailLog2((gradedY + 0.0020) / (localY + 0.0020));
+    float edgeConfidence = smoothstep(0.006, 0.040, abs(gradedY - localY));
+    float shadowNoiseGuard = smoothstep(0.018, 0.075, gradedY);
+    float highlightGuard = 1.0 - smoothstep(1.30, 3.20, gradedY);
+    localDetailStops *= edgeConfidence * shadowNoiseGuard * highlightGuard;
+    float detailGainStops = clamp(
+        localDetailStops * clamp(p.detailProfile.y, 0.0, 0.75),
+        clamp(p.detailProfile.z, -0.20, 0.0),
+        clamp(p.detailProfile.w, 0.0, 0.20)
+    );
+    graded *= boundedDetailExp2(detailGainStops);
+
+    vec3 pq = clamp(deliverSensorLinearPq(max(graded, vec3(0.0))), 0.0, 1.0);
+    // gl_FragCoord in the canonical GLES pass is the output coordinate.  Preserve that convention
+    // even when source X/Y are flipped, so TPDF parity is independent of sensor orientation.
+    vec2 outputPixelCenter = vec2(outputCoord) + vec2(0.5);
+    float dither = ditherHash(outputPixelCenter) -
+        ditherHash(outputPixelCenter + vec2(23.17, 61.43));
+    pq = clamp(pq + vec3(dither) * (1.0 / 1023.0), 0.0, 1.0);
+    imageStore(pregradedBt2020Pq, outputCoord, vec4(pq, 1.0));
+}

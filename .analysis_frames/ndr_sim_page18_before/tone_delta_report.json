@@ -1,0 +1,679 @@
+{
+  "version": "NDR_NIVUKX_OFFLINE_TONE_SIMULATOR_V1",
+  "generated_at": "2026-07-24T15:10:37",
+  "reference": "deliverables\\ndr_nivukx_144\\ndr_nivukx_144_reference.json",
+  "pages": [
+    18
+  ],
+  "analysis_max_edge": 720,
+  "processed_files": [
+    "NDR10\\ndr_nivukx_144_page_18_NDR10.png",
+    "NIVUKX\\ndr_nivukx_144_page_18_NIVUKX.png"
+  ],
+  "truth_boundary": {
+    "models": "CPU vector approximation of selected ycbcr_preview.frag NDR/NIVUKX color guards.",
+    "excludes": [
+      "Camera sensor response and AWB metadata",
+      "Vulkan texture-neighbor local sampling",
+      "Recording encoder color metadata",
+      "Device display color management"
+    ],
+    "use": "Compare original calibration PNG against tone-processed PNG to isolate pure tone-math color drift."
+  },
+  "patch_rows": {
+    "NDR10": [
+      {
+        "id": "validation_neutral_18",
+        "role": "NEUTRAL",
+        "page": 18,
+        "mode": "NDR10",
+        "before_srgb": [
+          0.188765,
+          0.188765,
+          0.188765
+        ],
+        "after_srgb": [
+          0.28135,
+          0.300735,
+          0.307405
+        ],
+        "delta_rgb": [
+          0.092586,
+          0.111971,
+          0.118641
+        ],
+        "red_delta": 0.092586,
+        "green_delta": 0.111971,
+        "blue_delta": 0.118641,
+        "luma_delta": 0.108331,
+        "chroma_delta": 0.026055,
+        "hue_delta_deg": 164.6401,
+        "flags": []
+      },
+      {
+        "id": "validation_sky_day",
+        "role": "SKY",
+        "page": 18,
+        "mode": "NDR10",
+        "before_srgb": [
+          0.317213,
+          0.565489,
+          0.910745
+        ],
+        "after_srgb": [
+          0.32817,
+          0.601911,
+          0.938774
+        ],
+        "delta_rgb": [
+          0.010957,
+          0.036423,
+          0.028029
+        ],
+        "red_delta": 0.010957,
+        "green_delta": 0.036423,
+        "blue_delta": 0.028029,
+        "luma_delta": 0.030403,
+        "chroma_delta": 0.017072,
+        "hue_delta_deg": 1.8006,
+        "flags": [
+          "sky_red_green_high_or_blue_low"
+        ]
+      },
+      {
+        "id": "validation_skin_medium",
+        "role": "SKIN",
+        "page": 18,
+        "mode": "NDR10",
+        "before_srgb": [
+          0.565489,
+          0.356076,
+          0.266821
+        ],
+        "after_srgb": [
+          0.497066,
+          0.395196,
+          0.316411
+        ],
+        "delta_rgb": [
+          -0.068422,
+          0.03912,
+          0.04959
+        ],
+        "red_delta": -0.068422,
+        "green_delta": 0.03912,
+        "blue_delta": 0.04959,
+        "luma_delta": 0.017012,
+        "chroma_delta": -0.118012,
+        "hue_delta_deg": 8.2357,
+        "flags": [
+          "skin_hue_shift_gt_5deg"
+        ]
+      },
+      {
+        "id": "validation_foliage",
+        "role": "FOLIAGE",
+        "page": 18,
+        "mode": "NDR10",
+        "before_srgb": [
+          0.196608,
+          0.48379,
+          0.16557
+        ],
+        "after_srgb": [
+          0.208114,
+          0.496865,
+          0.20148
+        ],
+        "delta_rgb": [
+          0.011506,
+          0.013075,
+          0.03591
+        ],
+        "red_delta": 0.011506,
+        "green_delta": 0.013075,
+        "blue_delta": 0.03591,
+        "luma_delta": 0.01439,
+        "chroma_delta": -0.022835,
+        "hue_delta_deg": 4.5047,
+        "flags": []
+      },
+      {
+        "id": "validation_highlight",
+        "role": "HIGHLIGHT",
+        "page": 18,
+        "mode": "NDR10",
+        "before_srgb": [
+          0.902923,
+          0.914581,
+          0.922317
+        ],
+        "after_srgb": [
+          0.724127,
+          0.839163,
+          0.916963
+        ],
+        "delta_rgb": [
+          -0.178796,
+          -0.075417,
+          -0.005354
+        ],
+        "red_delta": -0.178796,
+        "green_delta": -0.075417,
+        "blue_delta": -0.005354,
+        "luma_delta": -0.092337,
+        "chroma_delta": 0.173442,
+        "hue_delta_deg": 0.2732,
+        "flags": [
+          "highlight_channel_imbalance"
+        ]
+      },
+      {
+        "id": "validation_red",
+        "role": "SATURATED_RED",
+        "page": 18,
+        "mode": "NDR10",
+        "before_srgb": [
+          0.879673,
+          0.060802,
+          0.04915
+        ],
+        "after_srgb": [
+          0.649257,
+          0.088332,
+          0.0882
+        ],
+        "delta_rgb": [
+          -0.230416,
+          0.02753,
+          0.03905
+        ],
+        "red_delta": -0.230416,
+        "green_delta": 0.02753,
+        "blue_delta": 0.03905,
+        "luma_delta": -0.026478,
+        "chroma_delta": -0.269466,
+        "hue_delta_deg": 0.8277,
+        "flags": []
+      },
+      {
+        "id": "validation_cyan",
+        "role": "SATURATED_CYAN",
+        "page": 18,
+        "mode": "NDR10",
+        "before_srgb": [
+          0.04915,
+          0.763268,
+          0.821527
+        ],
+        "after_srgb": [
+          0.17281,
+          0.806557,
+          0.891411
+        ],
+        "delta_rgb": [
+          0.12366,
+          0.043289,
+          0.069884
+        ],
+        "red_delta": 0.12366,
+        "green_delta": 0.043289,
+        "blue_delta": 0.069884,
+        "luma_delta": 0.062296,
+        "chroma_delta": -0.053776,
+        "hue_delta_deg": 2.5593,
+        "flags": []
+      },
+      {
+        "id": "validation_texture",
+        "role": "TEXTURE",
+        "page": 18,
+        "mode": "NDR10",
+        "before_srgb": [
+          0.526801,
+          0.526801,
+          0.526801
+        ],
+        "after_srgb": [
+          0.510305,
+          0.553867,
+          0.582366
+        ],
+        "delta_rgb": [
+          -0.016496,
+          0.027065,
+          0.055565
+        ],
+        "red_delta": -0.016496,
+        "green_delta": 0.027065,
+        "blue_delta": 0.055565,
+        "luma_delta": 0.019862,
+        "chroma_delta": 0.072061,
+        "hue_delta_deg": 156.2706,
+        "flags": []
+      }
+    ],
+    "NIVUKX": [
+      {
+        "id": "validation_neutral_18",
+        "role": "NEUTRAL",
+        "page": 18,
+        "mode": "NIVUKX",
+        "before_srgb": [
+          0.188765,
+          0.188765,
+          0.188765
+        ],
+        "after_srgb": [
+          0.301418,
+          0.322262,
+          0.329429
+        ],
+        "delta_rgb": [
+          0.112653,
+          0.133498,
+          0.140664
+        ],
+        "red_delta": 0.112653,
+        "green_delta": 0.133498,
+        "blue_delta": 0.140664,
+        "luma_delta": 0.129584,
+        "chroma_delta": 0.028011,
+        "hue_delta_deg": 164.6489,
+        "flags": []
+      },
+      {
+        "id": "validation_sky_day",
+        "role": "SKY",
+        "page": 18,
+        "mode": "NIVUKX",
+        "before_srgb": [
+          0.317213,
+          0.565489,
+          0.910745
+        ],
+        "after_srgb": [
+          0.344278,
+          0.63177,
+          0.962056
+        ],
+        "delta_rgb": [
+          0.027064,
+          0.066282,
+          0.051311
+        ],
+        "red_delta": 0.027064,
+        "green_delta": 0.066282,
+        "blue_delta": 0.051311,
+        "luma_delta": 0.056863,
+        "chroma_delta": 0.024246,
+        "hue_delta_deg": 2.8238,
+        "flags": [
+          "sky_red_green_high_or_blue_low"
+        ]
+      },
+      {
+        "id": "validation_skin_medium",
+        "role": "SKIN",
+        "page": 18,
+        "mode": "NIVUKX",
+        "before_srgb": [
+          0.565489,
+          0.356076,
+          0.266821
+        ],
+        "after_srgb": [
+          0.510588,
+          0.416406,
+          0.335084
+        ],
+        "delta_rgb": [
+          -0.054901,
+          0.06033,
+          0.068263
+        ],
+        "red_delta": -0.054901,
+        "green_delta": 0.06033,
+        "blue_delta": 0.068263,
+        "luma_delta": 0.036405,
+        "chroma_delta": -0.123163,
+        "hue_delta_deg": 9.8711,
+        "flags": [
+          "skin_hue_shift_gt_5deg"
+        ]
+      },
+      {
+        "id": "validation_foliage",
+        "role": "FOLIAGE",
+        "page": 18,
+        "mode": "NIVUKX",
+        "before_srgb": [
+          0.196608,
+          0.48379,
+          0.16557
+        ],
+        "after_srgb": [
+          0.220532,
+          0.523768,
+          0.213555
+        ],
+        "delta_rgb": [
+          0.023924,
+          0.039979,
+          0.047985
+        ],
+        "red_delta": 0.023924,
+        "green_delta": 0.039979,
+        "blue_delta": 0.047985,
+        "luma_delta": 0.037143,
+        "chroma_delta": -0.008007,
+        "hue_delta_deg": 4.5027,
+        "flags": []
+      },
+      {
+        "id": "validation_highlight",
+        "role": "HIGHLIGHT",
+        "page": 18,
+        "mode": "NIVUKX",
+        "before_srgb": [
+          0.902923,
+          0.914581,
+          0.922317
+        ],
+        "after_srgb": [
+          0.764682,
+          0.855167,
+          0.913871
+        ],
+        "delta_rgb": [
+          -0.138242,
+          -0.059414,
+          -0.008446
+        ],
+        "red_delta": -0.138242,
+        "green_delta": -0.059414,
+        "blue_delta": -0.008446,
+        "luma_delta": -0.072493,
+        "chroma_delta": 0.129795,
+        "hue_delta_deg": 0.3246,
+        "flags": [
+          "highlight_channel_imbalance"
+        ]
+      },
+      {
+        "id": "validation_red",
+        "role": "SATURATED_RED",
+        "page": 18,
+        "mode": "NIVUKX",
+        "before_srgb": [
+          0.879673,
+          0.060802,
+          0.04915
+        ],
+        "after_srgb": [
+          0.649604,
+          0.089042,
+          0.08883
+        ],
+        "delta_rgb": [
+          -0.230069,
+          0.02824,
+          0.03968
+        ],
+        "red_delta": -0.230069,
+        "green_delta": 0.02824,
+        "blue_delta": 0.03968,
+        "luma_delta": -0.025851,
+        "chroma_delta": -0.269749,
+        "hue_delta_deg": 0.8191,
+        "flags": []
+      },
+      {
+        "id": "validation_cyan",
+        "role": "SATURATED_CYAN",
+        "page": 18,
+        "mode": "NIVUKX",
+        "before_srgb": [
+          0.04915,
+          0.763268,
+          0.821527
+        ],
+        "after_srgb": [
+          0.253983,
+          0.889709,
+          0.944306
+        ],
+        "delta_rgb": [
+          0.204833,
+          0.126441,
+          0.122779
+        ],
+        "red_delta": 0.204833,
+        "green_delta": 0.126441,
+        "blue_delta": 0.122779,
+        "luma_delta": 0.142843,
+        "chroma_delta": -0.082054,
+        "hue_delta_deg": 0.2197,
+        "flags": []
+      },
+      {
+        "id": "validation_texture",
+        "role": "TEXTURE",
+        "page": 18,
+        "mode": "NIVUKX",
+        "before_srgb": [
+          0.526801,
+          0.526801,
+          0.526801
+        ],
+        "after_srgb": [
+          0.54001,
+          0.585936,
+          0.610396
+        ],
+        "delta_rgb": [
+          0.013209,
+          0.059135,
+          0.083595
+        ],
+        "red_delta": 0.013209,
+        "green_delta": 0.059135,
+        "blue_delta": 0.083595,
+        "luma_delta": 0.051137,
+        "chroma_delta": 0.070386,
+        "hue_delta_deg": 159.1492,
+        "flags": []
+      }
+    ]
+  },
+  "role_summary": {
+    "NDR10": {
+      "NEUTRAL": {
+        "count": 1,
+        "mean_red_delta": 0.092586,
+        "mean_green_delta": 0.111971,
+        "mean_blue_delta": 0.118641,
+        "mean_luma_delta": 0.108331,
+        "mean_chroma_delta": 0.026055,
+        "mean_hue_delta_deg": 164.6401,
+        "flag_counts": {}
+      },
+      "SKY": {
+        "count": 1,
+        "mean_red_delta": 0.010957,
+        "mean_green_delta": 0.036423,
+        "mean_blue_delta": 0.028029,
+        "mean_luma_delta": 0.030403,
+        "mean_chroma_delta": 0.017072,
+        "mean_hue_delta_deg": 1.8006,
+        "flag_counts": {
+          "sky_red_green_high_or_blue_low": 1
+        }
+      },
+      "SKIN": {
+        "count": 1,
+        "mean_red_delta": -0.068422,
+        "mean_green_delta": 0.03912,
+        "mean_blue_delta": 0.04959,
+        "mean_luma_delta": 0.017012,
+        "mean_chroma_delta": -0.118012,
+        "mean_hue_delta_deg": 8.2357,
+        "flag_counts": {
+          "skin_hue_shift_gt_5deg": 1
+        }
+      },
+      "FOLIAGE": {
+        "count": 1,
+        "mean_red_delta": 0.011506,
+        "mean_green_delta": 0.013075,
+        "mean_blue_delta": 0.03591,
+        "mean_luma_delta": 0.01439,
+        "mean_chroma_delta": -0.022835,
+        "mean_hue_delta_deg": 4.5047,
+        "flag_counts": {}
+      },
+      "HIGHLIGHT": {
+        "count": 1,
+        "mean_red_delta": -0.178796,
+        "mean_green_delta": -0.075417,
+        "mean_blue_delta": -0.005354,
+        "mean_luma_delta": -0.092337,
+        "mean_chroma_delta": 0.173442,
+        "mean_hue_delta_deg": 0.2732,
+        "flag_counts": {
+          "highlight_channel_imbalance": 1
+        }
+      },
+      "SATURATED_RED": {
+        "count": 1,
+        "mean_red_delta": -0.230416,
+        "mean_green_delta": 0.02753,
+        "mean_blue_delta": 0.03905,
+        "mean_luma_delta": -0.026478,
+        "mean_chroma_delta": -0.269466,
+        "mean_hue_delta_deg": 0.8277,
+        "flag_counts": {}
+      },
+      "SATURATED_CYAN": {
+        "count": 1,
+        "mean_red_delta": 0.12366,
+        "mean_green_delta": 0.043289,
+        "mean_blue_delta": 0.069884,
+        "mean_luma_delta": 0.062296,
+        "mean_chroma_delta": -0.053776,
+        "mean_hue_delta_deg": 2.5593,
+        "flag_counts": {}
+      },
+      "TEXTURE": {
+        "count": 1,
+        "mean_red_delta": -0.016496,
+        "mean_green_delta": 0.027065,
+        "mean_blue_delta": 0.055565,
+        "mean_luma_delta": 0.019862,
+        "mean_chroma_delta": 0.072061,
+        "mean_hue_delta_deg": 156.2706,
+        "flag_counts": {}
+      }
+    },
+    "NIVUKX": {
+      "NEUTRAL": {
+        "count": 1,
+        "mean_red_delta": 0.112653,
+        "mean_green_delta": 0.133498,
+        "mean_blue_delta": 0.140664,
+        "mean_luma_delta": 0.129584,
+        "mean_chroma_delta": 0.028011,
+        "mean_hue_delta_deg": 164.6489,
+        "flag_counts": {}
+      },
+      "SKY": {
+        "count": 1,
+        "mean_red_delta": 0.027064,
+        "mean_green_delta": 0.066282,
+        "mean_blue_delta": 0.051311,
+        "mean_luma_delta": 0.056863,
+        "mean_chroma_delta": 0.024246,
+        "mean_hue_delta_deg": 2.8238,
+        "flag_counts": {
+          "sky_red_green_high_or_blue_low": 1
+        }
+      },
+      "SKIN": {
+        "count": 1,
+        "mean_red_delta": -0.054901,
+        "mean_green_delta": 0.06033,
+        "mean_blue_delta": 0.068263,
+        "mean_luma_delta": 0.036405,
+        "mean_chroma_delta": -0.123163,
+        "mean_hue_delta_deg": 9.8711,
+        "flag_counts": {
+          "skin_hue_shift_gt_5deg": 1
+        }
+      },
+      "FOLIAGE": {
+        "count": 1,
+        "mean_red_delta": 0.023924,
+        "mean_green_delta": 0.039979,
+        "mean_blue_delta": 0.047985,
+        "mean_luma_delta": 0.037143,
+        "mean_chroma_delta": -0.008007,
+        "mean_hue_delta_deg": 4.5027,
+        "flag_counts": {}
+      },
+      "HIGHLIGHT": {
+        "count": 1,
+        "mean_red_delta": -0.138242,
+        "mean_green_delta": -0.059414,
+        "mean_blue_delta": -0.008446,
+        "mean_luma_delta": -0.072493,
+        "mean_chroma_delta": 0.129795,
+        "mean_hue_delta_deg": 0.3246,
+        "flag_counts": {
+          "highlight_channel_imbalance": 1
+        }
+      },
+      "SATURATED_RED": {
+        "count": 1,
+        "mean_red_delta": -0.230069,
+        "mean_green_delta": 0.02824,
+        "mean_blue_delta": 0.03968,
+        "mean_luma_delta": -0.025851,
+        "mean_chroma_delta": -0.269749,
+        "mean_hue_delta_deg": 0.8191,
+        "flag_counts": {}
+      },
+      "SATURATED_CYAN": {
+        "count": 1,
+        "mean_red_delta": 0.204833,
+        "mean_green_delta": 0.126441,
+        "mean_blue_delta": 0.122779,
+        "mean_luma_delta": 0.142843,
+        "mean_chroma_delta": -0.082054,
+        "mean_hue_delta_deg": 0.2197,
+        "flag_counts": {}
+      },
+      "TEXTURE": {
+        "count": 1,
+        "mean_red_delta": 0.013209,
+        "mean_green_delta": 0.059135,
+        "mean_blue_delta": 0.083595,
+        "mean_luma_delta": 0.051137,
+        "mean_chroma_delta": 0.070386,
+        "mean_hue_delta_deg": 159.1492,
+        "flag_counts": {}
+      }
+    }
+  },
+  "recommendations": {
+    "NDR10": [
+      "NDR10: sky role still trends warm/cyan in offline tone math; tighten sky hue guard or reduce highlight neutral trim before live-camera retest.",
+      "NDR10: skin role shifts red/hue in offline tone math; strengthen measured skin hue guard after knee curve.",
+      "NDR10: highlight patches show channel imbalance; keep highlight balance guard active before final color guard."
+    ],
+    "NIVUKX": [
+      "NIVUKX: sky role still trends warm/cyan in offline tone math; tighten sky hue guard or reduce highlight neutral trim before live-camera retest.",
+      "NIVUKX: skin role shifts red/hue in offline tone math; strengthen measured skin hue guard after knee curve.",
+      "NIVUKX: highlight patches show channel imbalance; keep highlight balance guard active before final color guard."
+    ]
+  }
+}

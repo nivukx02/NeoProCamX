@@ -1,0 +1,35 @@
+{
+  "version": "NDR_NIVUKX_CRORE_IMAGE_CORPUS_V1",
+  "profile": "NDR10_PLUS_NIVUKX_VISION_ELITE_CRORE_CALIBRATION",
+  "image_count": 100000000,
+  "image_width": 8,
+  "image_height": 8,
+  "pixels_per_image": 64,
+  "total_pixel_samples": 6400000000,
+  "materialization": "DETERMINISTIC_ON_DEMAND",
+  "storage_policy": "Do not store crore PNGs inside the APK; generate exact image pixels by index.",
+  "generator": "com.neoproc.neoproccamx.color.NdrNivukxEliteCalibrationImageCorpus",
+  "tone_validator": "com.neoproc.neoproccamx.color.NdrNivukxEliteCalibrationHarness.validateImages",
+  "roles": [
+    "NEUTRAL_RAMP",
+    "SKIN_MEMORY",
+    "SKY_GRADIENT",
+    "HIGHLIGHT_ROLLOFF",
+    "SHADOW_CHROMA",
+    "FOLIAGE_MEMORY",
+    "SATURATION_BOUNDARY",
+    "WB_ILLUMINANT",
+    "RED_FACE_GUARD",
+    "CYAN_GREEN_GUARD",
+    "TEXTURE_DETAIL",
+    "LOW_NOISE_DARK"
+  ],
+  "strict_gates": {
+    "mean_hue_drift_degrees_max": 0.35,
+    "max_skin_hue_drift_degrees_max": 1.5,
+    "sky_blue_dominance_failure_rate_max": 0.001,
+    "highlight_clip_rate_max": 0.0005,
+    "max_neutral_channel_error_max": 0.004
+  },
+  "truth_boundary": "This corpus is original NeoProCamX calibration math. It does not embed, decode, imitate, or certify Dolby Vision metadata."
+}

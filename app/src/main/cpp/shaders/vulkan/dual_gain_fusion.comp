@@ -1,0 +1,154 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define NEO_ACESCG_NON_CERTIFIED 1
+#define ACESCG_LINEAR_WORKING_SPACE 1
+#define OMNIPOTENT_DUAL_GAIN_FUSION 1
+#define ZENITH_COSMIC_PLANCK_DUAL_GAIN_PIPELINE 1
+#define MICROSECOND_DUAL_GAIN_SYNC_GUARD 1
+
+layout(binding = 0, rgba16f) readonly uniform image2D uLcgAcesCg;
+layout(binding = 1, rgba16f) readonly uniform image2D uHcgAcesCg;
+layout(binding = 2, rgba16f) writeonly uniform image2D uFusedAcesCg;
+layout(binding = 3, rgba16f) writeonly uniform image2D uMotionConfidence;
+
+layout(push_constant) uniform DualGainFusionParams {
+    uint width;
+    uint height;
+    float kGain;
+    float noiseFloor;
+    float saturationThreshold;
+    float shadowStretch;
+} params;
+
+float acesCgLuma(vec3 color) {
+    return dot(color, vec3(0.272229, 0.674082, 0.053689));
+}
+
+vec3 loadLcg(ivec2 coord) {
+    ivec2 safeCoord = clamp(coord, ivec2(0), ivec2(int(params.width) - 1, int(params.height) - 1));
+    return max(imageLoad(uLcgAcesCg, safeCoord).rgb, vec3(0.0));
+}
+
+vec3 loadHcg(ivec2 coord) {
+    ivec2 safeCoord = clamp(coord, ivec2(0), ivec2(int(params.width) - 1, int(params.height) - 1));
+    return max(imageLoad(uHcgAcesCg, safeCoord).rgb, vec3(0.0));
+}
+
+float subPixelLumaDifference(ivec2 coord, vec3 equalizedCenter, vec3 hcgCenter) {
+    float centerDelta = abs(acesCgLuma(equalizedCenter) - acesCgLuma(hcgCenter));
+    vec2 halfPixel = vec2(0.5);
+    float regionalDelta = centerDelta;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 sampleCoord = coord + ivec2(x, y);
+            vec3 lcgSample = loadLcg(sampleCoord) * params.kGain;
+            vec3 hcgSample = loadHcg(sampleCoord);
+            float sampleDelta = abs(acesCgLuma(lcgSample) - acesCgLuma(hcgSample));
+            float subPixelWeight = 1.0 / (1.0 + length(vec2(x, y) + halfPixel) * 0.42);
+            regionalDelta += sampleDelta * subPixelWeight;
+        }
+    }
+    return regionalDelta / 7.34;
+}
+
+float hcgSaturation(vec3 hcgSignal) {
+    float maxChannel = max(hcgSignal.r, max(hcgSignal.g, hcgSignal.b));
+    return smoothstep(params.saturationThreshold * 0.82, params.saturationThreshold, maxChannel);
+}
+
+float computeMotionMask(float lumaDifference, float localSignal) {
+    float safeNoiseFloor = max(params.noiseFloor, 1e-5);
+    float normalized = (lumaDifference - safeNoiseFloor) / max(localSignal + safeNoiseFloor, 1e-5);
+    return smoothstep(0.018, 0.145, normalized);
+}
+
+vec3 coherentWavefrontChromaticAberrationCorrection(ivec2 coord, vec3 signal, bool hcgSource) {
+    ivec2 size = ivec2(int(params.width), int(params.height));
+    ivec2 redCoord = clamp(coord + ivec2(-1, 0), ivec2(0), size - ivec2(1));
+    ivec2 blueCoord = clamp(coord + ivec2(1, 0), ivec2(0), size - ivec2(1));
+    vec3 redAligned = hcgSource ? loadHcg(redCoord) : loadLcg(redCoord) * max(params.kGain, 1.0);
+    vec3 blueAligned = hcgSource ? loadHcg(blueCoord) : loadLcg(blueCoord) * max(params.kGain, 1.0);
+    float edgeLuma = abs(acesCgLuma(redAligned) - acesCgLuma(blueAligned));
+    float correctionWeight = smoothstep(0.025, 0.18, edgeLuma) * 0.18;
+    return vec3(
+        mix(signal.r, redAligned.r, correctionWeight),
+        signal.g,
+        mix(signal.b, blueAligned.b, correctionWeight)
+    );
+}
+
+float localizedLuminanceWeight(vec3 lcgSignal, vec3 hcgSignal, float saturationAmount) {
+    float lcgLuma = acesCgLuma(lcgSignal);
+    float hcgLuma = acesCgLuma(hcgSignal);
+    float shadowSnrWeight = 1.0 - smoothstep(0.025, 0.38, hcgLuma);
+    float highlightProtect = 1.0 - saturationAmount;
+    float exposureContinuity = exp(-abs(lcgLuma - hcgLuma) / max(params.noiseFloor + 0.035, 1e-5));
+    return clamp(mix(highlightProtect, shadowSnrWeight, 0.42) * exposureContinuity, 0.0, 1.0);
+}
+
+vec3 acescgExposureBlend32f(vec3 lcgSignal, vec3 hcgSignal, float baseHcgWeight, float saturationAmount) {
+    float localWeight = localizedLuminanceWeight(lcgSignal, hcgSignal, saturationAmount);
+    float hcgWeight = clamp(baseHcgWeight * (0.55 + localWeight * 0.45), 0.0, 1.0);
+    vec3 blended = mix(lcgSignal, hcgSignal, hcgWeight);
+    float blendedLuma = max(acesCgLuma(blended), 1e-5);
+    float targetLuma = mix(acesCgLuma(lcgSignal), acesCgLuma(hcgSignal), hcgWeight);
+    return max(blended * (targetLuma / blendedLuma), vec3(0.0));
+}
+
+vec3 subPixelWavefrontAlignment(ivec2 coord, vec3 signal, bool hcgSource) {
+    ivec2 size = ivec2(int(params.width), int(params.height));
+    vec3 left = hcgSource ? loadHcg(clamp(coord + ivec2(-1, 0), ivec2(0), size - ivec2(1)))
+                          : loadLcg(clamp(coord + ivec2(-1, 0), ivec2(0), size - ivec2(1))) * max(params.kGain, 1.0);
+    vec3 right = hcgSource ? loadHcg(clamp(coord + ivec2(1, 0), ivec2(0), size - ivec2(1)))
+                           : loadLcg(clamp(coord + ivec2(1, 0), ivec2(0), size - ivec2(1))) * max(params.kGain, 1.0);
+    float redBlueSkew = clamp((right.b - left.r) * 0.08, -0.035, 0.035);
+    float highContrastEdge = smoothstep(0.025, 0.22, abs(acesCgLuma(right) - acesCgLuma(left)));
+    return vec3(
+        mix(signal.r, left.r + redBlueSkew, highContrastEdge * 0.12),
+        signal.g,
+        mix(signal.b, right.b - redBlueSkew, highContrastEdge * 0.12)
+    );
+}
+
+vec3 linearAcesCgExposureFusionCosmic(vec3 lcgSignal, vec3 hcgSignal, float baseHcgWeight, float saturationAmount) {
+    vec3 baseBlend = acescgExposureBlend32f(lcgSignal, hcgSignal, baseHcgWeight, saturationAmount);
+    float luminanceWeight = localizedLuminanceWeight(lcgSignal, hcgSignal, saturationAmount);
+    float shadowContinuity = 1.0 - smoothstep(0.04, 0.36, acesCgLuma(baseBlend));
+    vec3 shadowSNRBlend = mix(lcgSignal, hcgSignal, clamp(luminanceWeight + shadowContinuity * 0.18, 0.0, 1.0));
+    return max(mix(baseBlend, shadowSNRBlend, shadowContinuity * 0.22), vec3(0.0));
+}
+
+vec3 applyShadowStretch(vec3 equalizedLcg, float motionAmount) {
+    float y = max(acesCgLuma(equalizedLcg), 1e-5);
+    float shadowWeight = 1.0 - smoothstep(0.035, 0.34, y);
+    float lift = params.shadowStretch * motionAmount * shadowWeight;
+    return equalizedLcg * (1.0 + lift);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(params.width) || coord.y >= int(params.height)) return;
+
+    vec3 equalizedLcg = loadLcg(coord) * max(params.kGain, 1.0);
+    vec3 hcgSignal = loadHcg(coord);
+    equalizedLcg = coherentWavefrontChromaticAberrationCorrection(coord, equalizedLcg, false);
+    hcgSignal = coherentWavefrontChromaticAberrationCorrection(coord, hcgSignal, true);
+    equalizedLcg = subPixelWavefrontAlignment(coord, equalizedLcg, false);
+    hcgSignal = subPixelWavefrontAlignment(coord, hcgSignal, true);
+    float difference = subPixelLumaDifference(coord, equalizedLcg, hcgSignal);
+    float localSignal = max(max(acesCgLuma(equalizedLcg), acesCgLuma(hcgSignal)), 1e-5);
+    float motionMask = computeMotionMask(difference, localSignal);
+    float saturationAmount = hcgSaturation(hcgSignal);
+
+    float staticHcgWeight = 1.0 - saturationAmount;
+    vec3 staticBlend = acescgExposureBlend32f(equalizedLcg, hcgSignal, staticHcgWeight, saturationAmount);
+    staticBlend = linearAcesCgExposureFusionCosmic(equalizedLcg, hcgSignal, staticHcgWeight, saturationAmount);
+    vec3 motionSafeLcg = applyShadowStretch(equalizedLcg, motionMask);
+    vec3 fused = mix(staticBlend, mix(hcgSignal, equalizedLcg, motionMask), motionMask);
+    fused = mix(fused, motionSafeLcg, motionMask * 0.62);
+
+    imageStore(uFusedAcesCg, coord, vec4(max(fused, vec3(0.0)), 1.0));
+    imageStore(uMotionConfidence, coord, vec4(vec3(motionMask), 1.0));
+}

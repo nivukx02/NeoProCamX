@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Flat translucent icon button with a simple pressed-state tint. -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_pressed="true">
+        <shape android:shape="oval">
+            <solid android:color="@color/glass_button_pressed" />
+            <stroke android:width="1dp" android:color="@color/glass_border" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="@color/glass_flat_button" />
+            <stroke android:width="1dp" android:color="@color/glass_border" />
+        </shape>
+    </item>
+</selector>

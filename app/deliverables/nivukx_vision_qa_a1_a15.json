@@ -1,0 +1,21 @@
+{
+  "schema": "nivukx-vision-a1-a15-v1",
+  "signedIntoTmb": true,
+  "tests": [
+    {"id": "A1", "metric": "hue_delta_e2000_max", "threshold": "<0.5"},
+    {"id": "A2", "metric": "skin_delta_e2000_max", "threshold": "<2.0"},
+    {"id": "A3", "metric": "specular_chroma_at_clip", "threshold": ">=0.15"},
+    {"id": "A4", "metric": "sky_hue_drift_degrees", "threshold": "<1.0"},
+    {"id": "A5", "metric": "look_round_trip_delta_e2000_max", "threshold": "<0.8"},
+    {"id": "A6", "metric": "gamut_boundary_overshoot", "threshold": "<=0.0"},
+    {"id": "A7", "metric": "lightness_drift_max", "threshold": "0.0"},
+    {"id": "A8", "metric": "noise_sigma_ire", "threshold": "<=0.4 base and <=0.8 high_gain"},
+    {"id": "A9", "metric": "mtf50_retention", "threshold": ">=0.92"},
+    {"id": "A10", "metric": "acutance_gain_and_halo", "threshold": ">=0.25 gain and <=0.04 halo"},
+    {"id": "A11", "metric": "gradient_banding_delta_code", "threshold": "0.0"},
+    {"id": "A12", "metric": "metadata_bitrate_ratio", "threshold": "<=0.0015"},
+    {"id": "A13", "metric": "tmb_signature_and_fallback_honesty", "threshold": "true"},
+    {"id": "A14", "metric": "nlogs12_round_trip_delta_e2000_max", "threshold": "<0.3"},
+    {"id": "A15", "metric": "deterministic_hash_match", "threshold": "true"}
+  ]
+}

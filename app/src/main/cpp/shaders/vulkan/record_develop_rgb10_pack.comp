@@ -1,0 +1,196 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 1) buffer PackedOutput {
+    uint packedData[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer InputRgb10 {
+    // Two words per pixel: word0 = R | (G << 16), word1 = B.
+    uint rgb10Data[];
+};
+
+layout(push_constant) uniform PackPushConstants {
+    uint width;
+    uint height;
+    uint mode;
+} pushData;
+
+const uint PACK_R210 = 0u;
+const uint PACK_V210 = 1u;
+const uint PACK_P010_BT2020 = 2u;
+const uint PACK_P010_BT709 = 3u;
+
+const float MAX10 = 1023.0;
+const float LUMA_MIN = 64.0;
+const float LUMA_MAX = 940.0;
+const float CHROMA_MIN = 64.0;
+const float CHROMA_MAX = 960.0;
+const float CHROMA_ZERO = 512.0;
+
+uint rowBytesR210(uint width) {
+    return ((width + 63u) / 64u) * 256u;
+}
+
+uint rowBytesV210(uint width) {
+    return ((width + 47u) / 48u) * 128u;
+}
+
+uint byteSwap32(uint v) {
+    return ((v & 0x000000FFu) << 24u) |
+        ((v & 0x0000FF00u) << 8u) |
+        ((v & 0x00FF0000u) >> 8u) |
+        ((v & 0xFF000000u) >> 24u);
+}
+
+uint clamp10u(uint v) {
+    return min(v, 1023u);
+}
+
+uint clamp10i(int v) {
+    return uint(clamp(v, 0, 1023));
+}
+
+uint trunc10(float v) {
+    return clamp10i(int(v));
+}
+
+uint round10(float v) {
+    return clamp10i(int(floor(v + 0.5)));
+}
+
+uvec3 readRgb10(uint pixel) {
+    uint word0 = rgb10Data[pixel * 2u];
+    return uvec3(
+        clamp10u(word0 & 0xFFFFu),
+        clamp10u((word0 >> 16u) & 0xFFFFu),
+        clamp10u(rgb10Data[pixel * 2u + 1u] & 0xFFFFu)
+    );
+}
+
+uvec3 ycbcrForPixel(uint pixel, bool bt709, bool rounded) {
+    uvec3 codes = readRgb10(pixel);
+    float rf = float(codes.r) / MAX10;
+    float gf = float(codes.g) / MAX10;
+    float bf = float(codes.b) / MAX10;
+    float kr = bt709 ? 0.2126 : 0.2627;
+    float kb = bt709 ? 0.0722 : 0.0593;
+    float kg = 1.0 - kr - kb;
+    float yp = kr * rf + kg * gf + kb * bf;
+    float cbv = (bf - yp) / (2.0 * (1.0 - kb));
+    float crv = (rf - yp) / (2.0 * (1.0 - kr));
+    if (rounded) {
+        return uvec3(
+            round10(yp * (LUMA_MAX - LUMA_MIN) + LUMA_MIN),
+            round10(cbv * (CHROMA_MAX - CHROMA_MIN) + CHROMA_ZERO),
+            round10(crv * (CHROMA_MAX - CHROMA_MIN) + CHROMA_ZERO)
+        );
+    }
+    return uvec3(
+        trunc10(yp * (LUMA_MAX - LUMA_MIN) + LUMA_MIN),
+        trunc10(cbv * (CHROMA_MAX - CHROMA_MIN) + CHROMA_ZERO),
+        trunc10(crv * (CHROMA_MAX - CHROMA_MIN) + CHROMA_ZERO)
+    );
+}
+
+uint p010Word(uint code) {
+    return clamp10u(code) << 6u;
+}
+
+void packR210(uint id) {
+    uint strideWords = rowBytesR210(pushData.width) / 4u;
+    uint totalWords = strideWords * pushData.height;
+    if (id >= totalWords) return;
+    uint x = id % strideWords;
+    uint y = id / strideWords;
+    if (x >= pushData.width) {
+        packedData[id] = 0u;
+        return;
+    }
+    uvec3 c = readRgb10(y * pushData.width + x);
+    uint word = ((c.r & 0x3FFu) << 20u) | ((c.g & 0x3FFu) << 10u) | (c.b & 0x3FFu);
+    packedData[id] = byteSwap32(word);
+}
+
+void packV210(uint id) {
+    uint rowWords = rowBytesV210(pushData.width) / 4u;
+    uint rowGroups = rowWords / 4u;
+    uint totalGroups = rowGroups * pushData.height;
+    if (id >= totalGroups) return;
+    uint group = id % rowGroups;
+    uint y = id / rowGroups;
+    uint x = group * 6u;
+    uint outWord = y * rowWords + group * 4u;
+    if (x >= pushData.width) {
+        packedData[outWord] = 0u;
+        packedData[outWord + 1u] = 0u;
+        packedData[outWord + 2u] = 0u;
+        packedData[outWord + 3u] = 0u;
+        return;
+    }
+
+    uint base = y * pushData.width;
+    uvec3 c0 = ycbcrForPixel(base + x, false, false);
+    uvec3 c1 = (x + 1u < pushData.width) ? ycbcrForPixel(base + x + 1u, false, false) : c0;
+    uvec3 c2 = (x + 2u < pushData.width) ? ycbcrForPixel(base + x + 2u, false, false) : c1;
+    uvec3 c3 = (x + 3u < pushData.width) ? ycbcrForPixel(base + x + 3u, false, false) : c2;
+    uvec3 c4 = (x + 4u < pushData.width) ? ycbcrForPixel(base + x + 4u, false, false) : c3;
+    uvec3 c5 = (x + 5u < pushData.width) ? ycbcrForPixel(base + x + 5u, false, false) : c4;
+    uvec3 chroma2 = (x + 2u < pushData.width) ? ycbcrForPixel(base + x + 2u, false, false) : c0;
+    uvec3 chroma4 = (x + 4u < pushData.width) ? ycbcrForPixel(base + x + 4u, false, false) : chroma2;
+
+    packedData[outWord] = ((c0.b & 0x3FFu) << 20u) | ((c0.r & 0x3FFu) << 10u) | (c0.g & 0x3FFu);
+    packedData[outWord + 1u] = ((c2.r & 0x3FFu) << 20u) | ((chroma2.g & 0x3FFu) << 10u) | (c1.r & 0x3FFu);
+    packedData[outWord + 2u] = ((chroma4.g & 0x3FFu) << 20u) | ((c3.r & 0x3FFu) << 10u) | (chroma2.b & 0x3FFu);
+    packedData[outWord + 3u] = ((c5.r & 0x3FFu) << 20u) | ((chroma4.b & 0x3FFu) << 10u) | (c4.r & 0x3FFu);
+}
+
+void packP010420(uint id) {
+    uint pixels = pushData.width * pushData.height;
+    uint lumaPairs = (pixels + 1u) / 2u;
+    uint chromaWidth = (pushData.width + 1u) / 2u;
+    uint chromaHeight = (pushData.height + 1u) / 2u;
+    uint chromaPixels = chromaWidth * chromaHeight;
+    bool bt709 = pushData.mode == PACK_P010_BT709;
+
+    if (id < lumaPairs) {
+        uint p0 = id * 2u;
+        uint p1 = p0 + 1u;
+        uint y0 = p0 < pixels ? ycbcrForPixel(p0, bt709, true).r : 0u;
+        uint y1 = p1 < pixels ? ycbcrForPixel(p1, bt709, true).r : 0u;
+        packedData[id] = p010Word(y0) | (p010Word(y1) << 16u);
+    }
+
+    if (id < chromaPixels) {
+        uint cx = id % chromaWidth;
+        uint cy = id / chromaWidth;
+        uint x0 = min(cx * 2u, pushData.width - 1u);
+        uint x1 = min(x0 + 1u, pushData.width - 1u);
+        uint y0 = min(cy * 2u, pushData.height - 1u);
+        uint y1 = min(y0 + 1u, pushData.height - 1u);
+        uint p00 = y0 * pushData.width + x0;
+        uint p01 = y0 * pushData.width + x1;
+        uint p10 = y1 * pushData.width + x0;
+        uint p11 = y1 * pushData.width + x1;
+        uvec3 c00 = ycbcrForPixel(p00, bt709, true);
+        uvec3 c01 = ycbcrForPixel(p01, bt709, true);
+        uvec3 c10 = ycbcrForPixel(p10, bt709, true);
+        uvec3 c11 = ycbcrForPixel(p11, bt709, true);
+        uint cb = round10(float(c00.g + c01.g + c10.g + c11.g) * 0.25);
+        uint cr = round10(float(c00.b + c01.b + c10.b + c11.b) * 0.25);
+        packedData[lumaPairs + id] = p010Word(cb) | (p010Word(cr) << 16u);
+    }
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (pushData.width == 0u || pushData.height == 0u) return;
+    if (pushData.mode == PACK_R210) {
+        packR210(id);
+    } else if (pushData.mode == PACK_V210) {
+        packV210(id);
+    } else {
+        packP010420(id);
+    }
+}

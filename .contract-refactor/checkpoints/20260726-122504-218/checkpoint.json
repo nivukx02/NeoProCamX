@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 2,
+  "engineVersion": "2.0-contract-graph",
+  "transaction": "engine-scoped-rollback-smoke-test",
+  "manifest": "tools/contract-refactor/rollback-smoke-manifest.json",
+  "manifestSha256": "4a1e6b8c4633c5e227fdbd8913e1c086c7eac439c0868355cbf60015f64f1cda",
+  "createdAt": "2026-07-26T12:25:04.3026839+05:30",
+  "allowedFiles": "tools/contract-refactor/fixtures/rollback-host.txt",
+  "protectedFiles": [
+    {
+      "file": "tools/contract-refactor/fixtures/rollback-protected.txt",
+      "lines": 1,
+      "bytes": 27,
+      "sha256": "2155e2a933ccbc32a0ba362f32a129b7003c29d9a5809046868561ff8102ddf1"
+    }
+  ],
+  "files": [
+    {
+      "file": "tools/contract-refactor/fixtures/rollback-host.txt",
+      "existed": true,
+      "lines": 1,
+      "bytes": 21,
+      "sha256": "7b11d10b86d78324a64cf46dad89526ca58f5812dec1d949feca2e9916b4e76d"
+    },
+    {
+      "file": "tools/contract-refactor/fixtures/rollback-protected.txt",
+      "existed": true,
+      "lines": 1,
+      "bytes": 27,
+      "sha256": "2155e2a933ccbc32a0ba362f32a129b7003c29d9a5809046868561ff8102ddf1"
+    }
+  ]
+}

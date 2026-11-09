@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- shutter_button.xml -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <gradient
+        android:angle="270"
+        android:startColor="#FFFFFFFF"
+        android:endColor="#FFF1F5F8" />
+    <stroke android:width="2dp" android:color="#66FFFFFF" />
+</shape>

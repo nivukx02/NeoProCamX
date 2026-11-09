@@ -1,0 +1,141 @@
+#version 450
+
+// Second pass of the offline NPV10 export. The first pass leaves the complete quality-enhanced P010
+// raster in binding 2. This pass applies the selected display-referred SDR 3D LUT on Vulkan and writes
+// canonical 10-bit P010 into binding 0. One invocation owns one 2x2 luma/chroma block, preserving the
+// CPU reference's 4:2:0 averaging rule without cross-workgroup dependencies.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) buffer GradedP010 {
+    uint gradedData[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer EnhancedP010 {
+    uint enhancedData[];
+};
+
+// The shared binding starts with the 44-float GpuImageEnhancementUniforms ABI. LUT RGB values follow
+// immediately in R-fastest order: ((b*N + g)*N + r)*3 + channel.
+layout(std430, set = 0, binding = 3) readonly buffer UniformAndLutBlock {
+    float packet[];
+};
+
+layout(push_constant) uniform ExportGradePushConstants {
+    uint width;
+    uint height;
+    uint hasPreviousFrame;
+    uint lutSize;
+} pushData;
+
+const uint ENHANCEMENT_UNIFORM_FLOAT_COUNT = 44u;
+const float MAX10 = 1023.0;
+const float NEUTRAL_CHROMA = 512.0;
+const float KR = 0.2126;
+const float KG = 0.7152;
+const float KB = 0.0722;
+
+uint readLane(uint packedWord, uint sampleIndex) {
+    return (packedWord >> ((sampleIndex & 1u) * 16u)) & 0xFFFFu;
+}
+
+uint readEnhanced10(uint sampleIndex) {
+    return clamp(readLane(enhancedData[sampleIndex >> 1u], sampleIndex) >> 6u, 0u, 1023u);
+}
+
+void writeGraded10(uint sampleIndex, uint value10) {
+    uint wordIndex = sampleIndex >> 1u;
+    uint shift = (sampleIndex & 1u) * 16u;
+    uint laneMask = 0xFFFFu << shift;
+    uint packed = (clamp(value10, 0u, 1023u) << 6u) << shift;
+    uint oldWord = gradedData[wordIndex];
+    while (true) {
+        uint nextWord = (oldWord & ~laneMask) | (packed & laneMask);
+        uint observed = atomicCompSwap(gradedData[wordIndex], oldWord, nextWord);
+        if (observed == oldWord) return;
+        oldWord = observed;
+    }
+}
+
+vec3 yuvToRgb(uint y10, uint u10, uint v10) {
+    float y = float(y10) / MAX10;
+    float u = (float(u10) - NEUTRAL_CHROMA) / 512.0;
+    float v = (float(v10) - NEUTRAL_CHROMA) / 512.0;
+    return clamp(vec3(
+        y + 1.5748 * v,
+        y - 0.1873 * u - 0.4681 * v,
+        y + 1.8556 * u
+    ), 0.0, 1.0);
+}
+
+vec3 lutTexel(uvec3 index3) {
+    uint n = pushData.lutSize;
+    uint base = ENHANCEMENT_UNIFORM_FLOAT_COUNT +
+        ((index3.z * n * n + index3.y * n + index3.x) * 3u);
+    return vec3(packet[base], packet[base + 1u], packet[base + 2u]);
+}
+
+vec3 sampleGradeLutTrilinear(vec3 rgb) {
+    uint maximumIndex = pushData.lutSize - 1u;
+    vec3 scaled = clamp(rgb, 0.0, 1.0) * float(maximumIndex);
+    uvec3 i0 = min(uvec3(floor(scaled)), uvec3(maximumIndex));
+    uvec3 i1 = min(i0 + uvec3(1u), uvec3(maximumIndex));
+    vec3 d = scaled - vec3(i0);
+
+    vec3 c000 = lutTexel(uvec3(i0.x, i0.y, i0.z));
+    vec3 c100 = lutTexel(uvec3(i1.x, i0.y, i0.z));
+    vec3 c010 = lutTexel(uvec3(i0.x, i1.y, i0.z));
+    vec3 c110 = lutTexel(uvec3(i1.x, i1.y, i0.z));
+    vec3 c001 = lutTexel(uvec3(i0.x, i0.y, i1.z));
+    vec3 c101 = lutTexel(uvec3(i1.x, i0.y, i1.z));
+    vec3 c011 = lutTexel(uvec3(i0.x, i1.y, i1.z));
+    vec3 c111 = lutTexel(uvec3(i1.x, i1.y, i1.z));
+    vec3 c00 = mix(c000, c100, d.x);
+    vec3 c10 = mix(c010, c110, d.x);
+    vec3 c01 = mix(c001, c101, d.x);
+    vec3 c11 = mix(c011, c111, d.x);
+    return clamp(mix(mix(c00, c10, d.y), mix(c01, c11, d.y), d.z), 0.0, 1.0);
+}
+
+uint quantize10(float value) {
+    return uint(clamp(floor(value + 0.5), 0.0, MAX10));
+}
+
+void main() {
+    uint blockX = gl_GlobalInvocationID.x;
+    uint blockY = gl_GlobalInvocationID.y;
+    uint chromaWidth = (pushData.width + 1u) / 2u;
+    uint chromaHeight = (pushData.height + 1u) / 2u;
+    if (blockX >= chromaWidth || blockY >= chromaHeight || pushData.lutSize < 2u) return;
+
+    uint chromaPair = pushData.width * pushData.height +
+        (blockY * chromaWidth + blockX) * 2u;
+    uint u10 = readEnhanced10(chromaPair);
+    uint v10 = readEnhanced10(chromaPair + 1u);
+    vec3 rgbSum = vec3(0.0);
+    uint sampleCount = 0u;
+
+    for (uint dy = 0u; dy < 2u; ++dy) {
+        uint y = blockY * 2u + dy;
+        if (y >= pushData.height) continue;
+        for (uint dx = 0u; dx < 2u; ++dx) {
+            uint x = blockX * 2u + dx;
+            if (x >= pushData.width) continue;
+            uint lumaIndex = y * pushData.width + x;
+            vec3 graded = sampleGradeLutTrilinear(yuvToRgb(readEnhanced10(lumaIndex), u10, v10));
+            float luma = dot(graded, vec3(KR, KG, KB));
+            writeGraded10(lumaIndex, quantize10(luma * MAX10));
+            rgbSum += graded;
+            sampleCount += 1u;
+        }
+    }
+
+    if (sampleCount > 0u) {
+        vec3 averageRgb = rgbSum / float(sampleCount);
+        float blockLuma = dot(averageRgb, vec3(KR, KG, KB));
+        float cb = (averageRgb.b - blockLuma) / 1.8556;
+        float cr = (averageRgb.r - blockLuma) / 1.5748;
+        writeGraded10(chromaPair, quantize10(cb * 512.0 + NEUTRAL_CHROMA));
+        writeGraded10(chromaPair + 1u, quantize10(cr * 512.0 + NEUTRAL_CHROMA));
+    }
+}

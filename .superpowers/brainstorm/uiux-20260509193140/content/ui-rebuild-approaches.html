@@ -1,0 +1,81 @@
+<style>
+  .phone-row{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:18px;margin-top:18px}
+  .phone-card{border:1px solid rgba(255,255,255,.16);border-radius:18px;background:rgba(255,255,255,.04);padding:14px;cursor:pointer;transition:.18s ease}
+  .phone-card:hover{transform:translateY(-2px);border-color:rgba(255,207,82,.55)}
+  .phone-card.selected{outline:2px solid #ffd45f}
+  .phone{height:480px;border-radius:26px;overflow:hidden;background:#070809;position:relative;border:1px solid rgba(255,255,255,.18);box-shadow:0 18px 48px rgba(0,0,0,.38)}
+  .preview{position:absolute;inset:0;background:linear-gradient(145deg,#1c2526,#101111 45%,#22210f);opacity:.92}
+  .focus{position:absolute;width:74px;height:74px;border:1px solid rgba(255,220,86,.9);left:50%;top:39%;transform:translate(-50%,-50%);border-radius:8px}
+  .topbar{position:absolute;left:14px;right:14px;top:14px;height:42px;display:flex;align-items:center;justify-content:space-between}
+  .pill{border-radius:999px;background:rgba(0,0,0,.48);border:1px solid rgba(255,255,255,.15);color:#fff;padding:7px 10px;font-size:11px}
+  .modebar{position:absolute;left:0;right:0;bottom:104px;text-align:center;color:#fff;font-size:12px;letter-spacing:.6px}
+  .modebar span{display:inline-block;margin:0 7px;opacity:.62}.modebar b{color:#ffd45f}
+  .dock{position:absolute;left:0;right:0;bottom:0;height:98px;background:rgba(0,0,0,.72);display:flex;align-items:center;justify-content:center;gap:38px}
+  .thumb{width:42px;height:42px;border-radius:10px;background:linear-gradient(135deg,#4f6b73,#151617);border:1px solid rgba(255,255,255,.22)}
+  .shutter{width:72px;height:72px;border-radius:50%;border:5px solid rgba(255,255,255,.88);box-shadow:inset 0 0 0 18px #e84437;background:#151515}
+  .gear{width:42px;height:42px;border-radius:50%;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22)}
+  .side{position:absolute;right:10px;top:92px;display:flex;flex-direction:column;gap:10px}.side .pill{padding:9px 8px}
+  .metrics{position:absolute;left:14px;right:14px;bottom:166px;display:flex;justify-content:space-between;color:#f8f8f8;font-size:10px}
+  .drawer{position:absolute;left:0;right:0;bottom:98px;height:142px;background:rgba(9,9,9,.86);border-top:1px solid rgba(255,255,255,.15);padding:12px}
+  .control-row{display:flex;gap:8px;justify-content:space-between}.control{flex:1;border-radius:12px;background:rgba(255,255,255,.08);padding:10px 6px;text-align:center;color:#fff;font-size:10px}.control b{display:block;color:#ffd45f;font-size:13px;margin-top:4px}
+  .rail-left{position:absolute;left:10px;top:88px;display:flex;flex-direction:column;gap:8px}.rail-left .pill{font-size:10px}
+  .caption{margin-top:12px}.caption h3{margin:0 0 6px}.caption p{margin:0;color:rgba(255,255,255,.72);font-size:13px;line-height:1.45}
+  @media(max-width:900px){.phone-row{grid-template-columns:1fr}.phone{height:420px}}
+</style>
+
+<h2>Hybrid Camera UI Direction</h2>
+<p class="subtitle">You picked the hybrid direction: Vivo/iQOO speed plus Xiaomi-style pro polish. Choose which version should drive the rebuild.</p>
+
+<div class="phone-row">
+  <div class="phone-card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="phone">
+      <div class="preview"></div><div class="focus"></div>
+      <div class="topbar"><span class="pill">HDR AUTO</span><span class="pill">1x</span><span class="pill">SET</span></div>
+      <div class="side"><span class="pill">RAW</span><span class="pill">LOG</span><span class="pill">GRID</span></div>
+      <div class="modebar"><span>PHOTO</span><b>VIDEO</b><span>PRO</span><span>MORE</span></div>
+      <div class="dock"><div class="thumb"></div><div class="shutter"></div><div class="gear"></div></div>
+    </div>
+    <div class="caption">
+      <h3>A. Vivo Speed</h3>
+      <p>Cleanest daily camera. Fast mode rail, minimal overlays, pro settings hidden until needed.</p>
+    </div>
+  </div>
+
+  <div class="phone-card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="phone">
+      <div class="preview"></div><div class="focus"></div>
+      <div class="topbar"><span class="pill">4K60</span><span class="pill">10-bit</span><span class="pill">Bypass: Partial</span></div>
+      <div class="rail-left"><span class="pill">ISO</span><span class="pill">S</span><span class="pill">WB</span><span class="pill">MF</span><span class="pill">EV</span></div>
+      <div class="metrics"><span>ISO 100</span><span>1/120</span><span>5600K</span><span>OIS</span></div>
+      <div class="modebar"><span>PRO</span><b>LOG</b><span>HDR</span><span>RAW</span></div>
+      <div class="dock"><div class="thumb"></div><div class="shutter"></div><div class="gear"></div></div>
+    </div>
+    <div class="caption">
+      <h3>B. Xiaomi Pro Console</h3>
+      <p>Most professional at a glance. More persistent controls and meters, but heavier visually.</p>
+    </div>
+  </div>
+
+  <div class="phone-card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="phone">
+      <div class="preview"></div><div class="focus"></div>
+      <div class="topbar"><span class="pill">LOG 4K60</span><span class="pill">10-bit</span><span class="pill">⚙</span></div>
+      <div class="side"><span class="pill">LUT</span><span class="pill">HDR</span><span class="pill">WAVE</span></div>
+      <div class="drawer">
+        <div class="control-row">
+          <div class="control">ISO<b>AUTO</b></div>
+          <div class="control">S<b>1/120</b></div>
+          <div class="control">WB<b>5600K</b></div>
+          <div class="control">MF<b>AF-C</b></div>
+          <div class="control">EV<b>0.0</b></div>
+        </div>
+      </div>
+      <div class="modebar"><span>VIDEO</span><b>PRO</b><span>HDR</span><span>LOG</span><span>RAW</span></div>
+      <div class="dock"><div class="thumb"></div><div class="shutter"></div><div class="gear"></div></div>
+    </div>
+    <div class="caption">
+      <h3>C. Adaptive Hybrid</h3>
+      <p>Recommended. Simple default view, one-swipe pro drawer, persistent only for critical mode/status controls.</p>
+    </div>
+  </div>
+</div>

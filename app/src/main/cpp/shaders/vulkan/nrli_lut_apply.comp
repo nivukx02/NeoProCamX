@@ -1,0 +1,72 @@
+#version 450
+// SNCE_V2_HVC Stage 11 (NCQEE) — NRLI 3D LUT apply.
+// Tetrahedral 3D-LUT lookup with a creation-time trilinear compatibility fallback. The LUT itself is
+// fed by the bounded analytic look path; this shader is the classical sampler.
+// CPU reference: SnceNeuralEnhancement.trilinearSampleLut (Kotlin). strength blends the graded
+// result with the input so the enhancement can be dialled per mode.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly uniform image2D uInput;
+layout(binding = 1, rgba16f) writeonly uniform image2D uOutput;
+layout(binding = 2) uniform sampler3D uNrliLut;
+
+layout(push_constant) uniform NrliParams {
+    float lutSize;
+    float strength;
+} uNrli;
+
+// s2-f08 / CP43: broadcast/DI-grade tetrahedral interpolation behind a spec constant. The native
+// pipeline requests true and retries the default-false trilinear path if a driver rejects specialization.
+// When enabled each cell is split
+// into 6 tetrahedra and interpolated over 4 vertices, removing trilinear's saturated-diagonal hue
+// twist. Mirrors com.neoproc.neoproccamx.snce.SnceNeuralEnhancement.tetrahedralSampleLut.
+layout(constant_id = 0) const bool USE_TETRAHEDRAL = false;
+
+vec3 tetrahedralSample(vec3 rgb, float lutSize) {
+    float maxIdx = lutSize - 1.0;
+    vec3 c = clamp(rgb, 0.0, 1.0) * maxIdx;          // clamp-to-edge ⇒ extended-range safe (monotonic)
+    ivec3 i0 = clamp(ivec3(floor(c)), ivec3(0), ivec3(int(maxIdx)));
+    ivec3 i1 = min(i0 + 1, ivec3(int(maxIdx)));
+    vec3 f = c - vec3(i0);
+    vec3 c000 = texelFetch(uNrliLut, ivec3(i0.x, i0.y, i0.z), 0).rgb;
+    vec3 c111 = texelFetch(uNrliLut, ivec3(i1.x, i1.y, i1.z), 0).rgb;
+    vec3 c100 = texelFetch(uNrliLut, ivec3(i1.x, i0.y, i0.z), 0).rgb;
+    vec3 c010 = texelFetch(uNrliLut, ivec3(i0.x, i1.y, i0.z), 0).rgb;
+    vec3 c001 = texelFetch(uNrliLut, ivec3(i0.x, i0.y, i1.z), 0).rgb;
+    vec3 c110 = texelFetch(uNrliLut, ivec3(i1.x, i1.y, i0.z), 0).rgb;
+    vec3 c101 = texelFetch(uNrliLut, ivec3(i1.x, i0.y, i1.z), 0).rgb;
+    vec3 c011 = texelFetch(uNrliLut, ivec3(i0.x, i1.y, i1.z), 0).rgb;
+    if (f.r >= f.g) {
+        if (f.g >= f.b)      return c000 + f.r * (c100 - c000) + f.g * (c110 - c100) + f.b * (c111 - c110);
+        else if (f.r >= f.b) return c000 + f.r * (c100 - c000) + f.b * (c101 - c100) + f.g * (c111 - c101);
+        else                 return c000 + f.b * (c001 - c000) + f.r * (c101 - c001) + f.g * (c111 - c101);
+    } else {
+        if (f.b >= f.g)      return c000 + f.b * (c001 - c000) + f.g * (c011 - c001) + f.r * (c111 - c011);
+        else if (f.b >= f.r) return c000 + f.g * (c010 - c000) + f.b * (c011 - c010) + f.r * (c111 - c011);
+        else                 return c000 + f.g * (c010 - c000) + f.r * (c110 - c010) + f.b * (c111 - c110);
+    }
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uInput);
+    if (pos.x >= size.x || pos.y >= size.y) return;
+
+    vec4 color = imageLoad(uInput, pos);
+
+    float lutSize = max(uNrli.lutSize, 2.0);
+    vec3 graded;
+    if (USE_TETRAHEDRAL) {
+        graded = tetrahedralSample(color.rgb, lutSize);
+    } else {
+        // Map [0,1] to the LUT texel centres (half-texel inset) for correct trilinear sampling.
+        float scale = (lutSize - 1.0) / lutSize;
+        float offset = 1.0 / (2.0 * lutSize);
+        vec3 coord = clamp(color.rgb, 0.0, 1.0) * scale + offset;
+        graded = texture(uNrliLut, coord).rgb;
+    }
+    vec3 outRgb = mix(color.rgb, graded, clamp(uNrli.strength, 0.0, 1.0));
+
+    imageStore(uOutput, pos, vec4(outRgb, color.a));
+}

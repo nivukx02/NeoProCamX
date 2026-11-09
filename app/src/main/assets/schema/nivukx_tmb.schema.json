@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neoproc.local/schema/nivukx_tmb.schema.json",
+  "title": "NIVUKX Truth Metadata Block",
+  "type": "object",
+  "required": ["schema", "records"],
+  "properties": {
+    "schema": {
+      "const": "nivukx-tmb-draft-12"
+    },
+    "records": {
+      "type": "array",
+      "minItems": 8,
+      "items": {
+        "type": "object",
+        "required": ["tier", "previousHash", "hash", "payload"],
+        "properties": {
+          "tier": {
+            "type": "string",
+            "pattern": "^T[0-7]_[A-Z0-9_]+$"
+          },
+          "previousHash": {
+            "type": "string"
+          },
+          "hash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "payload": {
+            "type": "object",
+            "additionalProperties": {
+              "type": ["string", "number", "boolean"]
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

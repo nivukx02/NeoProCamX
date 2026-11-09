@@ -1,0 +1,328 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, r16ui) uniform readonly uimage2D rawInput;
+layout(binding = 1, rgba16f) uniform writeonly image2D acescgOutput;
+layout(binding = 2, r16f) uniform readonly image2D darkCurrentMap;
+layout(binding = 3, r8ui) uniform readonly uimage2D hotPixelMask;
+
+layout(std140, binding = 4) uniform RawDemosaicUniforms {
+    vec4 blackLevelRggb;
+    vec4 whiteBalanceRggb;
+    vec4 exposureThermal; // x=exposureMs, y=sensorTempC, z=referenceTempC, w=Q10
+    mat3 M_SENSOR_TO_XYZ;
+    mat3 M_XYZ_TO_ACESCG;
+    int bayerPattern; // 0=RGGB, 1=GRBG, 2=GBRG, 3=BGGR
+    int width;
+    int height;
+    int whiteLevel;
+    // Preview-only 3x3 Camera2 lens-shading map, row-major; each cell is (R, Gr, Gb, B).
+    vec4 lensShadingGridRggb0;
+    vec4 lensShadingGridRggb1;
+    vec4 lensShadingGridRggb2;
+    vec4 lensShadingGridRggb3;
+    vec4 lensShadingGridRggb4;
+    vec4 lensShadingGridRggb5;
+    vec4 lensShadingGridRggb6;
+    vec4 lensShadingGridRggb7;
+    vec4 lensShadingGridRggb8;
+    ivec4 lensShadingInfo; // x=enabled, yzw=reserved
+    // Preview/develop reconstruction only; sensor RAW master bytes are never changed.
+    // x=threshold, y=strength, z=shoulder enable, w=recovery enable.
+    vec4 highlightRecovery;
+    // Exact host-precomputed calibration removes one full-resolution divide and two dependent UBO
+    // lookups per shared-tile sample. Values encode (raw * scale + offset), clamped to [0, WB].
+    vec4 calibrationScaleRggb;
+    vec4 calibrationOffsetRggb;
+    // M_XYZ_TO_ACESCG * M_SENSOR_TO_XYZ, composed once per frame on the CPU in FP32. The original
+    // two legs remain in the ABI for diagnostics; pixels execute only this mathematically identical leg.
+    mat3 M_SENSOR_TO_ACESCG_FAST;
+} uniforms;
+
+// Native currently clears both calibration maps to identity and has no upload path for non-zero map
+// content. Compile that proven runtime state as the default fast variant, while keeping the complete
+// dark-current/hot-pixel implementation available to a future calibrated pipeline build via
+// `glslc -DRAW_DEMOSAIC_DEFECT_MAPS=1`. Descriptor bindings and the UBO ABI remain unchanged.
+#ifndef RAW_DEMOSAIC_DEFECT_MAPS
+#define RAW_DEMOSAIC_DEFECT_MAPS 0
+#endif
+
+const int WORKGROUP_WIDTH = 16;
+const int WORKGROUP_HEIGHT = 16;
+const int TILE_GUARD = 2;
+const int TILE_WIDTH = WORKGROUP_WIDTH + 2 * TILE_GUARD;
+const int TILE_HEIGHT = WORKGROUP_HEIGHT + 2 * TILE_GUARD;
+
+// Every output neighbourhood is read directly from this calibrated shared tile. No coordinate-based
+// fallback remains in the output phase, so glslc cannot inline hundreds of unreachable image reads.
+shared float calibratedTile[TILE_HEIGHT][TILE_WIDTH];
+#if RAW_DEMOSAIC_DEFECT_MAPS
+shared uint rawTile[TILE_HEIGHT][TILE_WIDTH];
+shared float darkTile[TILE_HEIGHT][TILE_WIDTH];
+shared uint hotTile[TILE_HEIGHT][TILE_WIDTH];
+shared float thermalDarkScale;
+#endif
+
+const float Q10 = 2.0;
+
+ivec2 clampCoord(ivec2 p) {
+    return clamp(p, ivec2(0), ivec2(uniforms.width - 1, uniforms.height - 1));
+}
+
+#if RAW_DEMOSAIC_DEFECT_MAPS
+ivec2 tileOrigin() {
+    return ivec2(gl_WorkGroupID.xy) * ivec2(WORKGROUP_WIDTH, WORKGROUP_HEIGHT) - ivec2(TILE_GUARD);
+}
+
+uint loadRaw(ivec2 p) {
+    ivec2 c = clampCoord(p);
+    ivec2 tile = c - tileOrigin();
+    if (all(greaterThanEqual(tile, ivec2(0))) && all(lessThan(tile, ivec2(TILE_WIDTH, TILE_HEIGHT)))) {
+        return rawTile[tile.y][tile.x];
+    }
+    return imageLoad(rawInput, c).r;
+}
+
+float loadDarkCurrent(ivec2 p) {
+    ivec2 c = clampCoord(p);
+    ivec2 tile = c - tileOrigin();
+    if (all(greaterThanEqual(tile, ivec2(0))) && all(lessThan(tile, ivec2(TILE_WIDTH, TILE_HEIGHT)))) {
+        return darkTile[tile.y][tile.x];
+    }
+    return imageLoad(darkCurrentMap, c).r;
+}
+
+uint loadHotPixel(ivec2 p) {
+    ivec2 c = clampCoord(p);
+    ivec2 tile = c - tileOrigin();
+    if (all(greaterThanEqual(tile, ivec2(0))) && all(lessThan(tile, ivec2(TILE_WIDTH, TILE_HEIGHT)))) {
+        return hotTile[tile.y][tile.x];
+    }
+    return imageLoad(hotPixelMask, c).r;
+}
+#endif
+
+int bayerChannel(ivec2 p) {
+    // The four native Bayer enum values are the exact XOR masks for the RGGB channel index:
+    // 0=RGGB, 1=GRBG, 2=GBRG, 3=BGGR. Preserve the legacy fail-safe exactly: every out-of-range JNI
+    // value is interpreted as BGGR rather than indexing a UBO vector outside its four components.
+    int idx = ((p.y & 1) << 1) | (p.x & 1);
+    int pattern = uniforms.bayerPattern;
+    if (pattern < 0 || pattern > 3) pattern = 3;
+    return idx ^ pattern;
+}
+
+float blackForChannel(int channel) {
+    return uniforms.blackLevelRggb[channel];
+}
+
+float wbForChannel(int channel) {
+    return uniforms.whiteBalanceRggb[channel];
+}
+
+vec4 lensShadingGridCell(int index) {
+    if (index == 0) return uniforms.lensShadingGridRggb0;
+    if (index == 1) return uniforms.lensShadingGridRggb1;
+    if (index == 2) return uniforms.lensShadingGridRggb2;
+    if (index == 3) return uniforms.lensShadingGridRggb3;
+    if (index == 4) return uniforms.lensShadingGridRggb4;
+    if (index == 5) return uniforms.lensShadingGridRggb5;
+    if (index == 6) return uniforms.lensShadingGridRggb6;
+    if (index == 7) return uniforms.lensShadingGridRggb7;
+    return uniforms.lensShadingGridRggb8;
+}
+
+vec3 lensShadingRgb(ivec2 p) {
+    if (uniforms.lensShadingInfo.x == 0) return vec3(1.0);
+    vec2 lensExtent = max(vec2(uniforms.width - 1, uniforms.height - 1), vec2(1.0));
+    vec2 gridPosition = clamp(vec2(p) / lensExtent, vec2(0.0), vec2(1.0)) * 2.0;
+    ivec2 base = min(ivec2(floor(gridPosition)), ivec2(1));
+    vec2 blend = fract(gridPosition);
+    int i00 = base.y * 3 + base.x;
+    int i10 = i00 + 1;
+    int i01 = i00 + 3;
+    int i11 = i01 + 1;
+    vec4 top = mix(lensShadingGridCell(i00), lensShadingGridCell(i10), blend.x);
+    vec4 bottom = mix(lensShadingGridCell(i01), lensShadingGridCell(i11), blend.x);
+    vec4 gain = clamp(mix(top, bottom, blend.y), vec4(0.25), vec4(8.0));
+    return vec3(gain.x, 0.5 * (gain.y + gain.z), gain.w);
+}
+
+float calibrateZeroDefectSample(ivec2 c) {
+    int channel = bayerChannel(c);
+    float raw = float(imageLoad(rawInput, c).r);
+    return clamp(
+        (raw - blackForChannel(channel)) * uniforms.calibrationScaleRggb[channel],
+        0.0,
+        max(wbForChannel(channel), 0.0)
+    );
+}
+
+#if RAW_DEMOSAIC_DEFECT_MAPS
+float thermalScale() {
+    return pow(max(uniforms.exposureThermal.w, Q10), (uniforms.exposureThermal.y - uniforms.exposureThermal.z) / 10.0);
+}
+
+float calibrateDefectMappedSample(ivec2 p) {
+    ivec2 c = clampCoord(p);
+    int channel = bayerChannel(c);
+    float raw = float(loadRaw(c));
+    float DarkCurrent = loadDarkCurrent(c) * uniforms.exposureThermal.x * thermalDarkScale;
+    float value = raw - DarkCurrent;
+    if (loadHotPixel(c) != 0u) {
+        value = 0.25 * (
+            float(loadRaw(c + ivec2(1, 0))) +
+            float(loadRaw(c + ivec2(-1, 0))) +
+            float(loadRaw(c + ivec2(0, 1))) +
+            float(loadRaw(c + ivec2(0, -1)))
+        ) - DarkCurrent;
+    }
+    return clamp(
+        (value - blackForChannel(channel)) * uniforms.calibrationScaleRggb[channel],
+        0.0,
+        max(wbForChannel(channel), 0.0)
+    );
+}
+#endif
+
+vec3 demosaicRgbFromTile(ivec2 localCenter, int channel) {
+    int centerX = localCenter.x;
+    int centerY = localCenter.y;
+    float center = calibratedTile[centerY][centerX];
+    float xM1 = calibratedTile[centerY][centerX - 1];
+    float xP1 = calibratedTile[centerY][centerX + 1];
+    float yM1 = calibratedTile[centerY - 1][centerX];
+    float yP1 = calibratedTile[centerY + 1][centerX];
+
+    if (channel == 1 || channel == 2) {
+        bool greenOnRedRow = channel == 1;
+        float red = greenOnRedRow ? 0.5 * (xM1 + xP1) : 0.5 * (yM1 + yP1);
+        float blue = greenOnRedRow ? 0.5 * (yM1 + yP1) : 0.5 * (xM1 + xP1);
+        return max(vec3(red, center, blue), vec3(0.0));
+    }
+
+    // R/B sites use the same 5x5 edge-directed green reconstruction as the coordinate implementation,
+    // but every shared value is loaded once and reused across gradients and interpolation candidates.
+    float xM2 = calibratedTile[centerY][centerX - 2];
+    float xP2 = calibratedTile[centerY][centerX + 2];
+    float yM2 = calibratedTile[centerY - 2][centerX];
+    float yP2 = calibratedTile[centerY + 2][centerX];
+    float h = abs((xM2 + 2.0 * center + xP2) - (2.0 * xM1 + 2.0 * xP1));
+    float v = abs((yM2 + 2.0 * center + yP2) - (2.0 * yM1 + 2.0 * yP1));
+    float gH = 0.5 * (xM1 + xP1) + 0.25 * (2.0 * center - xM2 - xP2);
+    float gV = 0.5 * (yM1 + yP1) + 0.25 * (2.0 * center - yM2 - yP2);
+    float gA = 0.25 * (xM1 + xP1 + yM1 + yP1) +
+        0.125 * (4.0 * center - xM2 - xP2 - yM2 - yP2);
+    float green = h < v ? gH : (v < h ? gV : gA);
+
+    float diagonal = 0.25 * (
+        calibratedTile[centerY - 1][centerX - 1] +
+        calibratedTile[centerY - 1][centerX + 1] +
+        calibratedTile[centerY + 1][centerX - 1] +
+        calibratedTile[centerY + 1][centerX + 1]
+    ) + (center - green) * 0.5;
+    float red = channel == 0 ? center : diagonal;
+    float blue = channel == 3 ? center : diagonal;
+    // Preserve WB-amplified scene-linear highlight headroom in FP16. Clamping each channel to 1.0
+    // here destroyed saturated-colour ratios before ACEScg/highlight reconstruction and produced
+    // white/cyan skies. Negative interpolation lobes are invalid sensor energy and still clamp to 0.
+    return max(vec3(red, green, blue), vec3(0.0));
+}
+
+vec3 reconstructSensorHighlights(vec3 sensorRgb) {
+    if (uniforms.highlightRecovery.w < 0.5 || uniforms.highlightRecovery.y <= 0.0) {
+        return sensorRgb;
+    }
+
+    float threshold = clamp(uniforms.highlightRecovery.x, 0.50, 0.9999);
+    float strength = clamp(uniforms.highlightRecovery.y, 0.0, 1.0);
+    vec3 wb = max(
+        vec3(
+            uniforms.whiteBalanceRggb.x,
+            0.5 * (uniforms.whiteBalanceRggb.y + uniforms.whiteBalanceRggb.z),
+            uniforms.whiteBalanceRggb.w
+        ),
+        vec3(0.20)
+    );
+    vec3 preWb = max(sensorRgb / wb, vec3(0.0));
+
+    // A channel is considered reconstructable only at the actual sensor ceiling and only when
+    // another channel also carries highlight energy. This avoids neutralising legitimate saturated
+    // red/green/blue lights while repairing single-channel daylight/specular clipping.
+    float clipStart = max(threshold, 0.985);
+    vec3 clipped = smoothstep(vec3(clipStart), vec3(1.0), preWb);
+    vec3 support = vec3(max(preWb.g, preWb.b), max(preWb.r, preWb.b), max(preWb.r, preWb.g));
+    vec3 supportedClip = clipped * smoothstep(
+        vec3(threshold * 0.60),
+        vec3(max(threshold * 0.90, threshold * 0.60 + 1e-4)),
+        support
+    );
+    vec3 reliable = vec3(1.0) - clipped;
+    float reliableWeight = reliable.r + reliable.g + reliable.b;
+    if (reliableWeight > 0.25 && reliableWeight < 2.999) {
+        float neutralEstimate = dot(preWb, reliable) / reliableWeight;
+        vec3 plausible = min(preWb, vec3(neutralEstimate));
+        preWb = mix(preWb, plausible, supportedClip * strength);
+    }
+
+    // Hue-preserving scene-linear shoulder: scale all channels together, so it cannot introduce a
+    // new colour cast. The curve is C1 at the threshold and bounded at the sensor ceiling.
+    if (uniforms.highlightRecovery.z > 0.5) {
+        float peak = max(preWb.r, max(preWb.g, preWb.b));
+        if (peak > threshold) {
+            float span = max(1.0 - threshold, 1e-4);
+            float delta = peak - threshold;
+            float compressedPeak = threshold + delta / (1.0 + strength * delta / span);
+            float shoulderWeight = strength * smoothstep(threshold, 1.0, peak);
+            float scale = mix(1.0, compressedPeak / max(peak, 1e-6), shoulderWeight);
+            preWb *= scale;
+        }
+    }
+    return max(preWb * wb, vec3(0.0));
+}
+
+void main() {
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 lid = ivec2(gl_LocalInvocationID.xy);
+    ivec2 groupBase = ivec2(gl_WorkGroupID.xy) *
+        ivec2(WORKGROUP_WIDTH, WORKGROUP_HEIGHT) - ivec2(TILE_GUARD);
+
+#if RAW_DEMOSAIC_DEFECT_MAPS
+    for (int tileY = int(lid.y); tileY < TILE_HEIGHT; tileY += WORKGROUP_HEIGHT) {
+        for (int tileX = int(lid.x); tileX < TILE_WIDTH; tileX += WORKGROUP_WIDTH) {
+            ivec2 source = clampCoord(groupBase + ivec2(tileX, tileY));
+            rawTile[tileY][tileX] = imageLoad(rawInput, source).r;
+            darkTile[tileY][tileX] = imageLoad(darkCurrentMap, source).r;
+            hotTile[tileY][tileX] = imageLoad(hotPixelMask, source).r;
+        }
+    }
+    if (lid.x == 0 && lid.y == 0) thermalDarkScale = thermalScale();
+    barrier();
+
+    for (int tileY = int(lid.y); tileY < TILE_HEIGHT; tileY += WORKGROUP_HEIGHT) {
+        for (int tileX = int(lid.x); tileX < TILE_WIDTH; tileX += WORKGROUP_WIDTH) {
+            calibratedTile[tileY][tileX] =
+                calibrateDefectMappedSample(groupBase + ivec2(tileX, tileY));
+        }
+    }
+#else
+    for (int tileY = int(lid.y); tileY < TILE_HEIGHT; tileY += WORKGROUP_HEIGHT) {
+        for (int tileX = int(lid.x); tileX < TILE_WIDTH; tileX += WORKGROUP_WIDTH) {
+            ivec2 source = clampCoord(groupBase + ivec2(tileX, tileY));
+            calibratedTile[tileY][tileX] = calibrateZeroDefectSample(source);
+        }
+    }
+#endif
+    barrier();
+
+    if (gid.x >= uniforms.width || gid.y >= uniforms.height) return;
+    // Lens shading is a smooth optical field, so one RGB interpolation per output pixel is equivalent
+    // to per-neighbour CFA correction at this grid frequency and avoids multiplying demosaic cost.
+    ivec2 localCenter = lid + ivec2(TILE_GUARD);
+    vec3 sensorRgb = reconstructSensorHighlights(
+        demosaicRgbFromTile(localCenter, bayerChannel(gid)) * lensShadingRgb(gid)
+    );
+    vec3 acescg = uniforms.M_SENSOR_TO_ACESCG_FAST * sensorRgb;
+    imageStore(acescgOutput, gid, vec4(max(acescg, vec3(0.0)), 1.0));
+}

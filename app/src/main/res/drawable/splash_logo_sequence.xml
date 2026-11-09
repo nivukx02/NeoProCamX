@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- One platform-owned splash icon. The nine existing logo treatments animate in-place, so Android
+     never hands a first logo to a second activity overlay. Total animation time stays below 1 second. -->
+<animation-list xmlns:android="http://schemas.android.com/apk/res/android"
+    android:oneshot="false">
+    <item android:drawable="@drawable/splash_logo_01" android:duration="100" />
+    <item android:drawable="@drawable/splash_logo_02" android:duration="100" />
+    <item android:drawable="@drawable/splash_logo_03" android:duration="100" />
+    <item android:drawable="@drawable/splash_logo_05" android:duration="100" />
+    <item android:drawable="@drawable/splash_logo_06" android:duration="100" />
+    <item android:drawable="@drawable/splash_logo_07" android:duration="100" />
+    <item android:drawable="@drawable/splash_logo_08" android:duration="100" />
+    <item android:drawable="@drawable/splash_logo_09" android:duration="100" />
+    <item android:drawable="@drawable/splash_logo_10" android:duration="100" />
+</animation-list>

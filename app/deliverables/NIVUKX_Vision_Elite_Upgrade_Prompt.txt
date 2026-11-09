@@ -1,0 +1,41 @@
+NIVUKX VISION ELITE UPGRADE BRIEF
+
+Scope:
+NIVUKX Vision is the project-owned color-volume and look layer above the
+NIVUKX-DR transport path. Vision does not replace transport. It runs on the
+linear ACES AP1 scene-referred fork before final encode and hands AP1 pixels
+back to NIVUKX-DR.
+
+Ownership boundary:
+No external look profile, external dynamic metadata payload, foreign profile payload, or
+certification label is emitted or imitated. Unsupported device features are
+recorded as fallback evidence in the NIVUKX Truth Metadata Block.
+
+Pipeline:
+Sensor -> IDT -> ACES AP1 FP16 scene-linear -> NIVUKX-DR analysis fork ->
+NIVUKX Vision denoise/detail/look -> AP1 FP16 handoff -> NIVUKX-DR encode.
+
+Core math:
+1. Convert AP1 to XYZ and then to JzAzBz for appearance-space operations.
+2. Preserve hue by compressing chroma radially against a 33x33 Cmax(Jz,h)
+   boundary. Jz and hue are invariant in the V2 compressor.
+3. Replace fixed chroma compression with scene parameters:
+   omega = clamp(0.5 + 0.4 * P99 / L_peak, 0.5, 1.2)
+   gamma = clamp(0.25 + 0.6 * (P99 - P50) / L_peak, 0.25, 0.85)
+4. Apply per-channel near-white guard from AP1 channel headroom:
+   scale = 0.15 + 0.85 * smoothstep(0.02, 0.10, min(1-R,1-G,1-B)).
+5. Apply three project-owned 33^3 house looks:
+   NVX-Cinema-Neutral, NVX-Vivid-Neon, NVX-Filmic-Warm.
+
+Metadata:
+Vision emits V0..V7 records into the same Ed25519 hash-chained TMB used by
+NIVUKX-DR. V8 is reserved for conformance evidence and honest fallback reason.
+
+Conformance:
+LITE  = 10-bit transport, fixed essential Vision metadata.
+PRO   = 10/12-bit transport, dynamic scene solve and house looks.
+ELITE = 12-bit transport, class protection evidence, signed V0..V7 records.
+
+Acceptance:
+The A1..A15 measurement contract is implemented in EliteVisionQualityContract.
+Synthetic or lab measurements must be supplied before an ELITE claim is made.

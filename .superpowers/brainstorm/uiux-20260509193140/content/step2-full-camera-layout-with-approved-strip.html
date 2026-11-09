@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NeoProCamX Full Camera Layout</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --yellow: #ffd21c;
+      --white: #f8f8f8;
+      --muted: rgba(255,255,255,.62);
+      --panel: #050505;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      background: #090909;
+      font-family: Arial, Helvetica, sans-serif;
+      color: var(--white);
+    }
+
+    .phone {
+      width: min(430px, 100vw);
+      height: min(932px, 100vh);
+      position: relative;
+      overflow: hidden;
+      background: #000;
+      border: 1px solid rgba(255,255,255,.14);
+      border-radius: 28px;
+      box-shadow: 0 24px 80px rgba(0,0,0,.55);
+    }
+
+    .preview {
+      position: absolute;
+      inset: 0 0 184px;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 30% 22%, rgba(172,188,175,.36), transparent 28%),
+        radial-gradient(circle at 57% 44%, rgba(85,101,86,.42), transparent 34%),
+        linear-gradient(126deg, #637269 0%, #26342f 43%, #080908 78%, #020202 100%);
+    }
+
+    .preview::before {
+      content: "";
+      position: absolute;
+      inset: -50px;
+      background:
+        repeating-linear-gradient(116deg, transparent 0 14px, rgba(10,20,17,.36) 15px 19px, transparent 20px 36px),
+        linear-gradient(90deg, rgba(0,0,0,.05), rgba(0,0,0,.48));
+      opacity: .85;
+      filter: blur(.4px);
+    }
+
+    .preview::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, rgba(0,0,0,.48), transparent 20%, transparent 68%, rgba(0,0,0,.72));
+    }
+
+    .topbar {
+      position: absolute;
+      left: 14px;
+      right: 14px;
+      top: 13px;
+      height: 44px;
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      align-items: center;
+      z-index: 4;
+    }
+
+    .tool {
+      width: 38px;
+      height: 38px;
+      justify-self: center;
+      display: grid;
+      place-items: center;
+      color: #fff;
+      font-size: 18px;
+      font-weight: 700;
+      border-radius: 50%;
+      background: rgba(0,0,0,.18);
+      border: 1px solid rgba(255,255,255,.08);
+    }
+
+    .tool svg {
+      width: 22px;
+      height: 22px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 2.2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .side-meter {
+      position: absolute;
+      right: 16px;
+      top: 76px;
+      z-index: 4;
+      display: grid;
+      gap: 12px;
+    }
+
+    .meter-dot {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: rgba(0,0,0,.22);
+      border: 1px solid rgba(255,255,255,.14);
+    }
+
+    .meter-dot::before {
+      content: "";
+      width: 15px;
+      height: 15px;
+      border: 2px solid #fff;
+      border-radius: 50%;
+      box-shadow: 0 0 0 5px rgba(255,255,255,.12);
+    }
+
+    .pro-overlay {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 146px;
+      height: 184px;
+      z-index: 5;
+      overflow: hidden;
+      background: linear-gradient(90deg, rgba(24,38,35,.62), rgba(6,8,7,.2) 44%, rgba(0,0,0,.72));
+      border-top: 1px solid rgba(255,255,255,.08);
+      border-bottom: 1px solid rgba(255,255,255,.08);
+    }
+
+    .pro-overlay svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .adjust-scroll {
+      position: absolute;
+      left: 18.5%;
+      right: 5%;
+      top: 19%;
+      height: 18%;
+      overflow-x: auto;
+      opacity: .01;
+      scrollbar-width: none;
+    }
+
+    .adjust-scroll::-webkit-scrollbar { display: none; }
+    .scroll-content { width: 180%; height: 100%; }
+
+    .bottom {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 184px;
+      z-index: 6;
+      background: #050505;
+      border-top: 1px solid rgba(255,255,255,.08);
+      display: grid;
+      grid-template-rows: 52px 1fr;
+    }
+
+    .mode-row {
+      height: 52px;
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      overflow-x: auto;
+      padding: 0 54px;
+      scrollbar-width: none;
+      white-space: nowrap;
+    }
+
+    .mode-row::-webkit-scrollbar { display: none; }
+
+    .mode {
+      flex: 0 0 auto;
+      color: rgba(255,255,255,.66);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .mode.active {
+      min-width: 82px;
+      height: 32px;
+      padding: 0 20px;
+      border-radius: 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: #111;
+      background: #fff;
+      font-size: 14px;
+    }
+
+    .controls {
+      position: relative;
+      display: grid;
+      grid-template-columns: 1fr 118px 1fr;
+      align-items: center;
+      padding: 4px 28px 22px;
+    }
+
+    .thumb {
+      width: 50px;
+      height: 50px;
+      justify-self: start;
+      border-radius: 13px;
+      background:
+        linear-gradient(135deg, rgba(255,255,255,.9), rgba(255,255,255,.22)),
+        linear-gradient(120deg, #607267, #111);
+      border: 2px solid rgba(255,255,255,.78);
+    }
+
+    .shutter {
+      width: 92px;
+      height: 92px;
+      justify-self: center;
+      border-radius: 50%;
+      border: 5px solid #fff;
+      display: grid;
+      place-items: center;
+      background: transparent;
+    }
+
+    .shutter::before {
+      content: "";
+      width: 68px;
+      height: 68px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: inset 0 0 0 2px rgba(0,0,0,.08);
+    }
+
+    .switch {
+      width: 54px;
+      height: 54px;
+      justify-self: end;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: rgba(255,255,255,.12);
+      border: 1px solid rgba(255,255,255,.16);
+    }
+
+    .switch svg {
+      width: 28px;
+      height: 28px;
+      stroke: #fff;
+      fill: none;
+      stroke-width: 2.4;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    @media (max-height: 780px) {
+      .phone {
+        height: 100vh;
+        border-radius: 0;
+      }
+      .pro-overlay {
+        height: 166px;
+      }
+      .shutter {
+        width: 82px;
+        height: 82px;
+      }
+      .shutter::before {
+        width: 60px;
+        height: 60px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="phone" aria-label="NeoProCamX full Pro camera layout">
+    <section class="preview">
+      <div class="topbar">
+        <div class="tool" aria-label="Flash">
+          <svg viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 10-13h-7l0-7z"/></svg>
+        </div>
+        <div class="tool" aria-label="HDR">HDR</div>
+        <div class="tool" aria-label="Metering">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
+        </div>
+        <div class="tool" aria-label="RAW">RAW</div>
+        <div class="tool" aria-label="Settings">
+          <svg viewBox="0 0 24 24"><path d="M12 15.5A3.5 3.5 0 1 0 12 8a3.5 3.5 0 0 0 0 7.5z"/><path d="M19.4 15a1.8 1.8 0 0 0 .36 2l.05.05a2 2 0 1 1-2.83 2.83l-.05-.05a1.8 1.8 0 0 0-2-.36 1.8 1.8 0 0 0-1 1.63V21a2 2 0 1 1-4 0v-.1a1.8 1.8 0 0 0-1-1.63 1.8 1.8 0 0 0-2 .36l-.05.05a2 2 0 1 1-2.83-2.83L4.1 17a1.8 1.8 0 0 0 .36-2 1.8 1.8 0 0 0-1.63-1H2.7a2 2 0 1 1 0-4h.13a1.8 1.8 0 0 0 1.63-1 1.8 1.8 0 0 0-.36-2l-.05-.05A2 2 0 1 1 6.88 4.1l.05.05a1.8 1.8 0 0 0 2 .36 1.8 1.8 0 0 0 1-1.63V2.8a2 2 0 1 1 4 0v.08a1.8 1.8 0 0 0 1 1.63 1.8 1.8 0 0 0 2-.36l.05-.05A2 2 0 1 1 19.8 6.93l-.05.05a1.8 1.8 0 0 0-.36 2 1.8 1.8 0 0 0 1.63 1h.18a2 2 0 1 1 0 4h-.18a1.8 1.8 0 0 0-1.63 1z"/></svg>
+        </div>
+      </div>
+
+      <div class="side-meter">
+        <div class="meter-dot" aria-label="Histogram meter"></div>
+        <div class="meter-dot" aria-label="Zebra meter"></div>
+      </div>
+    </section>
+
+    <section class="pro-overlay" aria-label="Approved Pro controller overlay">
+      <svg viewBox="0 0 1064 476" preserveAspectRatio="none" aria-hidden="true">
+        <defs>
+          <style>
+            .w { fill: #f8f8f8; }
+            .s { stroke: #f8f8f8; stroke-width: 5.2; fill: none; stroke-linecap: square; stroke-linejoin: round; }
+            .t { stroke: rgba(255,255,255,.92); stroke-width: 4; stroke-linecap: square; }
+            .y { fill: #ffd21c; }
+            .ys { stroke: #ffd21c; stroke-width: 5.2; fill: none; stroke-linejoin: round; }
+            .dim { fill: rgba(255,255,255,.34); }
+            .dims { stroke: rgba(255,255,255,.34); stroke-width: 5.2; fill: none; stroke-linecap: round; }
+          </style>
+        </defs>
+        <line x1="352" y1="0" x2="352" y2="476" stroke="rgba(255,255,255,.24)" stroke-width="1.5"/>
+        <line x1="724" y1="0" x2="724" y2="476" stroke="rgba(255,255,255,.24)" stroke-width="1.5"/>
+        <circle cx="99" cy="135" r="30" class="w"/>
+        <text x="99" y="149" fill="#2f2f2f" font-size="47" font-weight="800" text-anchor="middle">A</text>
+        <text x="101" y="205" class="w" font-size="30" text-anchor="middle">Manual</text>
+        <text x="536" y="58" class="w" font-size="39" text-anchor="middle">500</text>
+        <line x1="217" y1="114" x2="217" y2="139" class="t"/><line x1="264" y1="112" x2="264" y2="141" class="t"/><line x1="312" y1="111" x2="312" y2="141" class="t"/><line x1="363" y1="112" x2="363" y2="140" class="t"/><line x1="415" y1="111" x2="415" y2="141" class="t"/><line x1="467" y1="113" x2="467" y2="139" class="t"/><line x1="536" y1="92" x2="536" y2="157" stroke="#ffd21c" stroke-width="7"/><line x1="595" y1="112" x2="595" y2="141" class="t"/><line x1="647" y1="113" x2="647" y2="139" class="t"/><line x1="700" y1="111" x2="700" y2="141" class="t"/><line x1="763" y1="112" x2="763" y2="141" class="t"/><line x1="813" y1="113" x2="813" y2="139" class="t"/><line x1="860" y1="113" x2="860" y2="139" class="t"/>
+        <text x="369" y="195" class="w" font-size="31" text-anchor="middle">250</text>
+        <text x="705" y="195" class="w" font-size="31" text-anchor="middle">1000</text>
+        <path d="M51 288 H101 V340 H51 Z" class="s"/><line x1="52" y1="340" x2="101" y2="289" class="s"/><text x="64" y="306" class="w" font-size="29" font-weight="800" text-anchor="middle">+</text><text x="87" y="333" class="w" font-size="29" font-weight="800" text-anchor="middle">-</text><text x="78" y="393" class="w" font-size="31" text-anchor="middle">0</text>
+        <rect x="227" y="289" width="58" height="50" rx="2" class="ys"/><text x="256" y="317" class="y" font-size="31" font-weight="700" text-anchor="middle">ISO</text><text x="256" y="394" class="y" font-size="31" text-anchor="middle">500</text>
+        <rect x="411" y="289" width="58" height="50" rx="2" class="s"/><text x="440" y="317" class="w" font-size="31" font-weight="700" text-anchor="middle">S</text><text x="440" y="394" class="w" font-size="31" text-anchor="middle">0.4</text>
+        <rect x="595" y="289" width="58" height="50" rx="2" class="s"/><text x="624" y="317" class="w" font-size="31" font-weight="700" text-anchor="middle">WB</text><path d="M609 390 C610 382 617 379 623 382 C626 375 637 377 639 386 C645 386 650 390 650 396 C650 402 645 405 638 405 H614 C608 405 604 401 604 396 C604 392 606 390 609 390 Z" fill="none" stroke="#f8f8f8" stroke-width="4" stroke-linejoin="round"/>
+        <circle cx="811" cy="314" r="27" class="dims"/><circle cx="811" cy="314" r="10" class="dims"/><text x="811" y="394" class="dim" font-size="31" text-anchor="middle">AF</text>
+        <path d="M967 292 H991 M1013 292 H1037 M967 339 H991 M1013 339 H1037" stroke="#f8f8f8" stroke-width="8"/><path d="M967 292 V312 M1037 292 V312 M967 339 V319 M1037 339 V319" stroke="#f8f8f8" stroke-width="8"/><circle cx="1002" cy="316" r="21" fill="#f8f8f8"/><circle cx="1002" cy="316" r="8" fill="#030303"/><rect x="987" y="378" width="31" height="23" rx="1.5" class="s" stroke-width="3.2"/>
+      </svg>
+      <div class="adjust-scroll" aria-label="Scrollable adjust bar">
+        <div class="scroll-content"></div>
+      </div>
+    </section>
+
+    <section class="bottom" aria-label="Mode and shutter controls">
+      <nav class="mode-row" aria-label="Scrollable camera modes">
+        <span class="mode">PHOTO</span>
+        <span class="mode">VIDEO</span>
+        <span class="mode active">PRO</span>
+        <span class="mode">HDR</span>
+        <span class="mode">LOG</span>
+        <span class="mode">RAW</span>
+      </nav>
+      <div class="controls">
+        <div class="thumb" aria-label="Gallery thumbnail"></div>
+        <button class="shutter" aria-label="Shutter"></button>
+        <button class="switch" aria-label="Switch camera">
+          <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.7-4.4"/><path d="M4 7V3h4"/><path d="M4 13a8 8 0 0 0 14.7 4.4"/><path d="M20 17v4h-4"/></svg>
+        </button>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

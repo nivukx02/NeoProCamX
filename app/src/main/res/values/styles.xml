@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Top Bar Style -->
+    <style name="TopBarIcon">
+        <item name="android:layout_width">@dimen/icon_touch_target</item>
+        <item name="android:layout_height">@dimen/icon_touch_target</item>
+        <item name="android:background">@drawable/bg_control_button_flat</item>
+        <item name="android:padding">@dimen/space_2</item>
+        <item name="android:tint">@color/text_primary_strong</item>
+    </style>
+
+    <!-- Pro Value Text Style -->
+    <style name="ProValueText">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:textSize">20sp</item>
+        <item name="android:fontFamily">sans-serif-black</item>
+        <item name="android:textColor">@color/accent_violet</item>
+    </style>
+
+    <style name="CameraChipText">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">@dimen/touch_target</item>
+        <item name="android:layout_marginHorizontal">@dimen/space_1</item>
+        <item name="android:background">@drawable/bg_camera_chip_selector</item>
+        <item name="android:paddingHorizontal">@dimen/space_4</item>
+        <item name="android:paddingVertical">@dimen/space_2</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:textColor">@color/text_secondary_strong</item>
+        <item name="android:gravity">center</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:textAllCaps">false</item>
+    </style>
+
+    <style name="ModeRailText">
+        <item name="android:layout_width">@dimen/mode_rail_item_width</item>
+        <item name="android:layout_height">@dimen/mode_rail_item_height</item>
+        <item name="android:layout_marginHorizontal">11dp</item>
+        <item name="android:background">@drawable/bg_mode_rail_idle</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:gravity">center</item>
+        <item name="android:textSize">15sp</item>
+        <item name="android:letterSpacing">0.06</item>
+        <item name="android:textColor">#FFFFFFFF</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:textAllCaps">false</item>
+    </style>
+
+    <style name="OverlayTextButton">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:textColor">@color/text_primary_strong</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:textAllCaps">false</item>
+    </style>
+
+    <style name="ManualAutoButton">
+        <item name="android:layout_width">24dp</item>
+        <item name="android:layout_height">24dp</item>
+        <item name="android:background">@drawable/bg_manual_auto_button</item>
+        <item name="android:backgroundTint">@null</item>
+        <item name="android:gravity">center</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:minWidth">0dp</item>
+        <item name="android:minHeight">0dp</item>
+        <item name="android:paddingHorizontal">0dp</item>
+        <item name="android:paddingVertical">0dp</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:textColor">#FF080808</item>
+        <item name="android:textSize">12sp</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="ManualReferenceSection">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">match_parent</item>
+        <item name="android:paddingStart">0dp</item>
+        <item name="android:paddingEnd">0dp</item>
+    </style>
+
+    <style name="ManualAutoColumn">
+        <item name="android:layout_width">30dp</item>
+        <item name="android:layout_height">match_parent</item>
+        <!-- Keep the ruler centered; independently dock Auto against its left edge. -->
+        <item name="android:layout_gravity">center</item>
+        <item name="android:translationX">-135dp</item>
+        <!-- Align the disc itself with the ruler axis while retaining the Auto caption below. -->
+        <item name="android:translationY">23dp</item>
+        <item name="android:gravity">center</item>
+        <item name="android:orientation">vertical</item>
+    </style>
+
+    <style name="ManualAutoLabel">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginTop">4dp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:textColor">#E6FFFFFF</item>
+        <item name="android:textSize">9sp</item>
+        <item name="android:textAllCaps">false</item>
+    </style>
+
+    <style name="ManualReferenceScaleColumn">
+        <item name="android:layout_width">240dp</item>
+        <item name="android:layout_height">match_parent</item>
+        <item name="android:layout_weight">0</item>
+        <item name="android:layout_gravity">center</item>
+        <item name="android:gravity">center</item>
+        <item name="android:orientation">vertical</item>
+    </style>
+
+    <style name="ManualReferenceValue">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">32dp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:gravity">center</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:textColor">#FFFFFFFF</item>
+        <item name="android:textSize">17sp</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="ManualReferenceSeekBar">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">58dp</item>
+        <item name="android:progressBackgroundTint">#4DFFFFFF</item>
+        <item name="android:progressTint">@color/accent_yellow</item>
+        <item name="android:thumbTint">@color/accent_yellow</item>
+        <item name="android:tickMarkTint">#80FFFFFF</item>
+    </style>
+
+    <style name="ManualParameterTab">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">64dp</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:layout_marginHorizontal">2dp</item>
+        <item name="android:background">@android:color/transparent</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:gravity">center</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:minWidth">0dp</item>
+        <item name="android:minHeight">0dp</item>
+        <item name="android:paddingHorizontal">1dp</item>
+        <item name="android:paddingVertical">0dp</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:textColor">#FFF1F4F7</item>
+        <item name="android:textSize">10.5sp</item>
+        <item name="android:stateListAnimator">@null</item>
+    </style>
+
+    <!-- Shutter Area Styles -->
+    <style name="GalleryThumbnail">
+        <item name="android:layout_width">56dp</item>
+        <item name="android:layout_height">56dp</item>
+        <item name="android:background">@drawable/bg_square_glass</item>
+    </style>
+</resources>

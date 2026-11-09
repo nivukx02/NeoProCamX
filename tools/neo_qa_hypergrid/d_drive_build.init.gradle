@@ -1,0 +1,20 @@
+// Keeps large Gradle intermediates off the nearly-full source drive while reusing one stable cache.
+// Usage: set NEOPROCAMX_BUILD_ROOT to an absolute directory and pass this file via --init-script.
+def neoBuildRoot = System.getenv('NEOPROCAMX_BUILD_ROOT')
+// Optional repository-local native staging avoids writes through an existing .cxx junction.
+// Dependency/Gradle distributions remain reusable; neither source nor old build data is deleted.
+def neoNativeBuildRoot = System.getenv('NEOPROCAMX_NATIVE_BUILD_ROOT')
+if (neoBuildRoot != null && !neoBuildRoot.trim().isEmpty()) {
+    gradle.beforeProject { project ->
+        def component = project.path == ':'
+                ? 'root'
+                : project.path.substring(1).replace(':', File.separator)
+        project.layout.buildDirectory.set(new File(neoBuildRoot, component))
+        if (neoNativeBuildRoot != null && !neoNativeBuildRoot.trim().isEmpty()) {
+            project.plugins.withId('com.android.application') {
+                project.extensions.getByName('android').externalNativeBuild.cmake
+                        .buildStagingDirectory = new File(neoNativeBuildRoot, component)
+            }
+        }
+    }
+}

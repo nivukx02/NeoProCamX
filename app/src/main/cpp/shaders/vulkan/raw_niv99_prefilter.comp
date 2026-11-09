@@ -1,0 +1,295 @@
+#version 450
+
+// Offline RAW conversion NIV99 prefilter.
+//
+// The source mosaic is immutable.  This pass performs CFA-aware defect correction,
+// edge-directed spatial denoise, and guarded temporal fusion into a separate R16_UINT
+// history/output image.  Demosaic consumes that output directly, so successful GPU
+// conversions never round-trip a full-resolution sensor frame through Kotlin.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, r16ui) uniform readonly uimage2D rawInput;
+layout(binding = 1, r16ui) uniform readonly uimage2D historyInput;
+layout(binding = 2, r16ui) uniform writeonly uimage2D filteredOutput;
+
+layout(std430, binding = 3) buffer Niv99Counters {
+    uint spatiallyFilteredSamples;
+    uint temporallyFusedSamples;
+    uint correctedDefects;
+    uint processedSamples;
+    uint sceneDifferenceCodeSum;
+    uint sceneSampleCount;
+    uint sceneCutDetected;
+    uint reserved;
+} counters;
+
+// Exact prefix/layout of the 416-byte RawDemosaicUniforms block shared with
+// demosaic_vulkan.comp. Arrays of vec4 make the std140 matrix padding explicit.
+layout(std140, binding = 4) uniform RawDemosaicUniformBlock {
+    vec4 blackLevelRggb;
+    vec4 whiteBalanceRggb;
+    vec4 exposureThermal;
+    vec4 sensorToXyzColumns[3];
+    vec4 xyzToAcescgColumns[3];
+    ivec4 rawInfo;                    // x=bayer, y=width, z=height, w=white level
+    vec4 lensShadingGridRggb[9];
+    ivec4 lensShadingInfo;
+    vec4 highlightRecovery;
+    vec4 calibrationScaleRggb;
+    vec4 calibrationOffsetRggb;
+    vec4 sensorToAcescgFastColumns[3];
+} rawUniforms;
+
+layout(push_constant) uniform Niv99Parameters {
+    ivec4 geometry;                   // width, height, historyEnabled, pass (0=spatial, 1=temporal)
+    vec4 noiseAndGain;                // noiseS, noiseO, totalGain, dynamicRange
+    vec4 spatial;                     // strength, defectSigma, spatialSigma, temporalStrength
+    vec4 temporal;                    // temporalSigma, minEffectiveWeight, minSigmaCodes, sceneCutThreshold
+} parameters;
+
+shared uint groupSpatial;
+shared uint groupTemporal;
+shared uint groupDefects;
+shared uint groupProcessed;
+shared uint groupSceneDifference;
+shared uint groupSceneSamples;
+
+const float BASE_SHOT_VARIANCE = 0.000018;
+const float BASE_READ_VARIANCE = 0.0000008;
+const float MIN_NORMALIZED_VARIANCE = 0.0000000001;
+const float MIN_DEFECT_CODE_THRESHOLD = 6.0;
+const float DEFECT_NEIGHBOR_SUPPORT_SIGMA = 2.5;
+const int HIGHLIGHT_GUARD_DIVISOR = 64;
+
+int cfaChannel(ivec2 coordinate) {
+    int physical = ((coordinate.y & 1) << 1) | (coordinate.x & 1);
+    return physical ^ clamp(rawUniforms.rawInfo.x, 0, 3);
+}
+
+float channelValue(vec4 values, int channel) {
+    if (channel == 0) return values.x;
+    if (channel == 1) return values.y;
+    if (channel == 2) return values.z;
+    return values.w;
+}
+
+int rawAt(ivec2 coordinate) {
+    ivec2 maximum = parameters.geometry.xy - ivec2(1);
+    return int(imageLoad(rawInput, clamp(coordinate, ivec2(0), maximum)).r);
+}
+
+float lensGain(ivec2 coordinate, int channel) {
+    if (rawUniforms.lensShadingInfo.x == 0) return 1.0;
+    ivec2 maximum = max(parameters.geometry.xy - ivec2(1), ivec2(1));
+    ivec2 grid = ivec2(
+        (clamp(coordinate.x, 0, maximum.x) * 2) / maximum.x,
+        (clamp(coordinate.y, 0, maximum.y) * 2) / maximum.y
+    );
+    int gridIndex = clamp(grid.y, 0, 2) * 3 + clamp(grid.x, 0, 2);
+    return clamp(channelValue(rawUniforms.lensShadingGridRggb[gridIndex], channel), 0.25, 8.0);
+}
+
+float noiseSigmaCodes(int sampleCode, float black, ivec2 coordinate, int channel) {
+    float dynamicRange = max(parameters.noiseAndGain.w, 1.0);
+    float signal = max(float(sampleCode) - black, 0.0) / dynamicRange;
+    float totalGain = clamp(parameters.noiseAndGain.z, 1.0, 64.0);
+    float shot = max(max(parameters.noiseAndGain.x, 0.0), BASE_SHOT_VARIANCE * totalGain);
+    float readNoise = max(max(parameters.noiseAndGain.y, 0.0),
+                          BASE_READ_VARIANCE * totalGain * totalGain);
+    float sigma = sqrt(max(MIN_NORMALIZED_VARIANCE, shot * signal + readNoise)) * dynamicRange;
+    return max(parameters.temporal.z, sigma * sqrt(max(lensGain(coordinate, channel), 1.0)));
+}
+
+float smoothStepSafe(float edge0, float edge1, float value) {
+    if (edge1 <= edge0) return value >= edge1 ? 1.0 : 0.0;
+    float t = clamp((value - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+int roundedCode(float value, int low, int high) {
+    return clamp(int(floor(value + 0.5)), low, high);
+}
+
+int spatialFilterAt(ivec2 coordinate, out bool filtered, out bool defect) {
+    filtered = false;
+    defect = false;
+    int center = rawAt(coordinate);
+    if (coordinate.x < 2 || coordinate.y < 2 ||
+        coordinate.x >= parameters.geometry.x - 2 ||
+        coordinate.y >= parameters.geometry.y - 2 ||
+        parameters.spatial.x <= 0.0) {
+        return center;
+    }
+
+    int channel = cfaChannel(coordinate);
+    int black = clamp(int(floor(channelValue(rawUniforms.blackLevelRggb, channel) + 0.5)),
+                      0, rawUniforms.rawInfo.w - 1);
+    int dynamicRange = max(rawUniforms.rawInfo.w - black, 1);
+    int highlightGuard = max(black + 1,
+        rawUniforms.rawInfo.w - max(2, dynamicRange / HIGHLIGHT_GUARD_DIVISOR));
+    if (center <= black || center >= highlightGuard) return center;
+
+    int left = rawAt(coordinate + ivec2(-2, 0));
+    int right = rawAt(coordinate + ivec2(2, 0));
+    int up = rawAt(coordinate + ivec2(0, -2));
+    int down = rawAt(coordinate + ivec2(0, 2));
+    int upLeft = rawAt(coordinate + ivec2(-2, -2));
+    int upRight = rawAt(coordinate + ivec2(2, -2));
+    int downLeft = rawAt(coordinate + ivec2(-2, 2));
+    int downRight = rawAt(coordinate + ivec2(2, 2));
+
+    int sum = left + right + up + down + upLeft + upRight + downLeft + downRight;
+    int low = min(min(min(left, right), min(up, down)),
+                  min(min(upLeft, upRight), min(downLeft, downRight)));
+    int high = max(max(max(left, right), max(up, down)),
+                   max(max(upLeft, upRight), max(downLeft, downRight)));
+    int trimmedMean = (sum - low - high + 3) / 6;
+    float sigma = noiseSigmaCodes(center, float(black), coordinate, channel);
+    float defectThreshold = max(MIN_DEFECT_CODE_THRESHOLD, sigma * parameters.spatial.y);
+    float supportThreshold = max(MIN_DEFECT_CODE_THRESHOLD,
+                                 sigma * DEFECT_NEIGHBOR_SUPPORT_SIGMA);
+    bool supportedOutlier = abs(left - right) <= supportThreshold &&
+                            abs(up - down) <= supportThreshold;
+    if (abs(float(center - trimmedMean)) > defectThreshold && supportedOutlier) {
+        int corrected = clamp(trimmedMean, black, rawUniforms.rawInfo.w);
+        defect = corrected != center;
+        return corrected;
+    }
+
+    int horizontal = (left + right + 1) / 2;
+    int vertical = (up + down + 1) / 2;
+    int diagonalDown = (upLeft + downRight + 1) / 2;
+    int diagonalUp = (upRight + downLeft + 1) / 2;
+    int horizontalGradient = abs(left - right);
+    int verticalGradient = abs(up - down);
+    int diagonalDownGradient = abs(upLeft - downRight);
+    int diagonalUpGradient = abs(upRight - downLeft);
+    int minimumGradient = min(min(horizontalGradient, verticalGradient),
+                              min(diagonalDownGradient, diagonalUpGradient));
+    int directional = minimumGradient == horizontalGradient ? horizontal :
+                      minimumGradient == verticalGradient ? vertical :
+                      minimumGradient == diagonalDownGradient ? diagonalDown : diagonalUp;
+    float residual = abs(float(center - directional));
+    float cutoff = max(1.0, sigma * parameters.spatial.z);
+    if (residual >= cutoff) return center;
+    float normalizedResidual = residual / cutoff;
+    float robustWeight = 1.0 - normalizedResidual * normalizedResidual;
+    robustWeight *= robustWeight;
+    float edgeGuard = smoothStepSafe(sigma * 1.5, sigma * 5.5, float(minimumGradient));
+    float shadowPressure = 1.0 - smoothStepSafe(
+        float(black) + float(dynamicRange) * 0.03,
+        float(black) + float(dynamicRange) * 0.24,
+        float(center));
+    float wb = channelValue(rawUniforms.whiteBalanceRggb, channel);
+    float gainPressure = clamp((wb - 1.0) / 2.0, 0.0, 1.0);
+    float strength = parameters.spatial.x * robustWeight * (1.0 - edgeGuard) *
+        (0.72 + shadowPressure * 0.18 + gainPressure * 0.10);
+    if (strength <= parameters.temporal.y) return center;
+    int value = roundedCode(float(center) + float(directional - center) * strength,
+                            black, rawUniforms.rawInfo.w);
+    filtered = value != center;
+    return value;
+}
+
+void main() {
+    uint localIndex = gl_LocalInvocationIndex;
+    if (localIndex == 0u) {
+        groupSpatial = 0u;
+        groupTemporal = 0u;
+        groupDefects = 0u;
+        groupProcessed = 0u;
+        groupSceneDifference = 0u;
+        groupSceneSamples = 0u;
+    }
+    barrier();
+
+    ivec2 coordinate = ivec2(gl_GlobalInvocationID.xy);
+    bool insideFrame = all(lessThan(coordinate, parameters.geometry.xy));
+    bool spatialChanged = false;
+    bool defectCorrected = false;
+    bool temporalChanged = false;
+    int outputCode = 0;
+    if (insideFrame) {
+        bool spatialPass = parameters.geometry.w == 0;
+        outputCode = spatialPass
+            ? spatialFilterAt(coordinate, spatialChanged, defectCorrected)
+            : rawAt(coordinate);
+        uint linearIndex = uint(coordinate.y) * uint(parameters.geometry.x) + uint(coordinate.x);
+        uint sampleStride = max(
+            (uint(parameters.geometry.x) * uint(parameters.geometry.y)) / 4096u,
+            1u);
+        if (spatialPass && parameters.geometry.z != 0 && linearIndex % sampleStride == 0u) {
+            int oldCode = int(imageLoad(historyInput, coordinate).r);
+            atomicAdd(groupSceneDifference, uint(abs(outputCode - oldCode)));
+            atomicAdd(groupSceneSamples, 1u);
+        }
+        bool sceneCut = counters.sceneSampleCount != 0u &&
+            float(counters.sceneDifferenceCodeSum) /
+                (float(counters.sceneSampleCount) * max(parameters.noiseAndGain.w, 1.0)) >=
+                    parameters.temporal.w;
+        if (!spatialPass && parameters.geometry.z != 0 && !sceneCut &&
+            coordinate.x >= 2 && coordinate.y >= 2 &&
+            coordinate.x < parameters.geometry.x - 2 &&
+            coordinate.y < parameters.geometry.y - 2 &&
+            parameters.spatial.w > 0.0) {
+            int channel = cfaChannel(coordinate);
+            int black = clamp(int(floor(channelValue(rawUniforms.blackLevelRggb, channel) + 0.5)),
+                              0, rawUniforms.rawInfo.w - 1);
+            int dynamicRange = max(rawUniforms.rawInfo.w - black, 1);
+            int highlightGuard = max(black + 1,
+                rawUniforms.rawInfo.w - max(2, dynamicRange / HIGHLIGHT_GUARD_DIVISOR));
+            if (outputCode > black && outputCode < highlightGuard) {
+                int oldCode = int(imageLoad(historyInput, coordinate).r);
+                float sigma = noiseSigmaCodes(outputCode, float(black), coordinate, channel);
+                float residual = abs(float(outputCode - oldCode));
+                float cutoff = max(1.0, sigma * parameters.temporal.x);
+                if (residual < cutoff) {
+                    bool ignoredFiltered;
+                    bool ignoredDefect;
+                    int left = spatialFilterAt(coordinate + ivec2(-2, 0), ignoredFiltered, ignoredDefect);
+                    int right = spatialFilterAt(coordinate + ivec2(2, 0), ignoredFiltered, ignoredDefect);
+                    int up = spatialFilterAt(coordinate + ivec2(0, -2), ignoredFiltered, ignoredDefect);
+                    int down = spatialFilterAt(coordinate + ivec2(0, 2), ignoredFiltered, ignoredDefect);
+                    float gradient = float(min(abs(left - right), abs(up - down)));
+                    float structureGuard = smoothStepSafe(sigma * 1.4, sigma * 4.5, gradient);
+                    float normalizedResidual = residual / cutoff;
+                    float robustWeight = 1.0 - normalizedResidual * normalizedResidual;
+                    robustWeight *= robustWeight;
+                    float weight = parameters.spatial.w * robustWeight * (1.0 - structureGuard);
+                    if (weight > parameters.temporal.y) {
+                        int blended = roundedCode(
+                            float(outputCode) + float(oldCode - outputCode) * weight,
+                            black,
+                            rawUniforms.rawInfo.w);
+                        temporalChanged = blended != outputCode;
+                        outputCode = blended;
+                    }
+                }
+            }
+        }
+        imageStore(filteredOutput, coordinate, uvec4(uint(outputCode), 0u, 0u, 1u));
+        if (spatialPass) {
+            if (spatialChanged) atomicAdd(groupSpatial, 1u);
+            if (defectCorrected) atomicAdd(groupDefects, 1u);
+        } else {
+            atomicAdd(groupProcessed, 1u);
+            if (temporalChanged) atomicAdd(groupTemporal, 1u);
+        }
+    }
+
+    barrier();
+    if (localIndex == 0u) {
+        atomicAdd(counters.spatiallyFilteredSamples, groupSpatial);
+        atomicAdd(counters.temporallyFusedSamples, groupTemporal);
+        atomicAdd(counters.correctedDefects, groupDefects);
+        atomicAdd(counters.processedSamples, groupProcessed);
+        atomicAdd(counters.sceneDifferenceCodeSum, groupSceneDifference);
+        atomicAdd(counters.sceneSampleCount, groupSceneSamples);
+        if (parameters.geometry.w != 0 && counters.sceneSampleCount != 0u &&
+            float(counters.sceneDifferenceCodeSum) /
+                (float(counters.sceneSampleCount) * max(parameters.noiseAndGain.w, 1.0)) >=
+                    parameters.temporal.w) {
+            atomicOr(counters.sceneCutDetected, 1u);
+        }
+    }
+}

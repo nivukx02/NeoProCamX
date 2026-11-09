@@ -1,0 +1,100 @@
+<style>
+  .compare{display:grid;grid-template-columns:1fr;gap:18px;margin-top:16px}
+  .mockup-frame{border:1px solid rgba(255,255,255,.16);border-radius:16px;background:rgba(0,0,0,.2);overflow:hidden}
+  .mockup-title{padding:10px 14px;border-bottom:1px solid rgba(255,255,255,.1);font-size:13px;color:rgba(255,255,255,.78)}
+  .reference-img{display:block;width:100%;height:auto}
+  .target-scene{position:relative;height:238px;background:linear-gradient(115deg,#52635d 0%,#21302c 42%,#090909 72%,#020202 100%);overflow:hidden}
+  .target-scene:before{content:"";position:absolute;inset:-20px;background:radial-gradient(circle at 21% 18%,rgba(255,255,255,.16),transparent 23%),radial-gradient(circle at 50% 40%,rgba(172,149,88,.18),transparent 24%);filter:blur(1px)}
+  .pro-strip{position:absolute;inset:0;background:linear-gradient(90deg,rgba(0,0,0,.12),rgba(0,0,0,.02) 44%,rgba(0,0,0,.56) 100%)}
+  .auto-block{position:absolute;left:28px;top:58px;text-align:center;color:#fff}
+  .auto-circle{width:56px;height:56px;border-radius:50%;background:#fff;color:#303030;display:flex;align-items:center;justify-content:center;font-size:36px;font-weight:800;line-height:1}
+  .auto-label{display:block;margin-top:15px;font-size:24px;line-height:1.05}
+  .scale-area{position:absolute;left:194px;right:52px;top:20px;height:86px;overflow:hidden}
+  .scale-value{position:absolute;left:38%;top:0;transform:translateX(-50%);font-size:32px;line-height:1;color:#fff;font-weight:500;z-index:3}
+  .scale-track{position:absolute;left:-4%;right:-18%;top:66px;display:flex;align-items:flex-start;justify-content:space-between}
+  .tick{width:3px;height:30px;background:rgba(255,255,255,.92);border-radius:2px}
+  .tick.short{height:23px;opacity:.78}
+  .tick.active{height:52px;background:#ffd21f;box-shadow:0 0 12px rgba(255,210,31,.45);margin-top:-20px}
+  .scale-labels{position:absolute;left:304px;right:314px;top:122px;display:flex;justify-content:space-between;color:#fff;font-size:27px;line-height:1}
+  .vline{position:absolute;top:0;bottom:0;width:1px;background:rgba(255,255,255,.24)}
+  .v1{left:32.3%}.v2{left:66.3%}
+  .tile-row{position:absolute;left:26px;right:31px;bottom:18px;height:64px;display:grid;grid-template-columns:1.03fr 1fr 1fr 1fr 1fr 1fr;align-items:start;text-align:center;color:#fff}
+  .tile{position:relative;min-width:0}
+  .icon-box{display:inline-flex;align-items:center;justify-content:center;min-width:53px;height:47px;border:4px solid rgba(255,255,255,.95);border-radius:4px;color:#fff;font-size:26px;font-weight:800;line-height:1;background:rgba(0,0,0,.04)}
+  .tile.active .icon-box{border-color:#ffd21f;color:#ffd21f}
+  .tile.dim{opacity:.42}
+  .tile-value{display:block;margin-top:21px;font-size:23px;line-height:1;color:#fff}
+  .tile.active .tile-value{color:#ffd21f}
+  .ev-icon{font-size:30px;letter-spacing:-4px}
+  .meter-icon{width:56px;height:44px;border:0;position:relative;background:transparent}
+  .meter-icon:before{content:"";position:absolute;inset:2px;border:9px solid #fff;border-radius:4px}
+  .meter-icon:after{content:"";position:absolute;left:19px;top:11px;width:18px;height:18px;background:#fff;border-radius:50%;box-shadow:0 0 0 8px #020202}
+  .small-meter{display:inline-flex;margin-top:18px;width:32px;height:22px;border:2px solid #fff;border-radius:2px;align-items:center;justify-content:center;font-size:13px}
+  .af-icon{position:relative;width:54px;height:54px;margin:0 auto 0;border:0}
+  .af-icon:before,.af-icon:after{content:"";position:absolute;border:6px solid rgba(255,255,255,.85);border-radius:50%;inset:4px}
+  .af-icon:after{inset:18px;border-width:4px}
+  .cloud{font-size:24px;margin-top:19px;display:block}
+  .implementation-note{margin-top:16px;color:rgba(255,255,255,.76);line-height:1.5}
+  .options{margin-top:14px}
+  @media(max-width:760px){.target-scene{height:174px}.auto-circle{width:42px;height:42px;font-size:27px}.auto-label{font-size:17px}.auto-block{left:18px;top:44px}.scale-area{left:132px;right:28px}.scale-value{font-size:24px}.scale-track{top:50px}.tick{height:22px}.tick.short{height:16px}.tick.active{height:38px;margin-top:-14px}.scale-labels{left:204px;right:176px;top:91px;font-size:18px}.tile-row{left:15px;right:16px;bottom:12px;height:48px}.icon-box{min-width:38px;height:34px;border-width:3px;font-size:18px}.tile-value{font-size:15px;margin-top:13px}}
+</style>
+
+<h2>Step 1: Match The Reference Image</h2>
+<p class="subtitle">This screen compares your original reference with the target controller style. The app implementation should use this bar in Pro mode.</p>
+
+<div class="compare">
+  <div class="mockup-frame">
+    <div class="mockup-title">Your Reference</div>
+    <img class="reference-img" src="/files/reference-pro-controller.jpg" alt="Reference pro controller">
+  </div>
+
+  <div class="mockup-frame">
+    <div class="mockup-title">Target NeoProCamX Pro Controller</div>
+    <div class="target-scene">
+      <div class="pro-strip"></div>
+      <div class="vline v1"></div>
+      <div class="vline v2"></div>
+      <div class="auto-block">
+        <div class="auto-circle">A</div>
+        <span class="auto-label">Manual</span>
+      </div>
+      <div class="scale-area">
+        <div class="scale-value">500</div>
+        <div class="scale-track">
+          <div class="tick short"></div><div class="tick"></div><div class="tick short"></div><div class="tick"></div><div class="tick short"></div><div class="tick"></div><div class="tick active"></div><div class="tick"></div><div class="tick short"></div><div class="tick"></div><div class="tick short"></div><div class="tick"></div><div class="tick short"></div>
+        </div>
+      </div>
+      <div class="scale-labels"><span>250</span><span>1000</span></div>
+      <div class="tile-row">
+        <div class="tile">
+          <div class="icon-box ev-icon">+−</div>
+          <span class="tile-value">0</span>
+        </div>
+        <div class="tile active">
+          <div class="icon-box">ISO</div>
+          <span class="tile-value">500</span>
+        </div>
+        <div class="tile">
+          <div class="icon-box">S</div>
+          <span class="tile-value">0.4</span>
+        </div>
+        <div class="tile">
+          <div class="icon-box">WB</div>
+          <span class="cloud">☁</span>
+        </div>
+        <div class="tile dim">
+          <div class="af-icon"></div>
+          <span class="tile-value">AF</span>
+        </div>
+        <div class="tile">
+          <div class="meter-icon"></div>
+          <span class="small-meter">[•]</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p class="implementation-note">
+  Design intent: use this exact landscape-style overlay strip inside the camera preview. The active parameter controls the top scrollable ruler. The bottom icons stay fixed: EV, ISO, shutter, WB, AF, metering. The active item uses yellow border and value.
+</p>

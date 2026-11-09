@@ -1,0 +1,38 @@
+#version 450
+
+// Offline RAW conversion stage 2. Produces the first 3x3 luma blur used by
+// RawDevelopEliteDetailPolicy. Stage 3 reads a second 3x3 neighbourhood from
+// this image to reproduce the broad clarity band without CPU pixels.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba32f) uniform readonly image2D denoisedInput;
+layout(binding = 1, r32f) uniform writeonly image2D lumaBlurOutput;
+
+layout(push_constant) uniform RawDevelopDetailPushConstants {
+    int width;
+    int height;
+    int detailEnabled;
+    int reserved;
+} p;
+
+const vec3 ACESCG_LUMA = vec3(0.2722287168, 0.6740817658, 0.0536895174);
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= p.width || pixel.y >= p.height) return;
+
+    float sum = 0.0;
+    int count = 0;
+    int x0 = max(pixel.x - 1, 0);
+    int x1 = min(pixel.x + 1, p.width - 1);
+    int y0 = max(pixel.y - 1, 0);
+    int y1 = min(pixel.y + 1, p.height - 1);
+    for (int y = y0; y <= y1; ++y) {
+        for (int x = x0; x <= x1; ++x) {
+            sum += dot(imageLoad(denoisedInput, ivec2(x, y)).rgb, ACESCG_LUMA);
+            count += 1;
+        }
+    }
+    imageStore(lumaBlurOutput, pixel, vec4(sum / float(max(count, 1)), 0.0, 0.0, 1.0));
+}

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NeoProCamX Pro Controls Above Bottom Overlay</title>
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #090909;
+      overflow: hidden;
+    }
+
+    iframe {
+      width: min(430px, 100vw);
+      height: min(932px, 100vh);
+      border: 0;
+      background: #000;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <iframe id="layout" src="/files/step6-center-mode-access-no-extra-slide-ui.html" title="NeoProCamX Pro controls fixed above bottom overlay"></iframe>
+  <script>
+    const frame = document.getElementById('layout');
+
+    frame.addEventListener('load', () => {
+      const doc = frame.contentDocument;
+      const proOverlay = doc.querySelector('.pro-overlay');
+      const preview = doc.querySelector('.preview');
+
+      if (proOverlay) {
+        proOverlay.style.bottom = '184px';
+        proOverlay.style.height = '174px';
+        proOverlay.style.borderBottom = '1px solid rgba(255,255,255,.14)';
+      }
+
+      if (preview) {
+        preview.style.inset = '0 0 184px';
+      }
+    });
+  </script>
+</body>
+</html>

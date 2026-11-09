@@ -1,0 +1,28 @@
+// Top-level build file - Now using Gradle Version Catalog (gradle/libs.versions.toml)
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:9.2.0'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.21"
+
+        // Pin reviewed, fixed build-tool transitive versions on the buildscript classpath. These
+        // are host-only controls and do not add code or weight to the camera APK. Together with
+        // strict dependency verification they address CVE-2026-53914-style build-input risk: CI
+        // and developer builds must not consume caches from untrusted writers.
+        constraints {
+            classpath('org.apache.commons:commons-lang3:3.18.0')
+            classpath('org.bitbucket.b_c:jose4j:0.9.6')
+            classpath('org.bouncycastle:bcpkix-jdk18on:1.84')
+            classpath('org.bouncycastle:bcprov-jdk18on:1.84')
+            classpath('org.bouncycastle:bcutil-jdk18on:1.84')
+            classpath('org.jdom:jdom2:2.0.6.1')
+        }
+    }
+}
+
+tasks.register('clean', Delete) {
+    delete layout.buildDirectory
+}

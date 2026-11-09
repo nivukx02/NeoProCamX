@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 2,
+  "name": "engine-scoped-rollback-smoke-test",
+  "sourceRoots": ["tools/contract-refactor/fixtures"],
+  "sourceExtensions": [".txt"],
+  "excludedPathRegex": "^$",
+  "allowedFiles": ["tools/contract-refactor/fixtures/rollback-host.txt"],
+  "protectedFiles": ["tools/contract-refactor/fixtures/rollback-protected.txt"],
+  "transactionLimits": {
+    "maximumChangedFiles": 1,
+    "maximumAddedFiles": 0,
+    "maximumRemovedFiles": 0
+  },
+  "lineRatchets": [
+    {"file": "tools/contract-refactor/fixtures/rollback-host.txt", "maximumLines": 1}
+  ],
+  "requiredContracts": [
+    {"file": "tools/contract-refactor/fixtures/rollback-host.txt", "patterns": ["stable-host-contract"]}
+  ],
+  "forbiddenContracts": [],
+  "preflightGates": [],
+  "gates": []
+}

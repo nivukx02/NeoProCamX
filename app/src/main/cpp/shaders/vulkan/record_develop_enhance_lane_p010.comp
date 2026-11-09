@@ -1,0 +1,274 @@
+#version 450
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  record_develop_enhance_lane_p010.comp — GPU port of the CPU-only CHROMA enhance lane
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Byte-CLOSE Vulkan-compute reproduction of the chroma/temporal/dither subset of
+//   com.neoproc.neoproccamx.recording.Npv10ExportEnhancementPolicy.enhanceP010
+// (Npv10MovConverter.kt) that stays on the CPU today under the live-parity profile:
+//   pass 0 TEMPORAL      stabilizeLowMotionTemporalNoise (luma+chroma, needs previous frame)
+//   pass 1 CHROMA_NR     suppressChromaNoise / suppressChromaSample
+//   pass 2 DEADBAND      applyShadowChromaDeadband / deadbandChromaSample
+//   pass 3 SPIKE         smoothLocalChromaSpikes / smoothChromaComponent
+//   pass 4 DITHER        applyBlueNoiseDither (luma)
+// The luma bilateral/unsharp (enhanceLiveCinemaLumaP010) is a SEPARATE, already-GPU pass
+// (record_parity_enhance_p010.comp); the identity colour-lane passes (calibration @ strength 0,
+// SNCE nudge @ sat=1/warmth=0, the gain-zeroed luma-detail/APEX lanes) are no-ops under the
+// live-parity profile and are intentionally omitted.
+//
+// Each pass reads the SNAPSHOT of the previous stage from binding 0 (`currentData`) and writes
+// binding 2 (`outputData`), which the native dispatch pre-seeds = input so unmodified samples
+// pass through (mirrors the CPU `output = payload.copyOf()` + conditional writes and the
+// per-pass `original = snapshot(payload)`). The host ping-pongs current<->output between passes.
+//
+// Math runs on 10-bit codes (value >> 6) exactly like readP010Sample/writeP010Sample. GPU float32
+// vs CPU float64 ⇒ output can differ by ~1 code; the converter's first-frame CPU-vs-GPU parity gate
+// accepts the GPU lane only within tolerance, else falls back to the byte-exact CPU enhanceP010.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer CurrentP010 {
+    uint currentData[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer PreviousP010 {
+    uint previousData[];
+};
+
+layout(std430, set = 0, binding = 2) buffer OutputP010 {
+    uint outputData[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer EnhanceLaneUniforms {
+    float uTemporalLumaBlend;   // profile.temporalLumaBlend
+    float uTemporalChromaBlend; // profile.temporalChromaBlend
+    float uChromaSuppression;   // profile.chromaSuppression
+    float uShadowChromaDeadband;// profile.shadowChromaDeadband (integer, as float)
+    float uDitherAmplitude;     // profile.ditherAmplitude
+    float uStrictNormalSdr;     // isStrictNormalSdrExportProfile (0/1)
+    float uStrictVisibleClean;  // isStrictVisibleCleanExportProfile (0/1)
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint hasPreviousFrame;
+    uint pass;
+} pushData;
+
+const uint PASS_TEMPORAL = 0u;
+const uint PASS_CHROMA_NR = 1u;
+const uint PASS_DEADBAND = 2u;
+const uint PASS_SPIKE = 3u;
+const uint PASS_DITHER = 4u;
+
+const int NEUTRAL_CHROMA = 512;
+const int TEMPORAL_LUMA_MOTION_THRESHOLD = 22;
+const int TEMPORAL_CHROMA_MOTION_THRESHOLD = 34;
+const int LOCAL_CHROMA_SPIKE_THRESHOLD = 80;
+const int STRICT_LOCAL_CHROMA_SPIKE_THRESHOLD = 44;
+const int LOCAL_CHROMA_NEIGHBOR_NEUTRAL_WINDOW = 72;
+const int STRICT_LOCAL_CHROMA_NEIGHBOR_NEUTRAL_WINDOW = 96;
+const float LOCAL_CHROMA_SPIKE_RETAIN = 0.16;
+const float STRICT_LOCAL_CHROMA_SPIKE_RETAIN = 0.012;
+const int LOCAL_CHROMA_SIGNAL_MIN_DELTA = 8;
+const int COHERENT_CHROMA_SUPPORT_WINDOW = 48;
+const float COHERENT_CHROMA_RETAIN_FLOOR = 0.52;
+
+const int BLUE_NOISE_8X8[64] = int[64](
+    0, 48, 12, 60, 3, 51, 15, 63,
+    32, 16, 44, 28, 35, 19, 47, 31,
+    8, 56, 4, 52, 11, 59, 7, 55,
+    40, 24, 36, 20, 43, 27, 39, 23,
+    2, 50, 14, 62, 1, 49, 13, 61,
+    34, 18, 46, 30, 33, 17, 45, 29,
+    10, 58, 6, 54, 9, 57, 5, 53,
+    42, 26, 38, 22, 41, 25, 37, 21
+);
+
+// P010: two 16-bit samples per 32-bit word (little-endian lane order); the 10-bit code sits in the
+// high bits (value >> 6), matching readP010Sample / writeP010Sample.
+int readCodeAt(uint sampleIndex, bool fromCurrent) {
+    uint word = fromCurrent ? currentData[sampleIndex >> 1u] : previousData[sampleIndex >> 1u];
+    uint lane = (sampleIndex & 1u) * 16u;
+    return int(((word >> lane) & 0xFFFFu) >> 6u);
+}
+
+void writeCode(uint sampleIndex, int code) {
+    uint wordIndex = sampleIndex >> 1u;
+    uint lane = (sampleIndex & 1u) * 16u;
+    uint laneMask = 0xFFFFu << lane;
+    uint packed = ((uint(clamp(code, 0, 1023)) << 6u) & 0xFFFFu) << lane;
+    uint oldWord = outputData[wordIndex];
+    // Two adjacent samples share one word and are written by different invocations — CAS so neither
+    // clobbers the other lane (mirrors the parity-enhance shader's writeLumaCode).
+    while (true) {
+        uint newWord = (oldWord & ~laneMask) | packed;
+        uint observed = atomicCompSwap(outputData[wordIndex], oldWord, newWord);
+        if (observed == oldWord) return;
+        oldWord = observed;
+    }
+}
+
+int blendCode(int current, int prior, float priorWeight) {
+    // Mirrors CPU blend(): (cur*(1-w) + prior*w).toInt().coerceIn(0,1023). int() truncates toward
+    // zero and the blended value is non-negative, matching Kotlin Double.toInt() truncation.
+    float v = float(current) * (1.0 - priorWeight) + float(prior) * priorWeight;
+    return clamp(int(v), 0, 1023);
+}
+
+bool sameChromaDirection(int a, int b) {
+    return (a < 0 && b < 0) || (a > 0 && b > 0);
+}
+
+bool locallySupportedChroma(int smp, int neighbor, int delta, int neighborDelta) {
+    return abs(delta) >= LOCAL_CHROMA_SIGNAL_MIN_DELTA &&
+        abs(neighborDelta) >= LOCAL_CHROMA_SIGNAL_MIN_DELTA &&
+        sameChromaDirection(delta, neighborDelta) &&
+        abs(smp - neighbor) <= COHERENT_CHROMA_SUPPORT_WINDOW;
+}
+
+// 4-neighbour (up/down/left/right) integer average of one chroma component from the snapshot; matches
+// chromaNeighborAverage (integer total/count, count==0 -> NEUTRAL_CHROMA).
+int chromaNeighborAverage(uint lumaShorts, uint chromaWidth, uint chromaHeight, int row, int column, uint component) {
+    int total = 0;
+    int count = 0;
+    int rc[4] = int[4](row - 1, row + 1, row, row);
+    int cc[4] = int[4](column, column, column - 1, column + 1);
+    for (int k = 0; k < 4; ++k) {
+        int nr = rc[k];
+        int nc = cc[k];
+        if (nr < 0 || nr >= int(chromaHeight) || nc < 0 || nc >= int(chromaWidth)) continue;
+        uint si = lumaShorts + (uint(nr) * chromaWidth + uint(nc)) * 2u + component;
+        total += readCodeAt(si, true);
+        count += 1;
+    }
+    return count == 0 ? NEUTRAL_CHROMA : total / count;
+}
+
+int suppressChromaSample(int smp, int neighborAverage) {
+    int cs = clamp(smp, 0, 1023);
+    int cn = clamp(neighborAverage, 0, 1023);
+    int delta = cs - NEUTRAL_CHROMA;
+    int ndelta = cn - NEUTRAL_CHROMA;
+    bool supported = locallySupportedChroma(cs, cn, delta, ndelta);
+    float retain;
+    if (supported) {
+        retain = max(uChromaSuppression, COHERENT_CHROMA_RETAIN_FLOOR);
+    } else if (uStrictNormalSdr > 0.5) {
+        retain = min(uChromaSuppression, 0.0005);
+    } else {
+        retain = uChromaSuppression;
+    }
+    int target = supported ? cn : NEUTRAL_CHROMA;
+    return clamp(int(float(target) + float(cs - target) * retain), 0, 1023);
+}
+
+float smoothstepUnit(float edge1, float value) {
+    // smoothstep(0, edge1, value) with the CPU's edge0==edge1 guard folded in (edge0 is always 0 here).
+    if (edge1 <= 0.0) return value >= edge1 ? 1.0 : 0.0;
+    float t = clamp(value / edge1, 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+void main() {
+    uint width = pushData.width;
+    uint height = pushData.height;
+    uint lumaShorts = width * height;
+    uint chromaWidth = (width + 1u) >> 1u;
+    uint chromaHeight = (height + 1u) >> 1u;
+    uint chromaPairs = chromaWidth * chromaHeight;
+    uint gid = gl_GlobalInvocationID.x;
+
+    if (pushData.pass == PASS_TEMPORAL) {
+        if (pushData.hasPreviousFrame == 0u) return;
+        uint totalShorts = lumaShorts + chromaPairs * 2u;
+        if (gid >= totalShorts) return;
+        int cur = readCodeAt(gid, true);
+        int prior = readCodeAt(gid, false);
+        bool luma = gid < lumaShorts;
+        int thresh = luma ? TEMPORAL_LUMA_MOTION_THRESHOLD : TEMPORAL_CHROMA_MOTION_THRESHOLD;
+        float w = luma ? uTemporalLumaBlend : uTemporalChromaBlend;
+        if (abs(cur - prior) <= thresh) {
+            writeCode(gid, blendCode(cur, prior, w));
+        }
+        return;
+    }
+
+    if (pushData.pass == PASS_DITHER) {
+        if (uDitherAmplitude <= 0.0) return;
+        if (gid >= lumaShorts) return;
+        int cur = readCodeAt(gid, true);
+        uint x = gid % width;
+        uint y = gid / width;
+        int rank = BLUE_NOISE_8X8[int(((y & 7u) << 3u) + (x & 7u))];
+        float centered = (float(rank) - 31.5) / 31.5;
+        float bn = centered * clamp(uDitherAmplitude, 0.0, 1.0) * 2.0;
+        int dither = bn >= 0.33 ? 1 : (bn <= -0.33 ? -1 : 0);
+        writeCode(gid, clamp(cur + dither, 0, 1023));
+        return;
+    }
+
+    // Chroma neighbourhood passes (CHROMA_NR / DEADBAND / SPIKE) over chroma pairs.
+    if (gid >= chromaPairs) return;
+    int row = int(gid / chromaWidth);
+    int column = int(gid % chromaWidth);
+    uint uSi = lumaShorts + gid * 2u;
+    uint vSi = uSi + 1u;
+    int neighborU = chromaNeighborAverage(lumaShorts, chromaWidth, chromaHeight, row, column, 0u);
+    int neighborV = chromaNeighborAverage(lumaShorts, chromaWidth, chromaHeight, row, column, 1u);
+
+    if (pushData.pass == PASS_CHROMA_NR) {
+        int u = readCodeAt(uSi, true);
+        int v = readCodeAt(vSi, true);
+        writeCode(uSi, suppressChromaSample(u, neighborU));
+        writeCode(vSi, suppressChromaSample(v, neighborV));
+        return;
+    }
+
+    if (pushData.pass == PASS_DEADBAND) {
+        int threshold = int(uShadowChromaDeadband + 0.5);
+        if (threshold <= 0) return;
+        // U then V — the snapshot (currentData) is the post-CHROMA_NR state; output pre-seeded = snapshot.
+        int comps[2] = int[2](0, 0);
+        uint sis[2] = uint[2](uSi, vSi);
+        int neigh[2] = int[2](neighborU, neighborV);
+        for (int k = 0; k < 2; ++k) {
+            int smp = readCodeAt(sis[k], true);
+            int delta = smp - NEUTRAL_CHROMA;
+            int magnitude = abs(delta);
+            if (magnitude <= threshold) {
+                float retain = smoothstepUnit(float(threshold), float(magnitude));
+                int neighbor = clamp(neigh[k], 0, 1023);
+                int target = locallySupportedChroma(smp, neighbor, delta, neighbor - NEUTRAL_CHROMA)
+                    ? neighbor : NEUTRAL_CHROMA;
+                int blended = clamp(int(float(target) + float(smp - target) * retain), 0, 1023);
+                writeCode(sis[k], blended);
+            }
+        }
+        return;
+    }
+
+    if (pushData.pass == PASS_SPIKE) {
+        bool strictClean = uStrictVisibleClean > 0.5;
+        int spikeThreshold = strictClean ? STRICT_LOCAL_CHROMA_SPIKE_THRESHOLD : LOCAL_CHROMA_SPIKE_THRESHOLD;
+        int neighborNeutralWindow = strictClean ? STRICT_LOCAL_CHROMA_NEIGHBOR_NEUTRAL_WINDOW : LOCAL_CHROMA_NEIGHBOR_NEUTRAL_WINDOW;
+        float retain = strictClean ? STRICT_LOCAL_CHROMA_SPIKE_RETAIN : LOCAL_CHROMA_SPIKE_RETAIN;
+        uint sis[2] = uint[2](uSi, vSi);
+        int neigh[2] = int[2](neighborU, neighborV);
+        for (int k = 0; k < 2; ++k) {
+            int current = readCodeAt(sis[k], true);
+            int currentDelta = current - NEUTRAL_CHROMA;
+            int neighborDelta = neigh[k] - NEUTRAL_CHROMA;
+            bool isolatedSpike = abs(currentDelta) >= spikeThreshold &&
+                abs(current - neigh[k]) >= spikeThreshold &&
+                abs(neighborDelta) <= neighborNeutralWindow;
+            if (isolatedSpike) {
+                int smoothed = NEUTRAL_CHROMA + int(float(currentDelta) * retain);
+                writeCode(sis[k], smoothed);
+            }
+        }
+        return;
+    }
+}

@@ -1,0 +1,55 @@
+<h2>Fixed shutter, sliding mode control</h2>
+<p class="subtitle">Corrected interaction: the shutter never moves. Swipe only the mode row above it; release and it snaps the centered label directly over the shutter into the active position.</p>
+
+<div class="mockup" style="max-width:420px;margin:0 auto;">
+  <div class="mockup-header">Camera screen - vertical layout</div>
+  <div class="mockup-body" style="background:#000;min-height:690px;position:relative;overflow:hidden;padding:0;">
+    <div style="position:absolute;top:24px;left:70px;right:70px;border:1px solid #252525;border-radius:22px;color:#ddd;text-align:center;padding:11px 0;font:500 12px Arial;">
+      3840x2160 | 4K | 16:9
+    </div>
+
+    <div style="position:absolute;bottom:0;left:0;right:0;height:198px;background:#030303;border-top:1px solid #090909;">
+      <div style="position:absolute;left:50%;transform:translateX(-50%);top:12px;color:#444;font:10px Arial;letter-spacing:1px;">CENTER ACTIVATION POINT</div>
+
+      <div style="position:absolute;top:34px;left:0;right:0;height:48px;overflow:hidden;border-top:1px solid #111;border-bottom:1px solid #111;">
+        <div style="display:flex;align-items:center;height:48px;width:max-content;transform:translateX(-148px);gap:28px;font:600 13px Arial;color:#777;white-space:nowrap;">
+          <span>LOG</span>
+          <span>RAW</span>
+          <span>VIDEO</span>
+          <span style="color:#fff;background:#181818;border-bottom:2px solid #fff;padding:15px 15px 13px;">PRO</span>
+          <span>NDR</span>
+          <span>LOG</span>
+          <span>RAW</span>
+          <span>VIDEO</span>
+          <span>PRO</span>
+        </div>
+      </div>
+
+      <div style="position:absolute;left:50%;transform:translateX(-50%);top:80px;width:2px;height:13px;background:#fff;"></div>
+      <div style="position:absolute;left:16px;top:111px;width:40px;height:40px;border:1px solid #575757;border-radius:50%;"></div>
+      <div style="position:absolute;right:16px;top:111px;width:40px;height:40px;border:1px solid #575757;border-radius:50%;"></div>
+
+      <div style="position:absolute;left:50%;transform:translateX(-50%);top:99px;width:76px;height:76px;border:4px solid #e6e8ea;border-radius:50%;box-shadow:inset 0 0 0 5px #303033;">
+        <div style="margin:10px;width:48px;height:48px;background:#f5f6f7;border-radius:50%;"></div>
+      </div>
+      <div style="position:absolute;left:50%;transform:translateX(-50%);top:181px;color:#777;font:10px Arial;">SHUTTER POSITION NEVER CHANGES</div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top:22px;">
+  <h3>Behavior</h3>
+  <p><strong>Swipe left:</strong> PRO -> NDR -> LOG -> RAW -> VIDEO -> PRO.</p>
+  <p><strong>Swipe right:</strong> PRO -> VIDEO -> RAW -> LOG -> NDR -> PRO.</p>
+  <p><strong>Selection:</strong> the row snaps on release; only the mode aligned over the fixed shutter becomes active.</p>
+</div>
+
+<div class="options">
+  <div class="option" data-choice="fixed-shutter-release-snap" onclick="toggleSelect(this)">
+    <div class="letter">OK</div>
+    <div class="content">
+      <h3>Use this fixed-shutter sliding rail</h3>
+      <p>Mode strip slides and loops; shutter remains exactly where it is now.</p>
+    </div>
+  </div>
+</div>

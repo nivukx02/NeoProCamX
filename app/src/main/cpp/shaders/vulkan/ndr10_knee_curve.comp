@@ -1,0 +1,77 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define NDR10_ADVANCED_KNEE_CURVE_SHADER 1
+#define RGBA16F_LINEAR_LIGHT_INPUT 1
+#define RGBA16F_TONE_MAPPED_OUTPUT 1
+#define VENDOR_HDR_CERTIFICATIONS_FALSE 1
+
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D uInputLinearRgba16f;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D uOutputToneMappedRgba16f;
+
+layout(push_constant) uniform Ndr10KneeCurveParams {
+    uint width;
+    uint height;
+    float kneePoint;
+    float kneeHardness;
+    float maxCllNits;
+    float exposureScale;
+    float enabled;
+    float reserved;
+} params;
+
+const float DEFAULT_CINEMA_KNEE_POINT = 0.65;
+const float DEFAULT_MAX_CLL_NITS = 1000.0;
+const float HDR_REFERENCE_WHITE_NITS = 203.0;
+
+float adaptiveSigmoidKneeWeight(float value, float kneePoint, float kneeHardness) {
+    float safeKnee = clamp(kneePoint, 0.55, 0.75);
+    float safeHardness = clamp(kneeHardness, 1.0, 3.0);
+    float t = clamp((value - safeKnee) / max(1.0 - safeKnee, 0.00001), 0.0, 1.0);
+    float centered = (t - 0.5) * safeHardness * 4.0;
+    float sigmoid = 1.0 / (1.0 + exp(-centered));
+    float zeroPoint = 1.0 / (1.0 + exp(0.5 * safeHardness * 4.0));
+    float onePoint = 1.0 / (1.0 + exp(-0.5 * safeHardness * 4.0));
+    return clamp((sigmoid - zeroPoint) / max(onePoint - zeroPoint, 0.00001), 0.0, 1.0);
+}
+
+float modifiedReinhardKnee(float channel, float kneePoint, float kneeHardness, float maxCllNits) {
+    float x = max(channel, 0.0);
+    float safeKnee = clamp(kneePoint, 0.55, 0.75);
+    float safeHardness = clamp(kneeHardness, 1.0, 3.0);
+    float safeMaxCll = max(maxCllNits, HDR_REFERENCE_WHITE_NITS);
+    float peakScale = clamp(safeMaxCll / DEFAULT_MAX_CLL_NITS, 0.25, 4.0);
+    float kneeHeadroom = max(peakScale - safeKnee, 0.00001);
+    float over = max(x - safeKnee, 0.0);
+    float reinhard = safeKnee + (over * kneeHeadroom) / (over + kneeHeadroom / safeHardness);
+    float weight = adaptiveSigmoidKneeWeight(x, safeKnee, safeHardness);
+    return mix(x, reinhard, weight);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(params.width) || coord.y >= int(params.height)) {
+        return;
+    }
+
+    vec4 source = imageLoad(uInputLinearRgba16f, coord);
+    float kneePoint = clamp(params.kneePoint > 0.0 ? params.kneePoint : DEFAULT_CINEMA_KNEE_POINT, 0.55, 0.75);
+    float kneeHardness = clamp(params.kneeHardness, 1.0, 3.0);
+    float maxCllNits = max(params.maxCllNits, HDR_REFERENCE_WHITE_NITS);
+    vec3 exposed = max(source.rgb * max(params.exposureScale, 0.0), vec3(0.0));
+    // Hue-preserving knee: drive the knee from the max RGB channel and scale all
+    // channels equally, so a clipping channel is compressed WITHOUT desaturating
+    // or twisting hue. Applying modifiedReinhardKnee per-channel (previously)
+    // shifted highlight hue on saturated colors (audit rank 7); matches
+    // knee_curve.comp [CP-NDR7] and the CPU ApexToneMapper. The knee FUNCTION is
+    // unchanged (Ndr10KneeCurveParityTest parity preserved).
+    float kneeDrive = max(max(exposed.r, exposed.g), exposed.b);
+    float kneeScale = kneeDrive > 1e-6
+        ? modifiedReinhardKnee(kneeDrive, kneePoint, kneeHardness, maxCllNits) / kneeDrive
+        : 1.0;
+    vec3 mapped = params.enabled <= 0.5
+        ? exposed
+        : exposed * kneeScale;
+    imageStore(uOutputToneMappedRgba16f, coord, vec4(mapped, source.a));
+}

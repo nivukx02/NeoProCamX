@@ -1,0 +1,470 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputPixels {
+    uint pixels[];
+} uInputPixels;
+
+layout(std430, binding = 1) writeonly buffer OutputPixels {
+    uint pixels[];
+} uOutputPixels;
+
+layout(push_constant) uniform HdrParams {
+    uint width;
+    uint height;
+    uint frameCount;
+    uint fastApproximation;
+    float exposureScales[8];
+    float normalizationFactors[8];
+    uint outputAcesCg16f; // s4-f04/CP35: 0 = today's 8-bit sRGB out; !=0 = scene-linear radiance out
+} uParams;
+
+#define NEO_ACESCG_NON_CERTIFIED 1
+#define ACESCG_LINEAR_WORKING_SPACE 1
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HIGH-END COLOR-ACCURATE sRGB CONVERSIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Accurate sRGB to linear - preserves color integrity
+float srgbToLinear(float value) {
+    float v = clamp(value, 0.0, 1.0);
+    // Precise IEC 61966-2-1 standard sRGB transfer
+    return v <= 0.04045 
+        ? v / 12.92 
+        : pow((v + 0.055) / 1.055, 2.4);
+}
+
+// Accurate linear to sRGB - preserves color integrity
+float linearToSrgb(float value) {
+    float v = clamp(value, 0.0, 1.0);
+    return v <= 0.0031308 
+        ? v * 12.92 
+        : 1.055 * pow(v, 1.0/2.4) - 0.055;
+}
+
+uint linearToSrgb8(float value) {
+    return uint(clamp(linearToSrgb(value) * 255.0 + 0.5, 0.0, 255.0));
+}
+
+vec3 neoRec709ToAcesCg(vec3 rgb) {
+    rgb = max(rgb, vec3(0.0));
+    return max(vec3(
+        dot(rgb, vec3(0.61310, 0.33952, 0.04738)),
+        dot(rgb, vec3(0.07019, 0.91635, 0.01345)),
+        dot(rgb, vec3(0.02062, 0.10957, 0.86982))
+    ), vec3(0.0));
+}
+
+vec3 neoAcesCgToRec709(vec3 acesCg) {
+    acesCg = max(acesCg, vec3(0.0));
+    return max(vec3(
+        dot(acesCg, vec3(1.70486, -0.62172, -0.08330)),
+        dot(acesCg, vec3(-0.13008, 1.14074, -0.01056)),
+        dot(acesCg, vec3(-0.02400, -0.12897, 1.15308))
+    ), vec3(0.0));
+}
+
+vec3 neoAcesFittedRrtOdt(vec3 acesCg) {
+    vec3 x = max(acesCg, vec3(0.0));
+    vec3 numerator = x * (x + vec3(0.0245786)) - vec3(0.000090537);
+    vec3 denominator = x * (vec3(0.983729) * x + vec3(0.4329510)) + vec3(0.238081);
+    return clamp(numerator / max(denominator, vec3(1e-6)), 0.0, 1.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HIGH-END CINEMA-GRADE TONE MAPPING
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ACES RRT+ODT fit by Stephen Hill - high-end color accurate version
+float acesHillTonemap(float x) {
+    x = max(x, 0.0);
+    float a = x * (x + 0.0245786) - 0.000090537;
+    float b = x * (0.983729 * x + 0.4329510) + 0.238081;
+    return clamp(a / b, 0.0, 1.0);
+}
+
+// Gran Turismo HDR tone mapping - natural brightness preservation
+float granTurismoTonemap(float x, float maxBrightness) {
+    x = max(x, 0.0);
+    float p = maxBrightness;
+    float m = 0.22;
+    float l = 0.4;
+    float c = 1.33;
+    
+    float l0 = ((p - m) * l) / 1.0;
+    float s0 = m + l0;
+    float s1 = m + 1.0 * l0;
+    float c2 = (1.0 * p) / (p - s1);
+    float cp = -c2 / p;
+    
+    float w0 = 1.0 - smoothstep(0.0, m, x);
+    float w2 = step(m + l0, x);
+    float w1 = 1.0 - w0 - w2;
+    
+    float t = m * pow(max(x / m, 0.001), c);
+    float s = p - (p - s1) * exp(cp * (x - s0));
+    float lVal = m + 1.0 * (x - m);
+    
+    return clamp(t * w0 + lVal * w1 + s * w2, 0.0, 1.0);
+}
+
+// Extended Reinhard with accurate highlight roll-off  
+float reinhardExtended(float x, float whitePoint) {
+    x = max(x, 0.0);
+    float wp2 = whitePoint * whitePoint;
+    return clamp((x * (1.0 + x / wp2)) / (1.0 + x), 0.0, 1.0);
+}
+
+// AgX-inspired tone mapping - modern color-preserving approach
+float agxTonemap(float x) {
+    x = max(x, 0.0);
+    float minEv = -12.47393;
+    float maxEv = 4.026069;
+    float encoded = log2(max(x, 0.00001));
+    encoded = (encoded - minEv) / (maxEv - minEv);
+    encoded = clamp(encoded, 0.0, 1.0);
+    
+    // Smooth sigmoid with better highlight preservation
+    float pivot = 0.18;
+    float t = encoded - pivot;
+    float signT = sign(t);
+    float absT = abs(t);
+    return clamp(pivot + signT * pow(absT, 0.55) * 0.55, 0.0, 1.0);
+}
+
+// HIGH-END hybrid tone mapping - preserves color fidelity in bright areas
+vec3 highEndToneMap(vec3 linearRGB, float whitePoint, float acesBlend, bool fastMode) {
+    float luma = dot(linearRGB, vec3(0.2126, 0.7152, 0.0722));
+    
+    // Calculate per-channel ratios to preserve original color
+    vec3 ratios = linearRGB / max(luma, 0.0001);
+    
+    // High-end tone mapping blend for brightness preservation
+    float tAces = acesHillTonemap(luma);
+    float tGT = granTurismoTonemap(luma, 1.2);
+    float tReinhard = reinhardExtended(luma, whitePoint);
+    
+    // Scene-adaptive blending based on luminance level
+    float highlightRegion = smoothstep(0.5, 2.0, luma);
+    float midtoneRegion = 1.0 - abs(luma - 0.5) * 1.5;
+    midtoneRegion = clamp(midtoneRegion, 0.0, 1.0);
+    
+    // Use GT for highlights (better brightness preservation), ACES for cinema look
+    float mappedLuma;
+    if (fastMode) {
+        // Fast mode: 40% GT + 35% ACES + 25% Reinhard - brighter result
+        mappedLuma = mix(
+            mix(tReinhard, tAces, 0.58),
+            tGT,
+            highlightRegion * 0.40 + 0.20
+        );
+    } else {
+        // Quality mode: adaptive blend for optimal color and brightness
+        float gtWeight = highlightRegion * 0.50 + 0.15;  // More GT in highlights
+        float acesWeight = acesBlend * (1.0 - highlightRegion * 0.3);  // Less ACES in highlights
+        float reinhardWeight = 1.0 - gtWeight - acesWeight;
+        reinhardWeight = max(reinhardWeight, 0.0);
+        
+        mappedLuma = tGT * gtWeight + tAces * acesWeight + tReinhard * reinhardWeight;
+    }
+    
+    // Apply tone-mapped luminance while preserving color ratios
+    vec3 result = ratios * mappedLuma;
+    
+    // Gentle highlight desaturation to prevent color burn
+    float desat = smoothstep(0.75, 1.0, mappedLuma) * 0.15;
+    result = mix(result, vec3(mappedLuma), desat);
+    
+    return clamp(result, 0.0, 1.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HIGH-END EXPOSURE WEIGHTING
+// ═══════════════════════════════════════════════════════════════════════════
+
+float sampleWeight(float luma8Bit, float exposureScale) {
+    float normalized = clamp(luma8Bit / 255.0, 0.0, 1.0);
+    
+    // Wider Gaussian for smoother transitions
+    float centered = normalized - 0.5;
+    float gaussian = exp(-centered * centered * 6.0);  // Wider bell curve
+    
+    // Exposure-aware weighting with smoother transitions
+    float exposurePreference = 1.0;
+    if (normalized < 0.12) {
+        // Deep shadow: strongly prefer overexposed frames
+        exposurePreference = clamp(exposureScale * 0.75, 0.3, 1.0);
+    } else if (normalized < 0.25) {
+        // Shadow region: prefer overexposed frames
+        float t = (normalized - 0.12) / 0.13;
+        exposurePreference = mix(clamp(exposureScale * 0.75, 0.3, 1.0), 1.0, t);
+    } else if (normalized > 0.88) {
+        // Deep highlight: strongly prefer underexposed frames  
+        exposurePreference = clamp(1.0 / (exposureScale + 0.01) * 0.65, 0.15, 1.0);
+    } else if (normalized > 0.75) {
+        // Highlight region: prefer underexposed frames
+        float t = (normalized - 0.75) / 0.13;
+        exposurePreference = mix(1.0, clamp(1.0 / (exposureScale + 0.01) * 0.65, 0.15, 1.0), t);
+    }
+    
+    // Smoother tent function
+    float tent = 1.0 - abs(normalized * 2.0 - 1.0);
+    tent = tent * tent;  // Quadratic for smoother falloff
+    
+    return max(tent * gaussian * exposurePreference, 0.015);
+}
+
+vec3 unpackArgb(uint pixel);
+float luminance(vec3 color);
+
+float preferUnderExposedHighlights(float normalizedLuma, float exposureScale) {
+    float highlight = smoothstep(0.72, 0.98, normalizedLuma);
+    float underExposure = clamp(1.0 / max(exposureScale, 0.05), 0.15, 2.5);
+    return mix(1.0, underExposure, highlight);
+}
+
+float preferLongExposureShadows(float normalizedLuma, float exposureScale) {
+    float shadow = 1.0 - smoothstep(0.04, 0.26, normalizedLuma);
+    float longExposure = clamp(exposureScale, 0.35, 2.8);
+    return mix(1.0, longExposure, shadow);
+}
+
+float exposureAwareNdrMergeWeight(float luma8Bit, float exposureScale) {
+    float normalized = clamp(luma8Bit / 255.0, 0.0, 1.0);
+    float baseWeight = sampleWeight(luma8Bit, exposureScale);
+    float highlightWeight = preferUnderExposedHighlights(normalized, exposureScale);
+    float shadowWeight = preferLongExposureShadows(normalized, exposureScale);
+    return max(baseWeight * highlightWeight * shadowWeight, 0.006);
+}
+
+float ghostRejectWeight(vec3 sampleColor, vec3 referenceColor, bool hasReference) {
+    if (!hasReference) return 1.0;
+    float lumaDelta = abs(luminance(sampleColor) - luminance(referenceColor));
+    float chromaDelta = length((sampleColor - vec3(luminance(sampleColor))) -
+        (referenceColor - vec3(luminance(referenceColor))));
+    return clamp(exp(-lumaDelta * 9.0 - chromaDelta * 5.0), 0.08, 1.0);
+}
+
+float perPixelLuminanceConfidence(float normalizedLuma, float exposureScale) {
+    float y = clamp(normalizedLuma, 0.0, 1.0);
+    float highlightReliability = 1.0 - smoothstep(0.92, 1.0, y) * clamp(exposureScale, 0.0, 1.0);
+    float shadowReliability = smoothstep(0.006, 0.055, y) + (1.0 - smoothstep(0.0, 0.018, y)) * 0.14;
+    return clamp(highlightReliability * shadowReliability, 0.08, 1.0);
+}
+
+float mediumExposureSkinWeight(vec3 srgb, float exposureScale) {
+    float r = srgb.r;
+    float g = srgb.g;
+    float b = srgb.b;
+    float y = luminance(srgb);
+    float redGreen = r / max(g, 1e-5);
+    float blueGreen = b / max(g, 1e-5);
+    float skin = smoothstep(0.20, 0.72, y) *
+        (1.0 - smoothstep(0.86, 1.0, y)) *
+        smoothstep(1.08, 1.58, redGreen) *
+        (1.0 - smoothstep(1.88, 2.60, redGreen)) *
+        smoothstep(0.42, 0.88, blueGreen);
+    float mediumExposure = 1.0 - smoothstep(0.24, 1.20, abs(exposureScale - 1.0));
+    return mix(1.0, 1.0 + mediumExposure * 0.48, skin);
+}
+
+vec3 rgbChannelNormalization(vec3 linearRgb) {
+    vec3 source = max(linearRgb, vec3(0.0));
+    float y = max(luminance(source), 1e-5);
+    vec3 balanced = source / vec3(1.18, 1.0, 0.96);
+    float balancedY = max(luminance(balanced), 1e-5);
+    balanced *= y / balancedY;
+    float redOverflow = smoothstep(1.42, 2.20, balanced.r / max(balanced.g, 1e-5));
+    balanced.r = mix(balanced.r, min(balanced.r, balanced.g * 1.42), redOverflow * 0.72);
+    balanced.b = mix(balanced.b, max(balanced.b, balanced.g * 0.70), redOverflow * 0.44);
+    float cyanShift = smoothstep(1.60, 3.40, max(balanced.g, balanced.b) / max(balanced.r, 1e-5));
+    balanced = mix(balanced, vec3(y) + (balanced - vec3(y)) * vec3(0.88, 0.76, 0.70), cyanShift * 0.32);
+    float finalY = max(luminance(balanced), 1e-5);
+    return max(balanced * (y / finalY), vec3(0.0));
+}
+
+float neighborHighlightStructure(uvec2 gid, uint pixelsPerFrame) {
+    if (uParams.frameCount == 0u) return 0.0;
+    uint frameOffset = min(uParams.frameCount - 1u, 0u) * pixelsPerFrame;
+    float structure = 0.0;
+    float count = 0.0;
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            if (x == 0 && y == 0) continue;
+            uint sx = uint(clamp(int(gid.x) + x, 0, int(uParams.width) - 1));
+            uint sy = uint(clamp(int(gid.y) + y, 0, int(uParams.height) - 1));
+            vec3 sampleColor = unpackArgb(uInputPixels.pixels[frameOffset + sy * uParams.width + sx]);
+            structure += luminance(sampleColor);
+            count += 1.0;
+        }
+    }
+    return structure / max(count, 1.0);
+}
+
+vec3 rawDomainHighlightReconstruct(vec3 merged, uvec2 gid, uint pixelsPerFrame, float peakLuma) {
+    float y = luminance(merged);
+    float clipped = smoothstep(0.88, 1.15, peakLuma);
+    if (clipped <= 0.001) return merged;
+    float neighborY = srgbToLinear(neighborHighlightStructure(gid, pixelsPerFrame));
+    float recoveredY = mix(y, max(y, neighborY), clipped * 0.42);
+    vec3 neutral = vec3(y);
+    vec3 texturePreserved = neutral + (merged - neutral) * (1.0 - clipped * 0.28);
+    return max(texturePreserved * (recoveredY / max(luminance(texturePreserved), 0.0001)), vec3(0.0));
+}
+
+vec3 unpackArgb(uint pixel) {
+    return vec3(
+        float((pixel >> 16) & 0xFFu),
+        float((pixel >> 8) & 0xFFu),
+        float(pixel & 0xFFu)
+    ) / 255.0;
+}
+
+float luminance(vec3 color) {
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= uParams.width || gid.y >= uParams.height) {
+        return;
+    }
+
+    uint pixelIndex = gid.y * uParams.width + gid.x;
+    uint pixelsPerFrame = uParams.width * uParams.height;
+    
+    // Accumulators for weighted HDR merge
+    vec3 accColor = vec3(0.0);
+    float accW = 0.0;
+    float peakLuma = 0.0;
+    float minLuma = 1000.0;
+    
+    // Reference frame color for consistency
+    vec3 refColor = vec3(0.0);
+    bool hasRef = false;
+
+    // Process all exposure frames
+    for (uint frameIndex = 0u; frameIndex < uParams.frameCount; ++frameIndex) {
+        uint packed = uInputPixels.pixels[frameIndex * pixelsPerFrame + pixelIndex];
+        vec3 srgb = unpackArgb(packed);
+        float luma = luminance(srgb) * 255.0;
+        
+        // Store middle exposure as reference for color consistency
+        if (!hasRef && abs(uParams.exposureScales[frameIndex] - 1.0) < 0.3) {
+            refColor = srgb;
+            hasRef = true;
+        }
+        
+        float exposureScale = max(uParams.exposureScales[frameIndex], 0.25);
+        float normalization = uParams.normalizationFactors[frameIndex];
+        float weight = exposureAwareNdrMergeWeight(luma, exposureScale);
+        weight *= ghostRejectWeight(srgb, refColor, hasRef);
+        weight *= perPixelLuminanceConfidence(luma / 255.0, exposureScale);
+        weight *= mediumExposureSkinWeight(srgb, exposureScale);
+        
+        // Clipping penalties with smoother transitions
+        float maxChannel = max(srgb.r, max(srgb.g, srgb.b));
+        float minChannel = min(srgb.r, min(srgb.g, srgb.b));
+        float highlightPenalty = 1.0 - smoothstep(0.90, 0.99, maxChannel);
+        float shadowPenalty = smoothstep(0.005, 0.06, minChannel);
+        weight *= max(highlightPenalty * shadowPenalty, 0.03);
+
+        // Convert to linear with accurate sRGB curve
+        vec3 linear = vec3(
+            srgbToLinear(srgb.r) / exposureScale * normalization,
+            srgbToLinear(srgb.g) / exposureScale * normalization,
+            srgbToLinear(srgb.b) / exposureScale * normalization
+        );
+        linear = neoRec709ToAcesCg(linear);
+        linear = rgbChannelNormalization(linear);
+        float linearLuma = luminance(linear);
+        
+        peakLuma = max(peakLuma, linearLuma);
+        minLuma = min(minLuma, linearLuma);
+
+        accColor += linear * weight;
+        accW += weight;
+    }
+
+    // Compute final merged values
+    float weightSum = max(accW, 0.0001);
+    vec3 merged = accColor / weightSum;
+    float mergedLuma = luminance(merged);
+
+    // s4-f04/CP35 16f-precision path: emit the scene-linear ACEScg merge radiance WITHOUT the SDR
+    // tone map or 8-bit sRGB floor, so the downstream s4-f03 peak-nits tone curve gets real headroom
+    // instead of pre-quantized highlights. Packed at 10-bit-per-channel via a reversible Reinhard
+    // compaction (no highlight clip); the true 16f float buffer output is the device-gated final step.
+    // Default OFF -> the 8-bit path below runs bit-for-bit.
+    if (uParams.outputAcesCg16f != 0u) {
+        vec3 hdr = merged / (vec3(1.0) + merged); // [0,inf) -> [0,1), reversible
+        uvec3 q = uvec3(clamp(hdr, vec3(0.0), vec3(1.0)) * 1023.0 + vec3(0.5));
+        uOutputPixels.pixels[pixelIndex] = 0xC0000000u | (q.b << 20) | (q.g << 10) | q.r;
+        return;
+    }
+
+    // Quality-based parameters - BRIGHT AREA FIX
+    bool fastMode = uParams.fastApproximation != 0u;
+    
+    // Higher white point = brighter highlights preserved
+    float whitePoint = fastMode ? 2.8 : 3.5;  // Increased significantly
+    float acesBlend = fastMode ? 0.45 : 0.38;  // Reduced ACES for less compression
+    
+    // Scene-adaptive exposure compensation - LESS AGGRESSIVE
+    float targetMidgray = 0.18;
+    float exposureComp = clamp(
+        targetMidgray / (mergedLuma + 0.04),  // Less aggressive
+        fastMode ? 0.85 : 0.75,   // Less darkening
+        fastMode ? 1.20 : 1.35    // More brightening allowed
+    );
+    
+    // Dynamic range adaptive white point - preserve bright areas better
+    float dynamicRange = max(peakLuma - minLuma, 0.1);
+    float adaptiveWhitePoint = whitePoint * (1.0 + peakLuma * 0.25);  // More headroom
+
+    merged = rawDomainHighlightReconstruct(merged, gid, pixelsPerFrame, peakLuma);
+
+    // Apply exposure compensation
+    vec3 exposed = merged * exposureComp;
+    
+    // High-end tone mapping with ACEScg scene-linear highlight preservation.
+    vec3 final = neoAcesFittedRrtOdt(exposed);
+    final = mix(final, highEndToneMap(neoAcesCgToRec709(exposed), adaptiveWhitePoint, acesBlend, fastMode), fastMode ? 0.28 : 0.18);
+    
+    // Subtle shadow lift for cinema look - gentler
+    float shadowLift = fastMode ? 0.006 : 0.010;
+    float finalLuma = luminance(final);
+    float shadowBlend = 1.0 - finalLuma;
+    shadowBlend = shadowBlend * shadowBlend * shadowBlend * shadowBlend;  // Quartic for gentler effect
+    final = final + shadowLift * shadowBlend;
+    
+    // COLOR CONSISTENCY FIX: Blend toward reference color in midtones
+    if (hasRef) {
+        vec3 refLinear = neoRec709ToAcesCg(vec3(srgbToLinear(refColor.r), srgbToLinear(refColor.g), srgbToLinear(refColor.b)));
+        vec3 refMapped = neoAcesFittedRrtOdt(refLinear * exposureComp);
+        
+        // Calculate color difference
+        float colorDiff = length(final - refMapped);
+        
+        // Blend toward reference in midtones to fix color mismatch
+        float midtoneBlend = 1.0 - abs(finalLuma - 0.5) * 2.0;
+        midtoneBlend = max(midtoneBlend, 0.0) * 0.25;  // Subtle blend
+        
+        // Only correct if there's significant color shift
+        if (colorDiff > 0.05) {
+            // Preserve luminance while correcting color
+            vec3 corrected = mix(final, refMapped * (finalLuma / max(luminance(refMapped), 0.001)), midtoneBlend);
+            final = corrected;
+        }
+    }
+
+    // Pack output with accurate sRGB encoding
+    uint outPixel =
+        0xFF000000u |
+        (linearToSrgb8(final.r) << 16) |
+        (linearToSrgb8(final.g) << 8) |
+        linearToSrgb8(final.b);
+    uOutputPixels.pixels[pixelIndex] = outPixel;
+}

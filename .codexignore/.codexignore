@@ -1,0 +1,11 @@
+build/
+app/build/
+.gradle/
+.idea/
+local.properties
+*.apk
+*.aab
+*.jar
+*.mp4
+*.png
+*.jpg

@@ -1,0 +1,1120 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define REALTIME_P010_COMPUTE_DISPATCH 1
+#define RGBA16F_INTERMEDIATE_RENDER_GRAPH 1
+
+layout(set = 0, binding = 0) uniform sampler2D uCameraSampler;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D uRealtimeIntermediate;
+
+layout(push_constant) uniform RealtimeEnhanceParams {
+    uint width;
+    uint height;
+    float colorGainR;
+    float colorGainG;
+    float colorGainB;
+    float reserved;
+    float spatialDenoise;
+    float chromaDenoise;
+    float sharpening;
+    float noiseMetric;
+    float colorSpaceId;
+    float activeTransportId;
+    float profileDetailGain;
+    float chromaStability;
+    float signalFamilyId;
+    float colorScienceId;
+    float niv99Active;
+    float niv99RedCorrection;
+    float niv99GreenCorrection;
+    float niv99BlueCorrection;
+    float niv99SpatialDenoise;
+    float niv99ChromaDenoise;
+    float niv99TemporalDenoise;
+    float niv99SharpeningCeiling;
+    float niv99Confidence;
+} params;
+
+const vec3 kRealtimeRec709LumaWeights = vec3(0.2126, 0.7152, 0.0722);
+const vec3 kRealtimeRec2020LumaWeights = vec3(0.2627, 0.6780, 0.0593);
+const float REALTIME_MAX_CUMULATIVE_DETAIL_DELTA = 0.036;
+const float REALTIME_COMPUTE_ENHANCED_ALPHA = 0.625;
+const float NIV99_SPATIAL_BLEND_SCALE = 0.72;
+const float NIV99_CHROMA_BLEND_SCALE = 0.84;
+const float NIV99_RECONSTRUCTION_SCALE = 0.68;
+
+float saturate(float value) {
+    return clamp(value, 0.0, 1.0);
+}
+
+int realtimeSignalFamilyId() {
+    return int(params.signalFamilyId + 0.5);
+}
+
+int realtimeColorScienceId() {
+    return int(params.colorScienceId + 0.5);
+}
+
+bool realtimeNeoHdrScience() {
+    int colorScience = realtimeColorScienceId();
+    return colorScience == 20 || colorScience == 21;
+}
+
+bool realtimeLogSignal() {
+    int colorScience = realtimeColorScienceId();
+    return realtimeSignalFamilyId() == 3 || colorScience == 10 || colorScience == 11 || colorScience == 12 || colorScience == 13;
+}
+
+bool realtimeWideGamutSignal() {
+    int colorSpace = int(params.colorSpaceId + 0.5);
+    int activeTransport = int(params.activeTransportId + 0.5);
+    return colorSpace == 2 || colorSpace == 3 || colorSpace == 4 || colorSpace == 5 ||
+        activeTransport == 2 || activeTransport == 3 || activeTransport == 4 ||
+        realtimeNeoHdrScience() || realtimeLogSignal();
+}
+
+vec3 realtimeLumaWeights() {
+    return realtimeWideGamutSignal() ? kRealtimeRec2020LumaWeights : kRealtimeRec709LumaWeights;
+}
+
+float realtimeLuma(vec3 rgb) {
+    return dot(max(rgb, vec3(0.0)), realtimeLumaWeights());
+}
+
+float heteroscedasticRealtimeNoiseVariance(float linearLuma) {
+    // Variance is expressed in normalized linear-light units. The former coefficients produced a
+    // 3-5% noise sigma even for clean daylight, so real brick/leaf frequencies were classified as
+    // noise before reconstruction. ISO/noiseMetric remains the adaptive high-noise authority.
+    float shotNoiseCoefficient = 0.00032;
+    float readNoiseCoefficient = 0.000032;
+    return max(shotNoiseCoefficient * saturate(linearLuma) + readNoiseCoefficient, 0.0000001);
+}
+
+float realtimeNormalizeStrength(float rawStrength) {
+    return clamp(rawStrength > 1.0 ? rawStrength * 0.1 : rawStrength, 0.0, 1.0);
+}
+
+float niv99Gate() {
+    return step(0.5, params.niv99Active) * clamp(params.niv99Confidence, 0.0, 1.0);
+}
+
+float niv99FuseStrength(float baseStrength, float requestedStrength, float scale) {
+    float base = clamp(baseStrength, 0.0, 1.0);
+    float requested = clamp(requestedStrength, 0.0, 1.0) * niv99Gate() * scale;
+    // Probabilistic union adds calibrated cleanup without replacing an already-stronger profile.
+    return 1.0 - (1.0 - base) * (1.0 - requested);
+}
+
+bool realtimeNormalProSdrTransport() {
+    int activeTransport = int(params.activeTransportId + 0.5);
+    return activeTransport == 1 || activeTransport == 2;
+}
+
+bool realtimeBoundedNormalProSdrQuality() {
+    return realtimeSignalFamilyId() == 1 && realtimeNormalProSdrTransport();
+}
+
+bool realtimeStrictNormalProSdr() {
+    return realtimeBoundedNormalProSdrQuality();
+}
+
+bool realtimeLegacyStrictNormalProSdr() {
+    return realtimeNormalProSdrTransport() &&
+        params.spatialDenoise >= 9.5 &&
+        params.chromaDenoise >= 9.5 &&
+        params.sharpening >= 9.5 &&
+        params.noiseMetric >= 9.5;
+}
+
+bool realtimeStrictEncodedTransport() {
+    int activeTransport = int(params.activeTransportId + 0.5);
+    return activeTransport == 3 || activeTransport == 4 || activeTransport == 5;
+}
+
+bool realtimeStrictHighQualityEncodedSignal() {
+    return realtimeStrictEncodedTransport() &&
+        params.spatialDenoise >= 0.98 &&
+        params.chromaDenoise >= 0.99 &&
+        params.sharpening >= 0.90 &&
+        params.noiseMetric >= 0.70;
+}
+
+float realtimeStrictAuthority() {
+    if (realtimeBoundedNormalProSdrQuality()) return 1.0;
+    return (realtimeLegacyStrictNormalProSdr() || realtimeStrictHighQualityEncodedSignal()) ? 10.0 : 1.0;
+}
+
+float realtimeStrictCeiling() {
+    return realtimeBoundedNormalProSdrQuality()
+        ? 1.0
+        : (realtimeStrictAuthority() > 1.0 ? 10.0 : 1.0);
+}
+
+float realtimeQualityStrength() {
+    if (realtimeBoundedNormalProSdrQuality()) {
+        // Quality is not synonymous with maximum filtering.  Use measured noise as the authority;
+        // forcing a 0.88 floor erased clean brick/foliage texture before the detail stage saw it.
+        float noiseShape = realtimeNormalizeStrength(params.noiseMetric);
+        return clamp(0.14 + noiseShape * 0.66, 0.14, 0.80);
+    }
+    return clamp(max(params.reserved, 0.88), 0.70, realtimeStrictCeiling());
+}
+
+float realtimeLegacyQualityStrength() {
+    return clamp(max(params.reserved, 0.88), 0.70, realtimeStrictCeiling());
+}
+
+float realtimeStrengthShape(float strictStrength) {
+    return realtimeBoundedNormalProSdrQuality()
+        ? realtimeNormalizeStrength(strictStrength)
+        : clamp(strictStrength / realtimeStrictCeiling(), 0.0, 1.0);
+}
+
+float realtimeNoiseShape(float noisePressure) {
+    return realtimeBoundedNormalProSdrQuality()
+        ? realtimeNormalizeStrength(noisePressure)
+        : clamp(noisePressure / realtimeStrictCeiling(), 0.0, 1.0);
+}
+
+float realtimeDenoiseCenterAnchor(float noiseShape) {
+    bool strictQuality = realtimeBoundedNormalProSdrQuality() || realtimeStrictAuthority() > 1.0;
+    return strictQuality
+        ? mix(4.80, 1.05, clamp(noiseShape, 0.0, 1.0))
+        : 3.80;
+}
+
+float realtimeStrictDetailNoiseReject(float noiseShape, float residualNoise, float localRange) {
+    bool strictQuality = realtimeBoundedNormalProSdrQuality() || realtimeStrictAuthority() > 1.0;
+    if (!strictQuality) {
+        return 1.0 - smoothstep(0.82, 1.0, noiseShape) * 0.24;
+    }
+    float impulseRatio = residualNoise / max(localRange, 0.004);
+    float impulseReject = 1.0 - smoothstep(0.16, 0.62, impulseRatio);
+    float extremeNoiseReject = 1.0 - smoothstep(0.44, 1.0, noiseShape) * 0.88;
+    float flatNoiseReject = 1.0 - smoothstep(0.010, 0.030, residualNoise) *
+        (1.0 - smoothstep(0.055, 0.160, localRange)) * 0.72;
+    return clamp(impulseReject * extremeNoiseReject * flatNoiseReject, 0.0, 1.0);
+}
+
+float realtimeSpatialStrength() {
+    if (realtimeBoundedNormalProSdrQuality()) {
+        float requested = realtimeNormalizeStrength(params.spatialDenoise);
+        float noiseShape = realtimeNormalizeStrength(params.noiseMetric);
+        float base = clamp(
+            max(requested * mix(0.28, 0.94, noiseShape), realtimeQualityStrength()),
+            0.08,
+            0.92
+        );
+        return min(
+            niv99FuseStrength(base, params.niv99SpatialDenoise, NIV99_SPATIAL_BLEND_SCALE),
+            0.94
+        );
+    }
+    float ceiling = realtimeStrictCeiling();
+    float base = clamp(max(params.spatialDenoise, realtimeLegacyQualityStrength()), 0.70, ceiling);
+    float fused = niv99FuseStrength(
+        clamp(base / ceiling, 0.0, 1.0),
+        params.niv99SpatialDenoise,
+        NIV99_SPATIAL_BLEND_SCALE
+    );
+    return fused * ceiling;
+}
+
+float realtimeChromaStrength() {
+    if (realtimeBoundedNormalProSdrQuality()) {
+        float requested = realtimeNormalizeStrength(params.chromaDenoise);
+        float noiseShape = realtimeNormalizeStrength(params.noiseMetric);
+        float base = clamp(
+            max(requested * mix(0.42, 0.98, noiseShape), realtimeQualityStrength()),
+            0.12,
+            0.96
+        );
+        return min(
+            niv99FuseStrength(base, params.niv99ChromaDenoise, NIV99_CHROMA_BLEND_SCALE),
+            0.975
+        );
+    }
+    float ceiling = realtimeStrictCeiling();
+    float base = clamp(max(params.chromaDenoise, realtimeLegacyQualityStrength()), 0.70, ceiling);
+    float fused = niv99FuseStrength(
+        clamp(base / ceiling, 0.0, 1.0),
+        params.niv99ChromaDenoise,
+        NIV99_CHROMA_BLEND_SCALE
+    );
+    return fused * ceiling;
+}
+
+float realtimeDetailStrength() {
+    if (realtimeBoundedNormalProSdrQuality()) {
+        float base = clamp(realtimeNormalizeStrength(params.sharpening), 0.0, 1.0);
+        float reconstruction = clamp(params.niv99SharpeningCeiling, 0.0, 1.0) *
+            niv99Gate() * NIV99_RECONSTRUCTION_SCALE;
+        return max(base, reconstruction);
+    }
+    float base = clamp(
+        max(params.sharpening * 10.0, 1.0 + realtimeLegacyQualityStrength() * 9.0),
+        1.0,
+        realtimeStrictAuthority() > 1.0 ? 100.0 : 10.0
+    );
+    float reconstruction = clamp(params.niv99SharpeningCeiling, 0.0, 1.0) *
+        niv99Gate() * NIV99_RECONSTRUCTION_SCALE * realtimeStrictCeiling();
+    return max(base, reconstruction);
+}
+
+float realtimeNoisePressure() {
+    return realtimeBoundedNormalProSdrQuality()
+        ? realtimeNormalizeStrength(params.noiseMetric)
+        : clamp(params.noiseMetric, 0.0, 10.0);
+}
+
+float realtimeProfileDetailGain() {
+    return realtimeBoundedNormalProSdrQuality()
+        ? realtimeNormalizeStrength(params.profileDetailGain)
+        : clamp(params.profileDetailGain, 1.00, 10.0);
+}
+
+float realtimeChromaStability() {
+    return realtimeBoundedNormalProSdrQuality()
+        ? realtimeNormalizeStrength(params.chromaStability)
+        : clamp(params.chromaStability, 0.0, 10.0);
+}
+
+float realtimeChromaStabilityAuthority() {
+    float stability = realtimeChromaStability();
+    return realtimeBoundedNormalProSdrQuality()
+        ? stability
+        : (stability >= 9.5 ? 10.0 : 1.0);
+}
+
+float realtimeNeutralChromaNoiseGate(float luma, float chromaEnergy, float stabilityAuthority) {
+    bool strictStability = realtimeBoundedNormalProSdrQuality()
+        ? stabilityAuthority >= 0.95
+        : stabilityAuthority > 1.0;
+    if (!strictStability) return 0.0;
+    float shadowOrFlat = 1.0 - smoothstep(0.22, 0.78, luma);
+    float neutralOnly = 1.0 - smoothstep(0.06, 0.20, chromaEnergy);
+    return clamp(shadowOrFlat * neutralOnly, 0.0, 1.0);
+}
+
+float realtimeStrictTexturelessGrainGate(float luma, float localRange, float residualNoise) {
+    bool strictQuality = realtimeBoundedNormalProSdrQuality() || realtimeStrictAuthority() > 1.0;
+    if (!strictQuality) return 0.0;
+    float flatLumaGate = (1.0 - smoothstep(0.128, 0.560, luma)) *
+        (1.0 - smoothstep(0.042, 0.210, localRange));
+    float noiseGate = smoothstep(0.002, 0.034, residualNoise);
+    return clamp(flatLumaGate * noiseGate, 0.0, 1.0);
+}
+
+vec3 realtimeColorGain() {
+    return clamp(vec3(params.colorGainR, params.colorGainG, params.colorGainB), vec3(0.85), vec3(1.35));
+}
+
+float realtimeLocalColorLockGate(vec3 safeRgb) {
+    float redGreenRatio = safeRgb.r / max(safeRgb.g, 0.000001);
+    float blueGreenRatio = safeRgb.b / max(safeRgb.g, 0.000001);
+    float redSwingGate = smoothstep(1.24, 1.62, redGreenRatio) *
+        (1.0 - smoothstep(1.02, 1.26, blueGreenRatio));
+    float greenRedRatio = safeRgb.g / max(safeRgb.r, 0.000001);
+    float greenBlueRatio = safeRgb.g / max(safeRgb.b, 0.000001);
+    float greenSwingGate = smoothstep(1.24, 1.62, min(greenRedRatio, greenBlueRatio));
+    return clamp(max(redSwingGate, greenSwingGate) * 0.42, 0.0, 0.42);
+}
+
+vec3 realtimeApplyNormalSdrCalibration(vec3 rgb) {
+    vec3 gain = realtimeColorGain();
+    if (all(lessThan(abs(gain - vec3(1.0)), vec3(0.0005)))) {
+        return rgb;
+    }
+    float sourceY = realtimeLuma(rgb);
+    vec3 safeRgb = max(rgb, vec3(0.0));
+    float redDominance = safeRgb.r - max(safeRgb.g, safeRgb.b);
+    float skyBlueDominance = min(safeRgb.b - safeRgb.r, safeRgb.g - safeRgb.r);
+    float redGreenRatio = safeRgb.r / max(safeRgb.g, 0.000001);
+    float blueGreenRatio = safeRgb.b / max(safeRgb.g, 0.000001);
+    float redOverflowGate = smoothstep(1.42, 1.72, redGreenRatio) *
+        (1.0 - smoothstep(0.98, 1.16, blueGreenRatio));
+    float redGuardGate = smoothstep(0.040, 0.240, redDominance) *
+        smoothstep(0.320, 0.820, safeRgb.r) *
+        redOverflowGate;
+    float skyHighlightProtect = 1.0 - smoothstep(0.88, 0.98, safeRgb.b);
+    float skyRecoveryGate = smoothstep(0.040, 0.220, skyBlueDominance) *
+        smoothstep(0.420, 0.900, safeRgb.b) *
+        skyHighlightProtect;
+    float redCorrectionGate = max(redGuardGate, skyRecoveryGate);
+    vec3 correctionGain = vec3(
+        mix(1.0, gain.r, redCorrectionGate),
+        mix(1.0, gain.g, redCorrectionGate),
+        mix(1.0, gain.b, skyRecoveryGate)
+    );
+    vec3 corrected = safeRgb * correctionGain;
+    float colorLockGate = realtimeLocalColorLockGate(safeRgb);
+    vec3 colorLocked = mix(corrected, vec3(realtimeLuma(corrected)), colorLockGate);
+    float lockedY = max(realtimeLuma(colorLocked), 0.000001);
+    return max(colorLocked * (sourceY / lockedY), vec3(0.0));
+}
+
+vec3 clampWidePreviewRgb(vec3 rgb) {
+    return clamp(realtimeApplyNormalSdrCalibration(max(rgb, vec3(0.0))), vec3(0.0), vec3(1.25));
+}
+
+vec3 realtimeApplyNiv99WhiteBalance(vec3 inputRgb) {
+    vec3 source = max(inputRgb, vec3(0.0));
+    float gate = niv99Gate();
+    if (gate <= 0.0) return source;
+
+    vec3 requestedGain = clamp(
+        vec3(
+            params.niv99RedCorrection,
+            params.niv99GreenCorrection,
+            params.niv99BlueCorrection
+        ),
+        vec3(0.92),
+        vec3(1.08)
+    );
+    vec3 corrected = source * mix(vec3(1.0), requestedGain, gate);
+
+    // Apply WB to the entire frame, including low-texture/noisy regions, while preserving encoded
+    // highlight headroom. This scale only engages when the correction itself would create clipping.
+    float sourcePeak = max(source.r, max(source.g, source.b));
+    float correctedPeak = max(corrected.r, max(corrected.g, corrected.b));
+    if (sourcePeak <= 1.0001 && correctedPeak > 1.0) {
+        float highlightGate = smoothstep(0.88, 1.0, sourcePeak);
+        float noClipScale = 1.0 / correctedPeak;
+        corrected *= mix(1.0, noClipScale, highlightGate);
+    }
+    return max(corrected, vec3(0.0));
+}
+
+vec3 sampleCameraRgb(vec2 uv) {
+    vec3 sampled = texture(uCameraSampler, clamp(uv, vec2(0.0), vec2(1.0))).rgb;
+    return realtimeApplyNiv99WhiteBalance(sampled);
+}
+
+struct RealtimeLumaNeighborhood {
+    float y00;
+    float y10;
+    float y20;
+    float y01;
+    float y11;
+    float y21;
+    float y02;
+    float y12;
+    float y22;
+};
+
+RealtimeLumaNeighborhood realtimeSample3x3Luma(vec2 uv, vec2 texel) {
+    RealtimeLumaNeighborhood n;
+    n.y00 = realtimeLuma(sampleCameraRgb(uv + vec2(-1.0, -1.0) * texel));
+    n.y10 = realtimeLuma(sampleCameraRgb(uv + vec2( 0.0, -1.0) * texel));
+    n.y20 = realtimeLuma(sampleCameraRgb(uv + vec2( 1.0, -1.0) * texel));
+    n.y01 = realtimeLuma(sampleCameraRgb(uv + vec2(-1.0,  0.0) * texel));
+    n.y11 = realtimeLuma(sampleCameraRgb(uv));
+    n.y21 = realtimeLuma(sampleCameraRgb(uv + vec2( 1.0,  0.0) * texel));
+    n.y02 = realtimeLuma(sampleCameraRgb(uv + vec2(-1.0,  1.0) * texel));
+    n.y12 = realtimeLuma(sampleCameraRgb(uv + vec2( 0.0,  1.0) * texel));
+    n.y22 = realtimeLuma(sampleCameraRgb(uv + vec2( 1.0,  1.0) * texel));
+    return n;
+}
+
+float realtimeNoiseLimitedLuma(
+    float sampleLuma,
+    float localMean,
+    float noiseVariance,
+    float noiseShape
+) {
+    float threshold = sqrt(max(noiseVariance, 0.0000001)) * mix(1.15, 2.10, noiseShape);
+    float coefficient = sampleLuma - localMean;
+    float shrunk = sign(coefficient) * max(abs(coefficient) - threshold, 0.0);
+    float coherentStructure = smoothstep(threshold * 2.0, threshold * 5.0, abs(coefficient));
+    float denoised = mix(localMean + shrunk, sampleLuma, coherentStructure * 0.88);
+    float measuredNoiseGate = smoothstep(0.16, 0.86, noiseShape);
+    return mix(sampleLuma, denoised, measuredNoiseGate * (1.0 - coherentStructure * 0.72));
+}
+
+RealtimeLumaNeighborhood realtimeBuildCleanLumaNeighborhood(
+    RealtimeLumaNeighborhood raw,
+    vec3 cleanRgb,
+    float noisePressure
+) {
+    float localMean = (
+        raw.y11 * 4.0 +
+        (raw.y01 + raw.y21 + raw.y10 + raw.y12) * 1.5 +
+        (raw.y00 + raw.y20 + raw.y02 + raw.y22) * 0.75
+    ) / 13.0;
+    float noiseVariance = heteroscedasticRealtimeNoiseVariance(realtimeLuma(cleanRgb));
+    float noiseShape = realtimeNoiseShape(noisePressure);
+    RealtimeLumaNeighborhood clean;
+    clean.y00 = realtimeNoiseLimitedLuma(raw.y00, localMean, noiseVariance, noiseShape);
+    clean.y10 = realtimeNoiseLimitedLuma(raw.y10, localMean, noiseVariance, noiseShape);
+    clean.y20 = realtimeNoiseLimitedLuma(raw.y20, localMean, noiseVariance, noiseShape);
+    clean.y01 = realtimeNoiseLimitedLuma(raw.y01, localMean, noiseVariance, noiseShape);
+    clean.y11 = realtimeLuma(cleanRgb);
+    clean.y21 = realtimeNoiseLimitedLuma(raw.y21, localMean, noiseVariance, noiseShape);
+    clean.y02 = realtimeNoiseLimitedLuma(raw.y02, localMean, noiseVariance, noiseShape);
+    clean.y12 = realtimeNoiseLimitedLuma(raw.y12, localMean, noiseVariance, noiseShape);
+    clean.y22 = realtimeNoiseLimitedLuma(raw.y22, localMean, noiseVariance, noiseShape);
+    return clean;
+}
+
+float realtimeDetailNoiseConfidence(
+    RealtimeLumaNeighborhood n,
+    float baseY,
+    float noisePressure
+) {
+    float localMean = (
+        n.y00 + n.y10 + n.y20 + n.y01 + n.y21 + n.y02 + n.y12 + n.y22
+    ) * 0.125;
+    float residual = abs(n.y11 - localMean);
+    float expectedNoise = sqrt(heteroscedasticRealtimeNoiseVariance(baseY));
+    float noiseShape = realtimeNoiseShape(noisePressure);
+    float residualSnr = residual / max(expectedNoise, 0.0015);
+    float residualConfidence = smoothstep(0.28, 2.40, residualSnr);
+    float localMin = min(
+        n.y11,
+        min(min(min(n.y00, n.y10), min(n.y20, n.y01)), min(min(n.y21, n.y02), min(n.y12, n.y22)))
+    );
+    float localMax = max(
+        n.y11,
+        max(max(max(n.y00, n.y10), max(n.y20, n.y01)), max(max(n.y21, n.y02), max(n.y12, n.y22)))
+    );
+    float localRange = max(localMax - localMin, 0.001);
+    // Coherent multi-pixel range is valid structure even when one coefficient is below a classic
+    // single-pixel SNR threshold. This clean-scene floor prevents the cumulative detail guard from
+    // collapsing fine distant texture to zero while the noise term still removes it at high ISO.
+    float coherentStructure = smoothstep(0.0035, 0.052, localRange);
+    float cleanStructureFloor = coherentStructure *
+        (1.0 - smoothstep(0.42, 0.92, noiseShape)) * 0.72;
+    return clamp(
+        max(residualConfidence, cleanStructureFloor) * (1.0 - noiseShape * 0.38),
+        0.0,
+        1.0
+    );
+}
+
+float realtimeCoherentTextureConfidence(
+    float coefficient,
+    float localRange,
+    float noiseVariance,
+    float noisePressure
+) {
+    float noiseSigma = sqrt(max(noiseVariance, 0.0000001));
+    float coefficientSnr = abs(coefficient) / max(noiseSigma, 0.0015);
+    float snrGate = smoothstep(0.26, 2.20, coefficientSnr);
+    float rangeSupport = smoothstep(0.0035, 0.050, localRange);
+    float cleanFineGate = smoothstep(0.0015, 0.014, abs(coefficient)) * rangeSupport;
+    float noiseShape = realtimeNoiseShape(noisePressure);
+    float cleanAuthority = 1.0 - smoothstep(0.38, 0.88, noiseShape);
+    return clamp(max(snrGate, cleanFineGate * cleanAuthority), 0.0, 1.0);
+}
+
+float realtimeSkinDetailGuard(vec3 rgb) {
+    vec3 safeRgb = max(rgb, vec3(0.0));
+    float peak = max(max(safeRgb.r, safeRgb.g), safeRgb.b);
+    float floorValue = min(min(safeRgb.r, safeRgb.g), safeRgb.b);
+    float chroma = peak - floorValue;
+    float warm = smoothstep(0.012, 0.14, safeRgb.r - safeRgb.g) *
+        (1.0 - smoothstep(0.34, 0.62, safeRgb.r - safeRgb.g));
+    float naturalBlueBalance = smoothstep(-0.02, 0.12, safeRgb.g - safeRgb.b) *
+        (1.0 - smoothstep(0.28, 0.52, safeRgb.g - safeRgb.b));
+    float skin = warm * naturalBlueBalance * smoothstep(0.025, 0.30, chroma);
+    return mix(1.0, 0.74, clamp(skin, 0.0, 1.0));
+}
+
+vec3 realtimeApplyCumulativeDetailBudget(
+    vec3 baseRgb,
+    vec3 candidateRgb,
+    RealtimeLumaNeighborhood n
+) {
+    float baseY = realtimeLuma(baseRgb);
+    float candidateY = realtimeLuma(candidateRgb);
+    float localMin = min(n.y11, min(min(min(n.y00, n.y10), min(n.y20, n.y01)), min(min(n.y21, n.y02), min(n.y12, n.y22))));
+    float localMax = max(n.y11, max(max(max(n.y00, n.y10), max(n.y20, n.y01)), max(max(n.y21, n.y02), max(n.y12, n.y22))));
+    float localRange = max(localMax - localMin, 0.001);
+    float edgeGuard = mix(1.0, 0.62, smoothstep(0.16, 0.52, localRange));
+    float highlightGuard = 1.0 - smoothstep(0.72, 1.02, baseY) * 0.72;
+    float skinGuard = realtimeSkinDetailGuard(baseRgb);
+    float noiseConfidence = realtimeDetailNoiseConfidence(n, baseY, realtimeNoisePressure());
+    float haloGuard = 1.0 - smoothstep(localRange * 0.42, localRange, abs(candidateY - baseY)) * 0.78;
+    float budget = min(
+        REALTIME_MAX_CUMULATIVE_DETAIL_DELTA,
+        max(0.0025, localRange * 0.20)
+    ) * edgeGuard * highlightGuard * skinGuard * noiseConfidence * haloGuard;
+    float boundedDelta = clamp(candidateY - baseY, -budget, budget);
+    float cumulativeOvershoot = min(0.006, max(0.0015, localRange * 0.08));
+    float boundedY = clamp(
+        baseY + boundedDelta,
+        max(0.0, localMin - cumulativeOvershoot),
+        min(1.25, localMax + cumulativeOvershoot)
+    );
+    return max(baseRgb + vec3(boundedY - baseY), vec3(0.0));
+}
+
+vec3 realtimeBilateralDenoise(vec2 uv, vec3 centerRgb, vec2 texel, float spatialStrength, float chromaStrength, float noisePressure) {
+    float spatialShape = realtimeStrengthShape(spatialStrength);
+    float chromaShape = realtimeStrengthShape(chromaStrength);
+    float noiseShape = realtimeNoiseShape(noisePressure);
+    float centerY = realtimeLuma(centerRgb);
+    float noiseVariance = heteroscedasticRealtimeNoiseVariance(centerY);
+    float rangeSigma = max(
+        noiseVariance * mix(8.0, 44.0, spatialShape) * (1.0 + noiseShape * 2.10),
+        0.000004
+    );
+
+    float centerAnchor = realtimeDenoiseCenterAnchor(noiseShape);
+    vec3 sumRgb = centerRgb * centerAnchor;
+    float sumWeight = centerAnchor;
+
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            if (x == 0 && y == 0) continue;
+
+            vec2 offset = vec2(float(x), float(y));
+            vec3 sampleRgb = sampleCameraRgb(uv + offset * texel);
+            float sampleY = realtimeLuma(sampleRgb);
+            float rangeDelta = sampleY - centerY;
+            float spatialWeight = exp(-dot(offset, offset) * mix(0.78, 0.34, spatialShape));
+            float rangeWeight = exp(-(rangeDelta * rangeDelta) / rangeSigma);
+            float weight = spatialWeight * rangeWeight;
+
+            sumRgb += sampleRgb * weight;
+            sumWeight += weight;
+        }
+    }
+
+    vec3 filtered = sumRgb / max(sumWeight, 0.0001);
+    float edgeEnergy = abs(realtimeLuma(filtered) - centerY);
+    float lumaPreserve = smoothstep(0.004, 0.050, edgeEnergy);
+    bool strictQuality = realtimeBoundedNormalProSdrQuality() || realtimeStrictAuthority() > 1.0;
+    float edgePreserveScale = strictQuality ? 0.92 : 0.64;
+    float lumaMix = clamp(
+        spatialShape * mix(0.18, 0.82, noiseShape) * (1.0 - lumaPreserve * edgePreserveScale),
+        0.0,
+        strictQuality ? 0.82 : 1.0
+    );
+    float chromaMix = clamp(
+        chromaShape * mix(0.34, 0.92, noiseShape),
+        0.0,
+        strictQuality ? 0.90 : 1.0
+    );
+
+    float filteredY = realtimeLuma(filtered);
+    float outY = mix(centerY, filteredY, lumaMix);
+    vec3 centerChroma = centerRgb - vec3(centerY);
+    vec3 filteredChroma = filtered - vec3(filteredY);
+    return max(vec3(outY) + mix(centerChroma, filteredChroma, chromaMix), vec3(0.0));
+}
+
+vec3 realtimeChromaSpeckleSuppress(vec3 originalRgb, vec3 denoisedRgb, float chromaStrength, float noisePressure) {
+    float chromaShape = realtimeStrengthShape(chromaStrength);
+    float noiseShape = realtimeNoiseShape(noisePressure);
+    float originalY = realtimeLuma(originalRgb);
+    float denoisedY = realtimeLuma(denoisedRgb);
+    vec3 originalChroma = originalRgb - vec3(originalY);
+    vec3 denoisedChroma = denoisedRgb - vec3(denoisedY);
+
+    float chromaEnergy = length(originalChroma);
+    float saturatedColorPreserve = smoothstep(0.035, 0.18, chromaEnergy);
+    float stability = realtimeChromaStability();
+    float stability01 = clamp(stability, 0.0, 1.0);
+    float stabilityAuthority = realtimeChromaStabilityAuthority();
+    float strictAuthority = realtimeStrictAuthority();
+    bool strictQuality = realtimeBoundedNormalProSdrQuality() || strictAuthority > 1.0;
+    float chromaPreserve = strictQuality ? saturatedColorPreserve * 0.86 : saturatedColorPreserve;
+    float shadowNoiseGate = 1.0 - smoothstep(0.030, 0.34, originalY);
+    float strictNeutralSuppression = realtimeNeutralChromaNoiseGate(originalY, chromaEnergy, stabilityAuthority) *
+        smoothstep(0.16, 0.72, noiseShape) *
+        (realtimeBoundedNormalProSdrQuality() ? 0.72 : 10.0);
+    float suppress = clamp(
+        chromaShape * (0.64 + shadowNoiseGate * 0.40 + noiseShape * 0.18) *
+            (1.0 - chromaPreserve * (0.56 + stability01 * 0.24)) +
+            strictNeutralSuppression,
+        0.0,
+        1.0
+    );
+    vec3 chroma = mix(originalChroma, denoisedChroma, suppress);
+    float luma = mix(
+        originalY,
+        denoisedY,
+        clamp((0.12 + noiseShape * 0.46) * chromaShape + strictNeutralSuppression * 0.34, 0.0, 0.78)
+    );
+    luma = mix(luma, originalY, chromaPreserve * stability01 * (strictQuality ? 0.04 : 0.12));
+    return max(vec3(luma) + chroma, vec3(0.0));
+}
+
+vec3 realtimeEdgeAwareDetail(RealtimeLumaNeighborhood n, vec3 cleanRgb, float detailStrength, float noisePressure) {
+    float gx = -3.0 * n.y00 + 3.0 * n.y20 - 10.0 * n.y01 + 10.0 * n.y21 - 3.0 * n.y02 + 3.0 * n.y22;
+    float gy = -3.0 * n.y00 - 10.0 * n.y10 - 3.0 * n.y20 + 3.0 * n.y02 + 10.0 * n.y12 + 3.0 * n.y22;
+    float edgeEnergy = length(vec2(gx, gy)) * 0.0625;
+    float lowPass = (n.y00 + n.y10 + n.y20 + n.y01 + n.y11 * 2.0 + n.y21 + n.y02 + n.y12 + n.y22) * 0.10;
+    float cleanY = realtimeLuma(cleanRgb);
+    float detail = n.y11 - lowPass;
+    float localMin = min(min(min(n.y00, n.y10), min(n.y20, n.y01)), min(min(n.y21, n.y02), min(n.y12, n.y22)));
+    float localMax = max(max(max(n.y00, n.y10), max(n.y20, n.y01)), max(max(n.y21, n.y02), max(n.y12, n.y22)));
+    float localRange = max(localMax - localMin, 0.001);
+    float noiseVariance = heteroscedasticRealtimeNoiseVariance(n.y11);
+
+    float textureConfidence = realtimeCoherentTextureConfidence(
+        detail,
+        localRange,
+        noiseVariance,
+        noisePressure
+    );
+    float haloGuard = 1.0 - smoothstep(0.11, 0.28, edgeEnergy);
+    float shadowNoiseGuard = smoothstep(0.018, 0.10, n.y11);
+    float detailNoiseShape = realtimeNoiseShape(noisePressure);
+    float residualNoise = abs(n.y11 - cleanY);
+    float strictDetailReject = realtimeStrictDetailNoiseReject(detailNoiseShape, residualNoise, localRange);
+    float noiseGuard = (1.0 - smoothstep(0.52, 1.0, detailNoiseShape) * 0.18) * strictDetailReject;
+    float profileDetail = realtimeProfileDetailGain();
+    bool boundedNormalProSdrQuality = realtimeBoundedNormalProSdrQuality();
+    float profileLift = boundedNormalProSdrQuality
+        ? profileDetail
+        : clamp((profileDetail - 1.00) / 9.00, 0.0, 1.0);
+    float realtimeAuthority = realtimeStrictAuthority();
+    float gain = boundedNormalProSdrQuality
+        ? clamp(detailStrength * mix(1.10, 2.40, profileLift), 0.0, 2.40)
+        : clamp(detailStrength * mix(1.92, 10.0, profileLift), 1.0, realtimeAuthority > 1.0 ? 100.0 : 10.0);
+    float maxDelta = boundedNormalProSdrQuality
+        ? max(0.0042, localRange * mix(0.140, 0.280, detailStrength * (0.82 + profileLift * 0.18)))
+        : max(0.0042, localRange * (realtimeAuthority > 1.0 ? 10.0 : mix(0.140, 1.0, detailStrength * (0.82 + profileLift * 0.18))));
+    float limitedDetail = clamp(
+        detail * gain * textureConfidence * haloGuard * shadowNoiseGuard * noiseGuard,
+        -maxDelta,
+        maxDelta
+    );
+    float sharpenedY = clamp(cleanY + limitedDetail, 0.0, 1.25);
+
+    return max(cleanRgb + vec3(sharpenedY - cleanY), vec3(0.0));
+}
+
+vec3 realtimeApexMicroTextureRecover(RealtimeLumaNeighborhood n, vec3 detailedRgb, float detailStrength, float noisePressure) {
+    float centerY = n.y11;
+
+    float axial1 = n.y01 + n.y21 + n.y10 + n.y12;
+    float diag1 = n.y00 + n.y20 + n.y02 + n.y22;
+    float axial2 = (axial1 + diag1) * 0.5;
+    float microLowPass = (centerY * 4.0 + axial1 * 1.0 + diag1 * 0.66 + axial2 * 0.18) / 11.36;
+    float microTexture = centerY - microLowPass;
+    float localMin = min(min(min(n.y01, n.y21), min(n.y10, n.y12)), min(min(n.y00, n.y20), min(n.y02, n.y22)));
+    float localMax = max(max(max(n.y01, n.y21), max(n.y10, n.y12)), max(max(n.y00, n.y20), max(n.y02, n.y22)));
+    float localRange = max(localMax - localMin, 0.001);
+    float noiseVariance = heteroscedasticRealtimeNoiseVariance(centerY);
+    float textureGate = realtimeCoherentTextureConfidence(
+        microTexture,
+        localRange,
+        noiseVariance,
+        noisePressure
+    );
+    float rangeGate = smoothstep(0.006, 0.060, localRange);
+    float shadowGate = smoothstep(0.014, 0.090, centerY);
+    float highlightGuard = 1.0 - smoothstep(0.92, 1.18, centerY);
+    float microNoiseShape = realtimeNoiseShape(noisePressure);
+    float motionlessRealtimeGate = (1.0 - smoothstep(0.72, 1.0, microNoiseShape) * 0.28) *
+        realtimeStrictDetailNoiseReject(microNoiseShape, abs(microTexture), localRange);
+    float profileDetail = realtimeProfileDetailGain();
+    float profileLift = realtimeBoundedNormalProSdrQuality()
+        ? profileDetail
+        : clamp((profileDetail - 1.00) / 9.00, 0.0, 1.0);
+    float realtimeAuthority = realtimeStrictAuthority();
+    float microGain = realtimeBoundedNormalProSdrQuality()
+        ? mix(1.20, 2.60, profileLift) * mix(0.40, 1.0, detailStrength)
+        : mix(2.0, 10.0, profileLift) * (realtimeAuthority > 1.0 ? 10.0 : 1.0) *
+            clamp(0.40 + detailStrength * 0.060, 0.40, 1.0);
+    float microLimit = realtimeBoundedNormalProSdrQuality()
+        ? max(0.0030, localRange * mix(0.16, 0.28, profileLift))
+        : max(0.0030, localRange * (realtimeAuthority > 1.0 ? 10.0 : mix(0.18, 0.42, profileLift)));
+    float limitedMicro = clamp(
+        microTexture * microGain * textureGate * rangeGate * shadowGate * highlightGuard * motionlessRealtimeGate,
+        -microLimit,
+        microLimit
+    );
+    return max(detailedRgb + vec3(limitedMicro), vec3(0.0));
+}
+
+vec3 realtimeApexMicroTextureRecoverLegacy(
+    RealtimeLumaNeighborhood n,
+    vec2 uv,
+    vec3 detailedRgb,
+    vec2 texel,
+    float detailStrength,
+    float noisePressure
+) {
+    float centerY = n.y11;
+    float x2n = realtimeLuma(sampleCameraRgb(uv + vec2(-2.0, 0.0) * texel));
+    float x2p = realtimeLuma(sampleCameraRgb(uv + vec2(2.0, 0.0) * texel));
+    float y2n = realtimeLuma(sampleCameraRgb(uv + vec2(0.0, -2.0) * texel));
+    float y2p = realtimeLuma(sampleCameraRgb(uv + vec2(0.0, 2.0) * texel));
+    float axial1 = n.y01 + n.y21 + n.y10 + n.y12;
+    float diag1 = n.y00 + n.y20 + n.y02 + n.y22;
+    float axial2 = x2n + x2p + y2n + y2p;
+    float microLowPass = (centerY * 4.0 + axial1 + diag1 * 0.66 + axial2 * 0.36) / 12.08;
+    float microTexture = centerY - microLowPass;
+    float localMin = min(min(min(n.y01, n.y21), min(n.y10, n.y12)), min(min(n.y00, n.y20), min(n.y02, n.y22)));
+    localMin = min(localMin, min(min(x2n, x2p), min(y2n, y2p)));
+    float localMax = max(max(max(n.y01, n.y21), max(n.y10, n.y12)), max(max(n.y00, n.y20), max(n.y02, n.y22)));
+    localMax = max(localMax, max(max(x2n, x2p), max(y2n, y2p)));
+    float localRange = max(localMax - localMin, 0.001);
+    float noiseVariance = heteroscedasticRealtimeNoiseVariance(centerY);
+    float textureGate = smoothstep(noiseVariance * 4.0, noiseVariance * 72.0, microTexture * microTexture);
+    float rangeGate = smoothstep(0.006, 0.060, localRange);
+    float shadowGate = smoothstep(0.014, 0.090, centerY);
+    float highlightGuard = 1.0 - smoothstep(0.92, 1.18, centerY);
+    float microNoiseShape = realtimeNoiseShape(noisePressure);
+    float motionlessRealtimeGate = (1.0 - smoothstep(0.72, 1.0, microNoiseShape) * 0.28) *
+        realtimeStrictDetailNoiseReject(microNoiseShape, abs(microTexture), localRange);
+    float profileLift = clamp((realtimeProfileDetailGain() - 1.00) / 9.00, 0.0, 1.0);
+    float realtimeAuthority = realtimeStrictAuthority();
+    float microGain = mix(2.0, 10.0, profileLift) * (realtimeAuthority > 1.0 ? 10.0 : 1.0) *
+        clamp(0.40 + detailStrength * 0.060, 0.40, 1.0);
+    float microLimit = max(0.0030, localRange * (realtimeAuthority > 1.0 ? 10.0 : mix(0.18, 0.42, profileLift)));
+    float limitedMicro = clamp(
+        microTexture * microGain * textureGate * rangeGate * shadowGate * highlightGuard * motionlessRealtimeGate,
+        -microLimit,
+        microLimit
+    );
+    return max(detailedRgb + vec3(limitedMicro), vec3(0.0));
+}
+
+vec3 realtimeApexLocalContrast(RealtimeLumaNeighborhood n, vec3 contrastRgb, float detailStrength, float noisePressure) {
+    float centerY = n.y11;
+    float localMean = (
+        centerY * 4.0 +
+        (n.y01 + n.y21 + n.y10 + n.y12) * 1.5 +
+        (n.y00 + n.y20 + n.y02 + n.y22) * 0.75
+    ) / 13.0;
+    float localContrast = centerY - localMean;
+    float localMin = min(min(min(n.y00, n.y10), min(n.y20, n.y01)), min(min(n.y21, n.y02), min(n.y12, n.y22)));
+    float localMax = max(max(max(n.y00, n.y10), max(n.y20, n.y01)), max(max(n.y21, n.y02), max(n.y12, n.y22)));
+    float localRange = max(localMax - localMin, 0.001);
+    float textureGate = smoothstep(0.004, 0.036, abs(localContrast)) * smoothstep(0.008, 0.096, localRange);
+    float shadowGate = smoothstep(0.012, 0.080, centerY);
+    float highlightGuard = 1.0 - smoothstep(0.900, 1.010, centerY);
+    float localNoiseShape = realtimeNoiseShape(noisePressure);
+    float noiseGuard = (1.0 - smoothstep(0.78, 1.0, localNoiseShape) * 0.20) *
+        realtimeStrictDetailNoiseReject(localNoiseShape, abs(localContrast), localRange);
+    float realtimeAuthority = realtimeStrictAuthority();
+    float contrastGain = realtimeBoundedNormalProSdrQuality()
+        ? 1.0 + detailStrength * 0.45
+        : (realtimeAuthority > 1.0 ? 10.0 : 1.0 + detailStrength * 0.18);
+    float contrastLimit = realtimeBoundedNormalProSdrQuality()
+        ? max(0.003, localRange * mix(0.12, 0.24, realtimeAuthority))
+        : (realtimeAuthority > 1.0 ? max(0.012, localRange * 0.46) : max(0.003, localRange * 0.16));
+    float limitedContrast = clamp(
+        localContrast * contrastGain * textureGate * shadowGate * highlightGuard * noiseGuard,
+        -contrastLimit,
+        contrastLimit
+    );
+    return max(contrastRgb + vec3(limitedContrast), vec3(0.0));
+}
+
+vec3 realtimeApexShadowNoiseFloor(RealtimeLumaNeighborhood n, vec3 contrastRgb, float noisePressure) {
+    float centerY = n.y11;
+    float localMean = (
+        centerY * 4.0 +
+        (n.y01 + n.y21 + n.y10 + n.y12) * 1.5 +
+        (n.y00 + n.y20 + n.y02 + n.y22) * 0.75
+    ) / 13.0;
+    float localMin = min(min(min(n.y00, n.y10), min(n.y20, n.y01)), min(min(n.y21, n.y02), min(n.y12, n.y22)));
+    float localMax = max(max(max(n.y00, n.y10), max(n.y20, n.y01)), max(max(n.y21, n.y02), max(n.y12, n.y22)));
+    float localRange = max(localMax - localMin, 0.001);
+    float legacyShadowNoiseGate = (1.0 - smoothstep(0.096, 0.360, centerY)) *
+        (1.0 - smoothstep(0.080, 0.260, localRange));
+    float noiseShape = realtimeNoiseShape(noisePressure);
+    float realtimeAuthority = realtimeStrictAuthority();
+    float strictShadowNoiseGate = max(
+        (1.0 - smoothstep(0.128, 0.520, centerY)) *
+            (1.0 - smoothstep(0.096, 0.340, localRange)),
+        realtimeStrictTexturelessGrainGate(centerY, localRange, abs(centerY - localMean))
+    );
+    bool strictQuality = realtimeBoundedNormalProSdrQuality() || realtimeAuthority > 1.0;
+    float shadowNoiseGate = strictQuality ? strictShadowNoiseGate : legacyShadowNoiseGate;
+    float noiseFloorWeight = strictQuality
+        ? clamp(smoothstep(0.18, 0.88, noiseShape) * 0.74, 0.0, 0.74)
+        : clamp(noiseShape * 0.50, 0.0, 1.0);
+    noiseFloorWeight *= shadowNoiseGate;
+    return max(mix(contrastRgb, vec3(localMean), noiseFloorWeight), vec3(0.0));
+}
+
+vec3 realtimeApexHighlightTexture(RealtimeLumaNeighborhood n, vec3 shadowCleanRgb, float detailStrength, float noisePressure) {
+    float centerY = n.y11;
+    float localMean = (
+        centerY * 4.0 +
+        (n.y01 + n.y21 + n.y10 + n.y12) * 1.5 +
+        (n.y00 + n.y20 + n.y02 + n.y22) * 0.75
+    ) / 13.0;
+    float highlightDetail = centerY - localMean;
+    float localMin = min(min(min(n.y00, n.y10), min(n.y20, n.y01)), min(min(n.y21, n.y02), min(n.y12, n.y22)));
+    float localMax = max(max(max(n.y00, n.y10), max(n.y20, n.y01)), max(max(n.y21, n.y02), max(n.y12, n.y22)));
+    float localRange = max(localMax - localMin, 0.001);
+    float highlightTextureGate = smoothstep(0.600, 0.880, centerY) *
+        (1.0 - smoothstep(0.980, 1.023, centerY));
+    float textureGate = smoothstep(0.004, 0.032, abs(highlightDetail)) *
+        smoothstep(0.010, 0.096, localRange);
+    float highlightNoiseShape = realtimeNoiseShape(noisePressure);
+    float noiseGuard = (1.0 - smoothstep(0.72, 1.0, highlightNoiseShape) * 0.18) *
+        realtimeStrictDetailNoiseReject(highlightNoiseShape, abs(highlightDetail), localRange);
+    float realtimeAuthority = realtimeStrictAuthority();
+    float highlightGain = realtimeBoundedNormalProSdrQuality()
+        ? 1.0 + detailStrength * 0.55
+        : (realtimeAuthority > 1.0 ? 10.0 : 1.0 + detailStrength * 0.24);
+    float highlightLimit = realtimeBoundedNormalProSdrQuality()
+        ? max(0.004, localRange * mix(0.14, 0.24, realtimeAuthority))
+        : (realtimeAuthority > 1.0 ? max(0.016, localRange * 0.58) : max(0.004, localRange * 0.18));
+    float cleanY = realtimeLuma(shadowCleanRgb);
+    float headroomGuard = highlightDetail > 0.0 ?
+        smoothstep(0.0, 0.032, 1.023 - cleanY) : 1.0;
+    float limitedHighlight = clamp(
+        highlightDetail * highlightGain * highlightTextureGate * textureGate * noiseGuard * headroomGuard,
+        -highlightLimit,
+        highlightLimit
+    );
+    return max(shadowCleanRgb + vec3(limitedHighlight), vec3(0.0));
+}
+
+vec3 realtimeApexEdgeCoherence(RealtimeLumaNeighborhood n, vec3 edgeRgb, float detailStrength, float noisePressure) {
+    float centerY = n.y11;
+    float localMean = (
+        centerY * 4.0 +
+        (n.y01 + n.y21 + n.y10 + n.y12) * 1.5 +
+        (n.y00 + n.y20 + n.y02 + n.y22) * 0.75
+    ) / 13.0;
+    float gx = (n.y21 - n.y01) + (n.y20 + n.y22 - n.y00 - n.y02) * 0.5;
+    float gy = (n.y12 - n.y10) + (n.y02 + n.y22 - n.y00 - n.y20) * 0.5;
+    float localMin = min(centerY, min(min(min(n.y00, n.y10), min(n.y20, n.y01)), min(min(n.y21, n.y02), min(n.y12, n.y22))));
+    float localMax = max(centerY, max(max(max(n.y00, n.y10), max(n.y20, n.y01)), max(max(n.y21, n.y02), max(n.y12, n.y22))));
+    float localRange = max(localMax - localMin, 0.001);
+    float detail = centerY - localMean;
+    float edgeCoherenceGate = smoothstep(0.018, 0.096, abs(gx) + abs(gy)) *
+        smoothstep(0.010, 0.096, localRange);
+    float haloRisk = smoothstep(localRange * 0.52, localRange, abs(detail));
+    float edgeNoiseShape = realtimeNoiseShape(noisePressure);
+    float noiseGuard = (1.0 - smoothstep(0.76, 1.0, edgeNoiseShape) * 0.14) *
+        realtimeStrictDetailNoiseReject(edgeNoiseShape, abs(detail), localRange);
+    float realtimeAuthority = realtimeStrictAuthority();
+    float edgeGain = realtimeBoundedNormalProSdrQuality()
+        ? 1.0 + detailStrength * 0.60
+        : (realtimeAuthority > 1.0 ? 10.0 : 1.0 + detailStrength * 0.24);
+    float edgeLimit = realtimeBoundedNormalProSdrQuality()
+        ? max(0.004, localRange * mix(0.16, 0.26, realtimeAuthority))
+        : (realtimeAuthority > 1.0 ? max(0.020, localRange * 0.62) : max(0.004, localRange * 0.20));
+    float coherentLift = clamp(
+        detail * edgeGain * edgeCoherenceGate * (1.0 - haloRisk * 0.48) * noiseGuard,
+        -edgeLimit,
+        edgeLimit
+    );
+    float currentY = realtimeLuma(edgeRgb);
+    float candidate = currentY + coherentLift;
+    float haloSafe = clamp(candidate, max(localMin - edgeLimit, 0.0), min(localMax + edgeLimit, 1.25));
+    return max(edgeRgb + vec3(haloSafe - currentY), vec3(0.0));
+}
+
+vec3 realtimeApexTonalDensity(RealtimeLumaNeighborhood n, vec3 densityRgb, float detailStrength, float noisePressure) {
+    float centerY = n.y11;
+    float localMin = min(centerY, min(min(min(n.y00, n.y10), min(n.y20, n.y01)), min(min(n.y21, n.y02), min(n.y12, n.y22))));
+    float localMax = max(centerY, max(max(max(n.y00, n.y10), max(n.y20, n.y01)), max(max(n.y21, n.y02), max(n.y12, n.y22))));
+    float localRange = max(localMax - localMin, 0.001);
+    float neighborMean = (n.y00 + n.y10 + n.y20 + n.y01 + n.y21 + n.y02 + n.y12 + n.y22) * 0.125;
+    float isolatedBrightDetail = max(centerY - neighborMean, 0.0);
+    float isolatedDetailGuard = 1.0 - smoothstep(0.006, 0.018, isolatedBrightDetail);
+    float midtoneGate = smoothstep(0.160, 0.360, centerY) *
+        (1.0 - smoothstep(0.760, 0.980, centerY));
+    float flatMidtoneGate = (1.0 - smoothstep(0.096, 0.260, localRange)) *
+        midtoneGate;
+    float currentY = realtimeLuma(densityRgb);
+    float normalized = clamp((currentY - 0.500) / 0.500, -1.0, 1.0);
+    float realtimeAuthority = realtimeStrictAuthority();
+    float densityGain = realtimeBoundedNormalProSdrQuality()
+        ? 1.0 + detailStrength * 0.35
+        : (realtimeAuthority > 1.0 ? 10.0 : 1.0 + detailStrength * 0.18);
+    float densityDelta = normalized * (1.0 - abs(normalized)) * densityGain;
+    float positiveDensityGuard = densityDelta > 0.0 ? isolatedDetailGuard : 1.0;
+    float densityNoiseShape = realtimeNoiseShape(noisePressure);
+    float noiseGuard = (1.0 - smoothstep(0.76, 1.0, densityNoiseShape) * 0.12) *
+        realtimeStrictDetailNoiseReject(densityNoiseShape, isolatedBrightDetail, localRange);
+    float densityLimit = realtimeBoundedNormalProSdrQuality()
+        ? max(0.002, localRange * mix(0.06, 0.10, realtimeAuthority))
+        : (realtimeAuthority > 1.0 ? max(0.010, localRange * 0.10) : max(0.002, localRange * 0.06));
+    float candidate = currentY + densityDelta * flatMidtoneGate * positiveDensityGuard * noiseGuard * 0.024;
+    float densitySafe = clamp(candidate, currentY - densityLimit, currentY + densityLimit);
+    return max(densityRgb + vec3(densitySafe - currentY), vec3(0.0));
+}
+
+vec3 realtimeApexLongDistanceDetail(RealtimeLumaNeighborhood n, vec3 detailRgb, float detailStrength, float noisePressure) {
+    float axial1 = n.y01 + n.y21 + n.y10 + n.y12;
+    float diagonal1 = n.y00 + n.y20 + n.y02 + n.y22;
+    float axial2 = (axial1 + diagonal1) * 0.5;
+    float axial3 = mix(diagonal1, axial1, 0.35);
+    float nearMean = (n.y11 * 4.0 + axial1 * 1.0 + diagonal1 * 0.75) / 11.0;
+    float farMean = (n.y11 * 4.0 + axial1 * 1.0 + diagonal1 * 0.66 + axial2 * 0.50) / 12.64;
+    float longDistanceDetail = (n.y11 - farMean) + (nearMean - farMean);
+    float wideMean = (n.y11 * 4.0 + axial1 * 0.82 + diagonal1 * 0.56 + axial2 * 0.44 + axial3 * 0.30) / 13.92;
+    float longDistanceStructure = mix(
+        longDistanceDetail,
+        (n.y11 - wideMean) + (nearMean - wideMean),
+        0.42
+    );
+    float singlePixelNoise = abs(n.y11 - nearMean);
+    float localMin = min(min(min(n.y11, n.y01), min(n.y21, n.y10)), min(min(n.y12, n.y00), min(n.y20, n.y02)));
+    localMin = min(localMin, n.y22);
+    float localMax = max(max(max(n.y11, n.y01), max(n.y21, n.y10)), max(max(n.y12, n.y00), max(n.y20, n.y02)));
+    localMax = max(localMax, n.y22);
+    float localRange = max(localMax - localMin, 0.001);
+    float textureGate = smoothstep(0.00035, 0.0022, abs(longDistanceStructure)) *
+        (1.0 - smoothstep(0.056, 0.144, localRange));
+    float midtoneGate = smoothstep(0.064, 0.180, n.y11) *
+        (1.0 - smoothstep(0.900, 1.016, n.y11));
+    float wideAgreement = 1.0 - smoothstep(0.002, 0.018, abs(farMean - wideMean));
+    float noiseReject = clamp(
+        1.0 - smoothstep(0.018, 0.042, singlePixelNoise) * (0.62 - wideAgreement * 0.22),
+        0.34 + wideAgreement * 0.24,
+        1.0
+    );
+    float longDistanceNoiseShape = realtimeNoiseShape(noisePressure);
+    float realtimeAuthority = realtimeStrictAuthority();
+    float noiseGuard = (1.0 - smoothstep(0.76, 1.0, longDistanceNoiseShape) * 0.16) *
+        realtimeStrictDetailNoiseReject(longDistanceNoiseShape, singlePixelNoise, localRange);
+    bool boundedNormalProSdrQuality = realtimeBoundedNormalProSdrQuality();
+    float strictStructureGuard = boundedNormalProSdrQuality
+        ? min(noiseGuard, 0.72 + wideAgreement * 0.18)
+        : (realtimeAuthority > 1.0 ? max(noiseGuard, 0.38 + wideAgreement * 0.18) : noiseGuard);
+    if (boundedNormalProSdrQuality ? realtimeAuthority < 0.5 : realtimeAuthority <= 1.0) return detailRgb;
+    float longDistanceGain = boundedNormalProSdrQuality
+        ? 1.0 + detailStrength * 1.40
+        : (realtimeAuthority > 1.0 ? 14.0 : 1.0 + detailStrength * 4.0);
+    float detailLimit = boundedNormalProSdrQuality
+        ? max(0.002, localRange * 0.18)
+        : (realtimeAuthority > 1.0 ? max(0.018, localRange * 0.72) : max(0.002, localRange * 0.10));
+    float currentY = realtimeLuma(detailRgb);
+    float detailLift = clamp(
+        longDistanceStructure * longDistanceGain * textureGate * midtoneGate * noiseReject * strictStructureGuard,
+        -detailLimit,
+        detailLimit
+    );
+    float candidate = currentY + detailLift;
+    float safeDetail = clamp(candidate, max(localMin - detailLimit, currentY - detailLimit), min(min(localMax + detailLimit, currentY + detailLimit), 1.25));
+    return max(detailRgb + vec3(safeDetail - currentY), vec3(0.0));
+}
+
+vec3 realtimeApexLongDistanceDetailLegacy(
+    RealtimeLumaNeighborhood n,
+    vec2 uv,
+    vec3 detailRgb,
+    vec2 texel,
+    float detailStrength,
+    float noisePressure
+) {
+    float x2n = realtimeLuma(sampleCameraRgb(uv + vec2(-2.0, 0.0) * texel));
+    float x2p = realtimeLuma(sampleCameraRgb(uv + vec2(2.0, 0.0) * texel));
+    float y2n = realtimeLuma(sampleCameraRgb(uv + vec2(0.0, -2.0) * texel));
+    float y2p = realtimeLuma(sampleCameraRgb(uv + vec2(0.0, 2.0) * texel));
+    float x3n = realtimeLuma(sampleCameraRgb(uv + vec2(-3.0, 0.0) * texel));
+    float x3p = realtimeLuma(sampleCameraRgb(uv + vec2(3.0, 0.0) * texel));
+    float y3n = realtimeLuma(sampleCameraRgb(uv + vec2(0.0, -3.0) * texel));
+    float y3p = realtimeLuma(sampleCameraRgb(uv + vec2(0.0, 3.0) * texel));
+    float axial1 = n.y01 + n.y21 + n.y10 + n.y12;
+    float diagonal1 = n.y00 + n.y20 + n.y02 + n.y22;
+    float axial2 = x2n + x2p + y2n + y2p;
+    float axial3 = x3n + x3p + y3n + y3p;
+    float nearMean = (n.y11 * 4.0 + axial1 + diagonal1 * 0.75) / 11.0;
+    float farMean = (n.y11 * 4.0 + axial1 + diagonal1 * 0.66 + axial2 * 0.50) / 12.64;
+    float longDistanceDetail = (n.y11 - farMean) + (nearMean - farMean);
+    float wideMean = (n.y11 * 4.0 + axial1 * 0.82 + diagonal1 * 0.56 + axial2 * 0.44 + axial3 * 0.30) / 13.92;
+    float longDistanceStructure = mix(longDistanceDetail, (n.y11 - wideMean) + (nearMean - wideMean), 0.42);
+    float singlePixelNoise = abs(n.y11 - nearMean);
+    float localMin = min(min(min(n.y11, n.y01), min(n.y21, n.y10)), min(min(n.y12, n.y00), min(n.y20, n.y02)));
+    localMin = min(localMin, min(min(n.y22, x2n), min(x2p, min(y2n, y2p))));
+    localMin = min(localMin, min(min(x3n, x3p), min(y3n, y3p)));
+    float localMax = max(max(max(n.y11, n.y01), max(n.y21, n.y10)), max(max(n.y12, n.y00), max(n.y20, n.y02)));
+    localMax = max(localMax, max(max(n.y22, x2n), max(x2p, max(y2n, y2p))));
+    localMax = max(localMax, max(max(x3n, x3p), max(y3n, y3p)));
+    float localRange = max(localMax - localMin, 0.001);
+    float textureGate = smoothstep(0.00035, 0.0022, abs(longDistanceStructure)) *
+        (1.0 - smoothstep(0.056, 0.144, localRange));
+    float midtoneGate = smoothstep(0.064, 0.180, n.y11) * (1.0 - smoothstep(0.900, 1.016, n.y11));
+    float wideAgreement = 1.0 - smoothstep(0.002, 0.018, abs(farMean - wideMean));
+    float noiseReject = clamp(
+        1.0 - smoothstep(0.018, 0.042, singlePixelNoise) * (0.62 - wideAgreement * 0.22),
+        0.34 + wideAgreement * 0.24,
+        1.0
+    );
+    float noiseShape = realtimeNoiseShape(noisePressure);
+    float authority = realtimeStrictAuthority();
+    float noiseGuard = (1.0 - smoothstep(0.76, 1.0, noiseShape) * 0.16) *
+        realtimeStrictDetailNoiseReject(noiseShape, singlePixelNoise, localRange);
+    float strictStructureGuard = authority > 1.0
+        ? max(noiseGuard, 0.38 + wideAgreement * 0.18)
+        : noiseGuard;
+    if (authority <= 1.0) return detailRgb;
+    float longDistanceGain = authority > 1.0 ? 14.0 : 1.0 + detailStrength * 4.0;
+    float detailLimit = authority > 1.0
+        ? max(0.018, localRange * 0.72)
+        : max(0.002, localRange * 0.10);
+    float currentY = realtimeLuma(detailRgb);
+    float detailLift = clamp(
+        longDistanceStructure * longDistanceGain * textureGate * midtoneGate * noiseReject * strictStructureGuard,
+        -detailLimit,
+        detailLimit
+    );
+    float candidate = currentY + detailLift;
+    float safeDetail = clamp(
+        candidate,
+        max(localMin - detailLimit, currentY - detailLimit),
+        min(min(localMax + detailLimit, currentY + detailLimit), 1.25)
+    );
+    return max(detailRgb + vec3(safeDetail - currentY), vec3(0.0));
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(params.width) || coord.y >= int(params.height)) return;
+
+    vec2 extent = vec2(max(params.width, 1u), max(params.height, 1u));
+    vec2 uv = (vec2(coord) + vec2(0.5)) / extent;
+    vec2 texel = 1.0 / extent;
+    float spatialStrength = realtimeSpatialStrength();
+    float chromaStrength = realtimeChromaStrength();
+    float detailStrength = realtimeDetailStrength();
+    float noisePressure = realtimeNoisePressure();
+    vec3 cameraRgb = sampleCameraRgb(uv);
+    vec3 denoised = realtimeBilateralDenoise(uv, cameraRgb, texel, spatialStrength, chromaStrength, noisePressure);
+    vec3 chromaClean = realtimeChromaSpeckleSuppress(cameraRgb, denoised, chromaStrength, noisePressure);
+    bool boundedNormalProSdrQuality = realtimeBoundedNormalProSdrQuality();
+    if (!boundedNormalProSdrQuality) {
+        RealtimeLumaNeighborhood lumaN = realtimeSample3x3Luma(uv, texel);
+        vec3 detailed = realtimeEdgeAwareDetail(lumaN, chromaClean, detailStrength, noisePressure);
+        vec3 processed = realtimeApexMicroTextureRecoverLegacy(lumaN, uv, detailed, texel, detailStrength, noisePressure);
+        vec3 contrast = realtimeApexLocalContrast(lumaN, processed, detailStrength, noisePressure);
+        vec3 shadowClean = realtimeApexShadowNoiseFloor(lumaN, contrast, noisePressure);
+        vec3 highlightTexture = realtimeApexHighlightTexture(lumaN, shadowClean, detailStrength, noisePressure);
+        vec3 edgeCoherent = realtimeApexEdgeCoherence(lumaN, highlightTexture, detailStrength, noisePressure);
+        vec3 tonalDensity = realtimeApexTonalDensity(lumaN, edgeCoherent, detailStrength, noisePressure);
+        vec3 longDistanceDetail = realtimeApexLongDistanceDetailLegacy(
+            lumaN,
+            uv,
+            tonalDensity,
+            texel,
+            detailStrength,
+            noisePressure
+        );
+        imageStore(uRealtimeIntermediate, coord, vec4(clampWidePreviewRgb(longDistanceDetail), 1.0));
+        return;
+    }
+    RealtimeLumaNeighborhood rawLumaN = realtimeSample3x3Luma(uv, texel);
+    RealtimeLumaNeighborhood cleanLumaN = realtimeBuildCleanLumaNeighborhood(rawLumaN, chromaClean, noisePressure);
+    vec3 detailBase = chromaClean;
+    vec3 shadowClean = realtimeApexShadowNoiseFloor(cleanLumaN, detailBase, noisePressure);
+    vec3 detailed = realtimeEdgeAwareDetail(cleanLumaN, shadowClean, detailStrength, noisePressure);
+    vec3 processed = realtimeApexMicroTextureRecover(cleanLumaN, detailed, detailStrength, noisePressure);
+    vec3 contrast = realtimeApexLocalContrast(cleanLumaN, processed, detailStrength, noisePressure);
+    vec3 highlightTexture = realtimeApexHighlightTexture(cleanLumaN, contrast, detailStrength, noisePressure);
+    vec3 edgeCoherent = realtimeApexEdgeCoherence(cleanLumaN, highlightTexture, detailStrength, noisePressure);
+    vec3 tonalDensity = realtimeApexTonalDensity(cleanLumaN, edgeCoherent, detailStrength, noisePressure);
+    vec3 longDistanceDetail = realtimeApexLongDistanceDetail(cleanLumaN, tonalDensity, detailStrength, noisePressure);
+    vec3 guardedDetail = realtimeApplyCumulativeDetailBudget(detailBase, longDistanceDetail, cleanLumaN);
+    imageStore(
+        uRealtimeIntermediate,
+        coord,
+        vec4(clampWidePreviewRgb(guardedDetail), REALTIME_COMPUTE_ENHANCED_ALPHA)
+    );
+}

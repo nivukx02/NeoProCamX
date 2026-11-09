@@ -1,0 +1,224 @@
+#version 450
+
+// NIV99 sensor-linear tile statistics. One 8x8 workgroup owns one analysis tile and writes one
+// fixed-size record. No floating-point atomics, subgroup extensions, or device-dependent reduction
+// order are used, which keeps the reference/shader comparison deterministic.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, r16ui) uniform readonly uimage2D rawInput;
+layout(binding = 1, rgba16f) uniform readonly image2D lensShadingMap;
+
+struct Niv99TileStatisticsRecord {
+    vec4 meanRggb;
+    vec4 varianceRggb;
+    vec4 confidence; // x=reliability, y=clipped fraction, z=shadow fraction, w=mean gradient
+    vec4 chroma;     // x=R/G, y=B/G, z=neutral confidence, w=sample count
+};
+
+layout(std430, binding = 12) writeonly buffer Niv99StatisticsBuffer {
+    Niv99TileStatisticsRecord records[];
+} statisticsOutput;
+
+layout(std140, binding = 15) uniform Niv99UniformBlock {
+    ivec4 frameExtent;       // width, height, tile columns, tile rows
+    ivec4 tileAndCfa;        // tile width, tile height, CFA pattern, bit depth
+    uvec4 identityLow;       // low words: camera hash, generation, frame, timestamp
+    uvec4 identityHigh;      // high words: camera hash, generation, frame, timestamp
+    uvec4 flags;             // lens-map enabled, history valid, scene cut, reserved
+    vec4 blackLevelRggb;     // sensor code values
+    vec4 whiteAndThresholds; // white code, shadow, highlight, clipping tolerance
+    vec4 shotNoiseRggb;      // normalized-signal Poisson coefficients
+    vec4 readNoiseRggb;      // normalized-signal Gaussian coefficients
+    vec4 whiteBalanceRggb;
+    vec4 colorMatrixRow0;
+    vec4 colorMatrixRow1;
+    vec4 colorMatrixRow2;
+    vec4 motionParameters;
+    vec4 temporalParameters;
+    vec4 reconstructionParameters;
+} uniforms;
+
+const uint LOCAL_COUNT = 64u;
+const float MIN_RANGE = 1e-6;
+const float MIN_SIGNAL = 1e-7;
+const float MIN_VARIANCE = 1e-12;
+
+shared vec4 weightedSignal[LOCAL_COUNT];
+shared vec4 weightedSquare[LOCAL_COUNT];
+shared vec4 channelWeight[LOCAL_COUNT];
+shared vec4 gradientSum[LOCAL_COUNT];
+shared float reliabilitySum[LOCAL_COUNT];
+shared uint acceptedCount[LOCAL_COUNT];
+shared uint sampleCount[LOCAL_COUNT];
+shared uint clippedCount[LOCAL_COUNT];
+shared uint shadowCount[LOCAL_COUNT];
+
+int cfaChannel(ivec2 coordinate) {
+    int base = ((coordinate.y & 1) << 1) | (coordinate.x & 1);
+    int pattern = uniforms.tileAndCfa.z;
+    if (pattern < 0 || pattern > 3) {
+        return -1;
+    }
+    return base ^ pattern;
+}
+
+float channelValue(vec4 value, int channel) {
+    if (channel == 0) return value.x;
+    if (channel == 1) return value.y;
+    if (channel == 2) return value.z;
+    return value.w;
+}
+
+void addChannel(inout vec4 value, int channel, float amount) {
+    if (channel == 0) value.x += amount;
+    else if (channel == 1) value.y += amount;
+    else if (channel == 2) value.z += amount;
+    else value.w += amount;
+}
+
+float lensGain(ivec2 coordinate, int channel) {
+    if (uniforms.flags.x == 0u) return 1.0;
+    ivec2 mapSize = imageSize(lensShadingMap);
+    if (mapSize.x <= 0 || mapSize.y <= 0) return 1.0;
+    vec2 frameDenominator = max(vec2(uniforms.frameExtent.xy - ivec2(1)), vec2(1.0));
+    vec2 normalized = clamp(vec2(coordinate) / frameDenominator, vec2(0.0), vec2(1.0));
+    ivec2 mapCoordinate = ivec2(round(normalized * vec2(mapSize - ivec2(1))));
+    return clamp(channelValue(imageLoad(lensShadingMap, mapCoordinate), channel), 0.25, 8.0);
+}
+
+float calibratedSignal(ivec2 coordinate, int channel) {
+    float raw = float(imageLoad(rawInput, coordinate).r);
+    float black = channelValue(uniforms.blackLevelRggb, channel);
+    float range = max(uniforms.whiteAndThresholds.x - black, MIN_RANGE);
+    return clamp((raw - black) / range * lensGain(coordinate, channel), 0.0, 1.0);
+}
+
+float sameColorGradient(ivec2 coordinate, int channel, float center) {
+    ivec2 upper = uniforms.frameExtent.xy - ivec2(1);
+    ivec2 left = clamp(coordinate + ivec2(-2, 0), ivec2(0), upper);
+    ivec2 right = clamp(coordinate + ivec2(2, 0), ivec2(0), upper);
+    ivec2 top = clamp(coordinate + ivec2(0, -2), ivec2(0), upper);
+    ivec2 bottom = clamp(coordinate + ivec2(0, 2), ivec2(0), upper);
+    float horizontal = abs(calibratedSignal(right, channel) - calibratedSignal(left, channel));
+    float vertical = abs(calibratedSignal(bottom, channel) - calibratedSignal(top, channel));
+    float laplacian = abs(
+        4.0 * center - calibratedSignal(left, channel) - calibratedSignal(right, channel) -
+        calibratedSignal(top, channel) - calibratedSignal(bottom, channel)
+    );
+    return 0.375 * (horizontal + vertical) + 0.25 * laplacian;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationIndex;
+    ivec2 tileIndex = ivec2(gl_WorkGroupID.xy);
+    ivec2 tileSize = max(uniforms.tileAndCfa.xy, ivec2(1));
+    ivec2 tileBegin = tileIndex * tileSize;
+    ivec2 tileEnd = min(tileBegin + tileSize, uniforms.frameExtent.xy);
+
+    vec4 localSignal = vec4(0.0);
+    vec4 localSquare = vec4(0.0);
+    vec4 localWeight = vec4(0.0);
+    vec4 localGradient = vec4(0.0);
+    float localReliability = 0.0;
+    uint localAccepted = 0u;
+    uint localSamples = 0u;
+    uint localClipped = 0u;
+    uint localShadow = 0u;
+
+    for (int y = tileBegin.y + int(gl_LocalInvocationID.y); y < tileEnd.y; y += 8) {
+        for (int x = tileBegin.x + int(gl_LocalInvocationID.x); x < tileEnd.x; x += 8) {
+            ivec2 coordinate = ivec2(x, y);
+            int channel = cfaChannel(coordinate);
+            if (channel < 0) continue;
+            float signal = calibratedSignal(coordinate, channel);
+            float gain = lensGain(coordinate, channel);
+            float shot = channelValue(uniforms.shotNoiseRggb, channel);
+            float read = channelValue(uniforms.readNoiseRggb, channel);
+            float variance = max((shot * signal + read) * gain * gain, MIN_VARIANCE);
+            float sigma = sqrt(variance);
+            float shadowGate = smoothstep(
+                uniforms.whiteAndThresholds.y * 0.5,
+                uniforms.whiteAndThresholds.y,
+                signal
+            );
+            float highlightGate = 1.0 - smoothstep(
+                uniforms.whiteAndThresholds.z,
+                max(uniforms.whiteAndThresholds.z + uniforms.whiteAndThresholds.w, 1.0),
+                signal
+            );
+            float noiseReliability = signal / max(signal + 4.0 * sigma, MIN_SIGNAL);
+            float weight = shadowGate * highlightGate * noiseReliability;
+            float gradient = sameColorGradient(coordinate, channel, signal);
+            addChannel(localGradient, channel, gradient);
+            localReliability += noiseReliability;
+            localSamples += 1u;
+            if (signal <= uniforms.whiteAndThresholds.y) localShadow += 1u;
+            if (signal >= uniforms.whiteAndThresholds.z) localClipped += 1u;
+            if (weight > 1e-6) {
+                addChannel(localSignal, channel, signal * weight);
+                addChannel(localSquare, channel, signal * signal * weight);
+                addChannel(localWeight, channel, weight);
+                localAccepted += 1u;
+            }
+        }
+    }
+
+    weightedSignal[lane] = localSignal;
+    weightedSquare[lane] = localSquare;
+    channelWeight[lane] = localWeight;
+    gradientSum[lane] = localGradient;
+    reliabilitySum[lane] = localReliability;
+    acceptedCount[lane] = localAccepted;
+    sampleCount[lane] = localSamples;
+    clippedCount[lane] = localClipped;
+    shadowCount[lane] = localShadow;
+    barrier();
+
+    for (uint stride = LOCAL_COUNT / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            weightedSignal[lane] += weightedSignal[lane + stride];
+            weightedSquare[lane] += weightedSquare[lane + stride];
+            channelWeight[lane] += channelWeight[lane + stride];
+            gradientSum[lane] += gradientSum[lane + stride];
+            reliabilitySum[lane] += reliabilitySum[lane + stride];
+            acceptedCount[lane] += acceptedCount[lane + stride];
+            sampleCount[lane] += sampleCount[lane + stride];
+            clippedCount[lane] += clippedCount[lane + stride];
+            shadowCount[lane] += shadowCount[lane + stride];
+        }
+        barrier();
+    }
+
+    if (lane != 0u) return;
+    uint tileLinearIndex = uint(tileIndex.y * uniforms.frameExtent.z + tileIndex.x);
+    vec4 denominator = max(channelWeight[0], vec4(MIN_SIGNAL));
+    vec4 mean = weightedSignal[0] / denominator;
+    vec4 variance = max(weightedSquare[0] / denominator - mean * mean, vec4(0.0));
+    float green = 0.5 * (mean.y + mean.z);
+    float redGreen = mean.x / max(green, MIN_SIGNAL);
+    float blueGreen = mean.w / max(green, MIN_SIGNAL);
+    float chromaDistance = max(abs(log(max(redGreen, MIN_SIGNAL))), abs(log(max(blueGreen, MIN_SIGNAL))));
+    float total = float(max(sampleCount[0], 1u));
+    float acceptance = float(acceptedCount[0]) / total;
+    float noiseReliability = reliabilitySum[0] / total;
+    float channelCoverage = min(min(channelWeight[0].x, channelWeight[0].y),
+        min(channelWeight[0].z, channelWeight[0].w));
+    float coverageGate = smoothstep(0.5, 4.0, channelCoverage);
+    float reliability = clamp(acceptance * noiseReliability * coverageGate, 0.0, 1.0);
+    float gradient = dot(gradientSum[0], vec4(0.25)) / total;
+
+    statisticsOutput.records[tileLinearIndex].meanRggb = mean;
+    statisticsOutput.records[tileLinearIndex].varianceRggb = variance;
+    statisticsOutput.records[tileLinearIndex].confidence = vec4(
+        reliability,
+        float(clippedCount[0]) / total,
+        float(shadowCount[0]) / total,
+        gradient
+    );
+    statisticsOutput.records[tileLinearIndex].chroma = vec4(
+        redGreen,
+        blueGreen,
+        exp(-8.0 * chromaDistance) * reliability,
+        total
+    );
+}

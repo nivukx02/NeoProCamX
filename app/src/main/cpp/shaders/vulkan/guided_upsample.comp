@@ -1,0 +1,86 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba8) uniform readonly image2D inputGuidance; // Full-res guide image
+layout(binding = 1, r32f) uniform readonly image2D inputLowResValue; // 1/4 res value map
+layout(binding = 2, r32f) uniform writeonly image2D outputHighResValue; // Upsampled output
+
+layout(push_constant) uniform PushConstants {
+    float sigmaS; // Spatial sigma (default ~3.0)
+    float sigmaR; // Range sigma (default ~0.1)
+    int scaleFactor; // Downsampling scale factor (default 4)
+    // CP24 elite gate, now per-dispatch (default 0.0 → today's upsample bit-for-bit): >0.5 tightens the
+    // joint-bilateral range sigma where the guide has a strong local gradient (snaps to real edges).
+    float edgeTightenGate;
+} pcs;
+
+const float GUIDED_TIGHTEN_K = 8.0;
+
+float gaussian(float x, float sigma) {
+    return exp(-(x * x) / (2.0 * sigma * sigma));
+}
+
+float guideLumaAt(ivec2 p, ivec2 fullSize) {
+    ivec2 c = clamp(p, ivec2(0), fullSize - ivec2(1));
+    return dot(imageLoad(inputGuidance, c).rgb, vec3(0.299, 0.587, 0.114));
+}
+
+void main() {
+    ivec2 fullResPos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 fullSize = imageSize(inputGuidance);
+    if (fullResPos.x >= fullSize.x || fullResPos.y >= fullSize.y) {
+        return;
+    }
+
+    // Read full resolution guidance luminance
+    vec4 guideColor = imageLoad(inputGuidance, fullResPos);
+    float guideLuma = dot(guideColor.rgb, vec3(0.299, 0.587, 0.114));
+
+    // Effective range sigma — tightened near guide edges only when the gate is enabled.
+    float effSigmaR = pcs.sigmaR;
+    if (pcs.edgeTightenGate > 0.5) {
+        float gx = abs(guideLumaAt(fullResPos + ivec2(1, 0), fullSize) - guideLumaAt(fullResPos - ivec2(1, 0), fullSize));
+        float gy = abs(guideLumaAt(fullResPos + ivec2(0, 1), fullSize) - guideLumaAt(fullResPos - ivec2(0, 1), fullSize));
+        float gmag = sqrt(gx * gx + gy * gy);
+        effSigmaR = pcs.sigmaR / (1.0 + GUIDED_TIGHTEN_K * gmag);
+    }
+
+    ivec2 lowResPos = fullResPos / pcs.scaleFactor;
+    ivec2 lowSize = imageSize(inputLowResValue);
+
+    float sumVal = 0.0;
+    float sumW = 0.0;
+
+    int radius = int(pcs.sigmaS * 2.0);
+
+    for (int dy = -radius; dy <= radius; ++dy) {
+        for (int dx = -radius; dx <= radius; ++dx) {
+            ivec2 neighborLowPos = lowResPos + ivec2(dx, dy);
+            if (neighborLowPos.x < 0 || neighborLowPos.x >= lowSize.x ||
+                neighborLowPos.y < 0 || neighborLowPos.y >= lowSize.y) {
+                continue;
+            }
+
+            // Map low-res position back to full-res to compare guidance luma
+            ivec2 neighborFullPos = neighborLowPos * pcs.scaleFactor;
+            vec4 neighborGuideColor = imageLoad(inputGuidance, neighborFullPos);
+            float neighborGuideLuma = dot(neighborGuideColor.rgb, vec3(0.299, 0.587, 0.114));
+
+            float val = imageLoad(inputLowResValue, neighborLowPos).r;
+
+            // Spatial and Range weights
+            float distS = length(vec2(fullResPos - neighborFullPos));
+            float distR = abs(guideLuma - neighborGuideLuma);
+
+            float wS = gaussian(distS, pcs.sigmaS * float(pcs.scaleFactor));
+            float wR = gaussian(distR, effSigmaR);
+            float w = wS * wR;
+
+            sumVal += val * w;
+            sumW += w;
+        }
+    }
+
+    float finalVal = sumW > 0.0 ? (sumVal / sumW) : imageLoad(inputLowResValue, lowResPos).r;
+    imageStore(outputHighResValue, fullResPos, vec4(finalVal, 0.0, 0.0, 0.0));
+}

@@ -1,0 +1,407 @@
+apply plugin: 'com.android.application'
+apply from: rootProject.file('gradle/build-health.gradle')
+apply from: rootProject.file('gradle/packaging-flow.gradle')
+
+// Production signing comes from the environment. The local validation key is opt-in only and can
+// never silently sign a release artifact intended for distribution.
+def allowLocalValidationSigning = (
+        project.findProperty('NEOPROCAMX_ALLOW_LOCAL_VALIDATION_SIGNING') ?:
+        System.getenv('NEOPROCAMX_ALLOW_LOCAL_VALIDATION_SIGNING') ?:
+        'false'
+).toString().toBoolean()
+def loadSigningCredentials = { ->
+    Properties props = new Properties()
+    File propsFile = rootProject.file('keystore.properties')
+    if (allowLocalValidationSigning && propsFile.exists()) {
+        propsFile.withInputStream { props.load(it) }
+    }
+    return [
+        storeFile    : System.getenv('NEOPROCAMX_KEYSTORE_FILE') ?: props.getProperty('storeFile'),
+        storePassword: System.getenv('NEOPROCAMX_KEYSTORE_PASSWORD') ?: props.getProperty('storePassword'),
+        keyAlias     : System.getenv('NEOPROCAMX_KEY_ALIAS') ?: props.getProperty('keyAlias'),
+        keyPassword  : System.getenv('NEOPROCAMX_KEY_PASSWORD') ?: props.getProperty('keyPassword')
+    ]
+}
+def releaseSigning = loadSigningCredentials()
+def hasSigningValue = { Object value -> value != null && !value.toString().trim().isEmpty() }
+def releaseSigningAvailable = hasSigningValue(releaseSigning.storeFile) &&
+        hasSigningValue(releaseSigning.storePassword) &&
+        hasSigningValue(releaseSigning.keyAlias) &&
+        hasSigningValue(releaseSigning.keyPassword) &&
+        rootProject.file(releaseSigning.storeFile).exists()
+def releaseArtifactRequested = gradle.startParameter.taskNames.any { requestedTask ->
+    def normalizedTask = requestedTask.toString().toLowerCase(Locale.ROOT)
+    normalizedTask.endsWith('assemblerelease') ||
+            normalizedTask.endsWith('bundlerelease') ||
+            (normalizedTask.contains('publish') && normalizedTask.contains('release'))
+}
+def playDistributionArtifactRequested = gradle.startParameter.taskNames.any { requestedTask ->
+    def normalizedTask = requestedTask.toString().toLowerCase(Locale.ROOT)
+    normalizedTask.endsWith('bundlerelease') ||
+            (normalizedTask.contains('publish') && normalizedTask.contains('release'))
+}
+def readSecurityConfig = { String name, String fallback = "" ->
+    def value = System.getenv(name)
+    if (value == null || value.toString().trim().isEmpty()) {
+        value = project.findProperty(name)
+    }
+    value == null ? fallback : value.toString().trim()
+}
+
+def quotedBuildConfigString = { String value ->
+    '"' + value
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"") + '"'
+}
+
+def allowedSigningCertHashes = readSecurityConfig("NEOPROCAMX_ALLOWED_CERT_SHA256", "")
+// #1 fix: with Google Play App Signing (mandatory for AAB) Play RE-SIGNS the app with a Google-managed key
+// whose SHA-256 differs from the local upload-key hash above. If ONLY the upload hash is pinned, ApkTamperGuard
+// evaluates BLOCK on 100% of Play-distributed installs and MainActivity.enforceRuntimeSecurityGate() closes the
+// app on launch. Pin BOTH: paste the Play "App signing key certificate" SHA-256 (Play Console > Test and
+// release > Setup > App integrity) into NEOPROCAMX_PLAY_APP_SIGNING_SHA256; it is MERGED with the upload hash
+// (the guard parser accepts a comma-separated set), so sideloads of the upload build AND Play installs both
+// pass while genuinely re-signed/tampered APKs are still blocked. Leave empty for pure-sideload-only builds.
+def playAppSigningCertHash = readSecurityConfig("NEOPROCAMX_PLAY_APP_SIGNING_SHA256", "")
+def signingFingerprintTokens = { String value ->
+    value.split(/[,;\r\n]+/)
+            .collect { it.trim() }
+            .findAll { !it.isEmpty() }
+}
+def configuredSigningFingerprints = signingFingerprintTokens(allowedSigningCertHashes) +
+        signingFingerprintTokens(playAppSigningCertHash)
+def invalidSigningFingerprints = configuredSigningFingerprints.findAll { rawFingerprint ->
+    def normalized = rawFingerprint.toUpperCase(Locale.ROOT).replaceAll('[^A-F0-9]', '')
+    normalized.length() != 64
+}
+def mergedAllowedSigningCertHashes = [allowedSigningCertHashes, playAppSigningCertHash]
+        .findAll { it != null && !it.trim().isEmpty() }
+        .join(",")
+def tamperBlockingReady = !configuredSigningFingerprints.isEmpty()
+def backendSslPins = readSecurityConfig("NEOPROCAMX_SSL_PINS", "")
+def playIntegrityProjectNumberRaw = readSecurityConfig("NEOPROCAMX_PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER", "0")
+def playIntegrityProjectNumberValid = playIntegrityProjectNumberRaw ==~ /[0-9]+/
+def playIntegrityProjectNumber = playIntegrityProjectNumberValid ? playIntegrityProjectNumberRaw : "0"
+def playIntegrityEnabled = playIntegrityProjectNumber != "0"
+
+android {
+    namespace = 'com.neoproc.neoproccamx'
+    compileSdk {
+        version = release(36) {
+            it.minorApiLevel = 1
+        }
+    }
+    buildToolsVersion = "36.1.0"
+    // Section 1 modernization: use the newest complete installed NDK for current
+    // Vulkan/C++20 toolchain coverage and 16 KB page-size packaging.
+    ndkVersion = '29.0.14206865'
+
+    defaultConfig {
+        applicationId = "com.neoproc.neoproccamx"
+        minSdk = 29
+        targetSdk = 36
+        versionCode = 19112005
+        versionName = "19.11.2005"
+
+        buildConfigField "String", "SECURITY_ALLOWED_SIGNING_CERT_SHA256", quotedBuildConfigString(mergedAllowedSigningCertHashes)
+        buildConfigField "String", "SECURITY_SSL_PINS", quotedBuildConfigString(backendSslPins)
+        buildConfigField "long", "PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER", "${playIntegrityProjectNumber}L"
+        buildConfigField "boolean", "PLAY_INTEGRITY_ENABLED", playIntegrityEnabled.toString()
+        buildConfigField "boolean", "SECURITY_BLOCK_ON_TAMPER", "false"
+        buildConfigField "boolean", "SECURITY_BLOCK_ON_COMPROMISED_DEVICE", "false"
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_static'
+                cppFlags '-std=c++20'
+            }
+        }
+
+        ndk {
+            // Compile every app-owned JNI entry point for phones and x86_64 test/ChromeOS targets.
+            // AAB ABI delivery below keeps each installed footprint architecture-specific.
+            abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64'
+        }
+    }
+
+    signingConfigs {
+        if (releaseSigningAvailable) {
+            release {
+                storeFile = rootProject.file(releaseSigning.storeFile)
+                storePassword = releaseSigning.storePassword
+                keyAlias = releaseSigning.keyAlias
+                keyPassword = releaseSigning.keyPassword
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+                enableV4Signing = true
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled = false
+            manifestPlaceholders = [
+                debugCommandReceiverEnabled : "true",
+                debugCommandReceiverExported: "true"
+            ]
+        }
+        release {
+            minifyEnabled = true
+            shrinkResources = true
+            // Any configured distribution certificate enables runtime tamper blocking. Release
+            // artifact tasks above fail before packaging when no trust fingerprint is supplied.
+            buildConfigField "boolean", "SECURITY_BLOCK_ON_TAMPER", tamperBlockingReady.toString()
+            buildConfigField "boolean", "SECURITY_BLOCK_ON_COMPROMISED_DEVICE", "true"
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            manifestPlaceholders = [
+                debugCommandReceiverEnabled : "false",
+                debugCommandReceiverExported: "false"
+            ]
+            if (releaseSigningAvailable) {
+                signingConfig = signingConfigs.release
+            }
+        }
+    }
+    compileOptions {
+        // Section 1: bump to JVM 21 LTS (matches the JBR JDK shipped with Android Studio Iguana+).
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
+    }
+    lint {
+        // Production gate: every enabled lint warning is a build failure and no baseline hides debt.
+        warningsAsErrors = true
+        abortOnError = true
+        checkReleaseBuilds = true
+        // Disabled-by-default advisory checks (for example SyntheticAccessor) are intentionally
+        // excluded; all default correctness, security, performance, and accessibility checks run.
+        checkAllWarnings = false
+        disable += [
+            // Version freshness is tracked separately from app correctness. Major
+            // AGP/Kotlin/AndroidX bumps require a dedicated compatibility pass.
+            'AndroidGradlePluginVersion',
+            'GradleDependency',
+            'OldTargetApi',
+
+            // minSdk is 29. Keeping some SDK guards documents API intent and
+            // protects future lower-minSdk refactors without changing runtime.
+            'ObsoleteSdkInt',
+
+            // Resource shrink runs for release. This project has a large code-built
+            // UI surface and resource cleanup should be a reviewed visual pass.
+            'UnusedResources',
+
+            // Launcher artwork policy warnings are aesthetic/advisory; the
+            // adaptive icon now includes monochrome metadata below.
+            'IconLauncherShape',
+            'IconDuplicates',
+
+            // Required for high-rate gyro/IMU stabilization modes.
+            'HighSamplingRate',
+
+            // The settings icon path is a small static vector; replacing it would
+            // be a visual asset change, not a runtime correctness fix.
+            'VectorPath'
+        ]
+        explainIssues = true
+        textReport = true
+        htmlReport = true
+        xmlReport = true
+    }
+    buildFeatures {
+        buildConfig = true
+        viewBinding = true
+    }
+    externalNativeBuild {
+        cmake {
+            path = file('src/main/cpp/CMakeLists.txt')
+        }
+    }
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+    bundle {
+        abi {
+            enableSplit = true
+        }
+    }
+    testOptions {
+        animationsDisabled = true
+        // Run each instrumented test in its own process so camera-device / process-singleton state
+        // from one test cannot pollute the next (the shared-process full-suite flakiness where a
+        // camera-heavy predecessor leaves the shared camera mid-restart for the following test).
+        execution = 'ANDROIDX_TEST_ORCHESTRATOR'
+        unitTests {
+            includeAndroidResources = true
+            returnDefaultValues = true
+        }
+    }
+}
+
+// Validate only after the Android DSL has been configured. Failing earlier makes AGP emit a false
+// secondary "compileSdk missing" error, hiding the one actionable security configuration failure.
+if (!invalidSigningFingerprints.isEmpty()) {
+    throw new GradleException(
+            'Every configured signing-certificate fingerprint must be a complete SHA-256 value.'
+    )
+}
+if (!playIntegrityProjectNumberValid) {
+    throw new GradleException('NEOPROCAMX_PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER must contain digits only.')
+}
+if (releaseArtifactRequested && !releaseSigningAvailable) {
+    throw new GradleException(
+            'Release artifact generation requires an explicit production signing configuration. ' +
+            'Unsigned APK/AAB output is intentionally blocked. For local validation only, opt in ' +
+            'with NEOPROCAMX_ALLOW_LOCAL_VALIDATION_SIGNING=true and a valid keystore.properties.'
+    )
+}
+if (releaseArtifactRequested && !tamperBlockingReady) {
+    throw new GradleException(
+            'Release artifact generation requires NEOPROCAMX_ALLOWED_CERT_SHA256 and/or ' +
+            'NEOPROCAMX_PLAY_APP_SIGNING_SHA256. Tamper protection cannot ship unconfigured.'
+    )
+}
+if (playDistributionArtifactRequested && signingFingerprintTokens(playAppSigningCertHash).isEmpty()) {
+    throw new GradleException(
+            'Play release generation requires NEOPROCAMX_PLAY_APP_SIGNING_SHA256. ' +
+            'Google Play re-signs the bundle, so upload-key trust alone would block every Play install.'
+    )
+}
+
+kotlin {
+    compilerOptions {
+        // Keep the application warning-free: any new Kotlin warning is a build failure.
+        allWarningsAsErrors = true
+        freeCompilerArgs.addAll([
+            '-jvm-default=no-compatibility',
+            '-opt-in=kotlin.RequiresOptIn',
+            '-opt-in=kotlinx.coroutines.ExperimentalCoroutinesApi',
+            '-opt-in=kotlinx.coroutines.FlowPreview'
+        ])
+    }
+}
+
+tasks.withType(org.gradle.api.tasks.testing.Test).configureEach {
+    // JDK 24+ restricts native library loading unless the test JVM opts in explicitly. The app's
+    // native codec/quality probes are intentional, so authorize them instead of hiding the warning.
+    jvmArgs('--enable-native-access=ALL-UNNAMED')
+}
+
+dependencies {
+    constraints {
+        // MediaPipe 0.10.35 requests protobuf-javalite 4.26.1, which is affected by
+        // CVE-2024-7254. Pin the nearest compatible fixed 4.x patch line. `strictly` also prevents
+        // a future transitive move onto the separately vulnerable 4.28.0/4.28.1 line without an
+        // explicit security/compatibility review.
+        implementation(libs.protobuf.javalite) {
+            version { strictly(libs.versions.protobuf.javalite.get()) }
+            because('CVE-2024-7254 / GHSA-735f-pc8j-v9w8; fixed in protobuf-javalite 4.27.5')
+        }
+
+        // Glide's compiler is host-only but selected Guava 28.1-android. Keep its annotation
+        // processor graph on an already verified, non-affected Android Guava release. This does
+        // not add Guava to the APK runtime graph.
+        annotationProcessor(libs.guava.annotation.processor) {
+            version { strictly(libs.versions.guava.annotation.processor.get()) }
+            because('CVE-2020-8908 and CVE-2023-2976 in the Glide compiler transitive graph')
+        }
+
+        // AGP's isolated lint tool configuration is not part of implementation/runtime and does
+        // not inherit normal app constraints. Use patch/minor-compatible fixed versions only;
+        // lintRelease and the strict quality gate validate this host-tool substitution.
+        add('androidLintTool', 'org.apache.commons:commons-lang3:3.18.0') {
+            version { strictly('3.18.0') }
+            because('CVE-2025-48924; first fixed Commons Lang release')
+        }
+        add('androidLintTool', 'org.apache.httpcomponents:httpclient:4.5.14') {
+            version { strictly('4.5.14') }
+            because('CVE-2020-13956; remain on the compatible HttpClient 4.5 patch line')
+        }
+        add('androidLintTool', 'org.bouncycastle:bcpkix-jdk18on:1.84') {
+            version { strictly('1.84') }
+            because('CVE-2026-5588; align the Bouncy Castle lint-tool family on 1.84')
+        }
+        add('androidLintTool', 'org.bouncycastle:bcprov-jdk18on:1.84') {
+            version { strictly('1.84') }
+            because('CVE-2025-14813 and CVE-2026-0636; common fixed release is 1.84')
+        }
+        add('androidLintTool', 'org.bouncycastle:bcutil-jdk18on:1.84') {
+            version { strictly('1.84') }
+            because('Keep the Bouncy Castle provider, PKIX, and utility modules ABI-aligned')
+        }
+    }
+
+    // ── Internal Modules ──
+    implementation project(':core-math')
+
+    // AndroidX Core
+    implementation libs.androidx.core.ktx
+    implementation libs.androidx.activity.ktx
+    implementation libs.androidx.appcompat
+    // Cold-start splash (logo on black) that holds until the first preview frame, masking boot latency.
+    implementation libs.androidx.core.splashscreen
+    implementation libs.google.material
+    implementation libs.androidx.constraintlayout
+
+    // AndroidX Lifecycle (using bundle)
+    implementation libs.bundles.androidx.lifecycle
+
+    // AndroidX Navigation (using bundle)
+    implementation libs.bundles.androidx.navigation
+
+    // Kotlin Coroutines
+    implementation libs.kotlinx.coroutines.android
+    implementation libs.okhttp
+    implementation libs.playIntegrity
+
+    // Glide for image loading
+    implementation libs.glide
+    annotationProcessor libs.glide.compiler
+
+    // AndroidX Other
+    implementation libs.androidx.exifinterface
+    implementation libs.androidx.window
+    implementation libs.androidx.preference.ktx
+    implementation libs.androidx.recyclerview
+
+    // CameraX core types retained for AI frame interop
+    implementation libs.androidx.camera.core
+
+    // Media3 / ExoPlayer for the new Media Preview screen (Section 14)
+    implementation libs.bundles.media3
+
+    // MediaPipe Tasks
+    implementation libs.mediapipe.tasks.vision
+
+    // ML Kit (using bundle)
+    implementation libs.bundles.mlkit
+
+    // TensorFlow Lite (using bundle)
+    implementation libs.bundles.tensorflow
+
+    // Testing
+    testImplementation libs.junit
+    androidTestImplementation libs.bundles.androidx.testing
+    // Test orchestrator: isolates each instrumented test in a fresh process so shared camera-device
+    // and process-singleton state cannot pollute across the full suite. Test-only utility APKs.
+    androidTestUtil libs.androidx.test.orchestrator
+    androidTestUtil libs.androidx.test.services
+}
+
+// Recording contract tests read native writer/codec sources directly. These files do not change
+// JVM class bytes, so the default Test cache key alone can incorrectly reuse an earlier PASS after
+// a native root fix. Keep caching, but include the actual source contracts in its identity.
+tasks.withType(org.gradle.api.tasks.testing.Test).configureEach {
+    inputs.files(fileTree('src/main/cpp') {
+        include '**/*.h', '**/*.cpp', '**/*.c', 'CMakeLists.txt'
+    }).withPropertyName('nativeRecordingSourceContracts')
+            .withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
+    inputs.file(layout.projectDirectory.file('build.gradle'))
+            .withPropertyName('nativeRecordingContractBuildConfiguration')
+            .withPathSensitivity(org.gradle.api.tasks.PathSensitivity.RELATIVE)
+}

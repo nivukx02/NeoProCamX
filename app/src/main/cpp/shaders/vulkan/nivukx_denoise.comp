@@ -1,0 +1,269 @@
+#version 450
+
+#define NIVUKX_DR_ELITE 1
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) uniform readonly image2D currentLinear;
+layout(binding = 1, rgba16f) uniform readonly image2D previousAligned;
+layout(binding = 2, rgba16f) uniform writeonly image2D denoisedLinear;
+// CP20 motion-compensated temporal: live full-res Argus flow field (omniFlowFull, rg16f, pixels).
+// Bound unconditionally (foundation); only sampled when SC_TEMPORAL_MOTION_COMP is enabled.
+layout(binding = 3, rg16f) uniform readonly image2D omniFlowField;
+
+// ── Elite no-downgrade gates (default OFF → shader emits today's output bit-for-bit) ──
+// CP20 — warp the previous-frame history along true motion before the temporal blend.
+layout(constant_id = 0) const bool SC_TEMPORAL_MOTION_COMP = true; // Default ON (user-directed 2026-07-04, device-verified): motion-compensates the temporal history against the live omni flow -> reduces ghosting
+// CP21 — run the spatial bilateral inside a Generalized-Anscombe variance-stabilized domain.
+// Default ON (user-directed 2026-07-04, device-verified); spatial-only, no history/flow dependency.
+layout(constant_id = 1) const bool SC_VST_DENOISE = true;
+// CP22 — replace the speckle suppressor with a perceptual opponent-channel chroma low-pass.
+// Default ON (user-directed 2026-07-04, device-verified); spatial-only.
+layout(constant_id = 2) const bool SC_PERCEPTUAL_CHROMA = true;
+// Generalized-Anscombe coefficients from SENSOR_NOISE_PROFILE (s1-f03). Defaults reproduce the
+// shader's current implicit Poisson-Gaussian model: variance ≈ 0.0012*signal + 0.00022.
+layout(constant_id = 3) const float GAT_SIGMA_READ_SQ = 0.00022; // read-noise variance σ_read²
+layout(constant_id = 4) const float GAT_SIGMA_SHOT = 0.0012;     // shot-noise gain α (var per unit signal)
+// CP22 perceptual chroma low-pass radius (pixels).
+layout(constant_id = 5) const int CHROMA_LP_RADIUS = 3;
+
+float jzazbzLuma(vec3 rgb) {
+    return dot(rgb, vec3(0.2627, 0.6780, 0.0593));
+}
+
+float localSnrDb(float signal, float variance) {
+    float snr = max(signal, 0.000001) / sqrt(max(variance, 0.00000001));
+    return 20.0 * log2(max(snr, 0.000001)) / log2(10.0);
+}
+
+float tukeyBiweight(float residual, float cutoff) {
+    float x = residual / max(cutoff, 0.000001);
+    if (abs(x) >= 1.0) return 0.0;
+    float oneMinus = 1.0 - x * x;
+    return oneMinus * oneMinus;
+}
+
+vec3 edgeAwareSpatialDenoise(ivec2 pixel, vec3 center, float variance) {
+    ivec2 size = imageSize(currentLinear);
+    float centerJ = jzazbzLuma(center);
+    vec3 sumColor = vec3(0.0);
+    float sumWeight = 0.0;
+    for (int y = -3; y <= 3; ++y) {
+        for (int x = -3; x <= 3; ++x) {
+            ivec2 samplePixel = clamp(pixel + ivec2(x, y), ivec2(0), size - ivec2(1));
+            vec3 sampleColor = imageLoad(currentLinear, samplePixel).rgb;
+            float sampleJ = jzazbzLuma(sampleColor);
+            // HIGH-END: 7x7 bilateral window (was 5x5) with wider spatial sigma — stronger flat-area
+            // denoise while the range weight below still preserves edges.
+            float spatial = exp(-float(x * x + y * y) / 18.0);
+            float range = exp(-pow(sampleJ - centerJ, 2.0) / max(variance * 8.0, 0.000001));
+            float weight = spatial * range;
+            sumColor += sampleColor * weight;
+            sumWeight += weight;
+        }
+    }
+    return sumColor / max(sumWeight, 0.000001);
+}
+
+vec3 microTextureReinject(vec3 originalColor, vec3 cleanColor, float snrDb) {
+    float preserve = smoothstep(12.0, 24.0, snrDb);
+    vec3 residual = originalColor - cleanColor;
+    return cleanColor + residual * preserve * 0.35;
+}
+
+// ── CP21: Generalized Anscombe variance-stabilizing transform ─────────────────────
+// With gain α=GAT_SIGMA_SHOT and read variance σ²=GAT_SIGMA_READ_SQ, the generalized Anscombe
+// f(x)=(2/α)·√(αx+3/8·α²+σ²) reduces EXACTLY to the standard Anscombe 2·√(u+3/8) under the change
+// of variable u = x/α + σ²/α². So we stabilize, denoise where the noise is ≈unit-variance, then
+// apply the Mäkitalo–Foi exact unbiased inverse (not the naive algebraic inverse) on the result.
+float gatForwardScalar(float x) {
+    float u = x / GAT_SIGMA_SHOT + GAT_SIGMA_READ_SQ / (GAT_SIGMA_SHOT * GAT_SIGMA_SHOT);
+    return 2.0 * sqrt(max(u + 0.375, 0.0));
+}
+float gatInverseExactScalar(float D) {
+    float Dc = max(D, 0.0001);
+    float D2 = Dc * Dc;
+    // Exact unbiased inverse of the standard Anscombe transform (Mäkitalo & Foi 2011/2013).
+    float u = 0.25 * D2
+            + 0.25 * sqrt(1.5) / Dc
+            - 1.375 / D2
+            + 0.625 * sqrt(1.5) / (D2 * Dc)
+            - 0.125;
+    return GAT_SIGMA_SHOT * u - GAT_SIGMA_READ_SQ / GAT_SIGMA_SHOT;
+}
+vec3 gatForward3(vec3 c) {
+    return vec3(gatForwardScalar(c.r), gatForwardScalar(c.g), gatForwardScalar(c.b));
+}
+vec3 gatInverseExact3(vec3 d) {
+    return vec3(gatInverseExactScalar(d.r), gatInverseExactScalar(d.g), gatInverseExactScalar(d.b));
+}
+
+// CP21 spatial bilateral run inside the GAT-stabilized domain. The post-transform noise is ≈unit
+// variance, so the range weight uses a fixed ≈3σ sigma instead of the signal-dependent `variance`.
+vec3 edgeAwareSpatialDenoiseVst(ivec2 pixel, vec3 center) {
+    ivec2 size = imageSize(currentLinear);
+    vec3 centerG = gatForward3(center);
+    float centerGJ = jzazbzLuma(centerG);
+    vec3 sumColor = vec3(0.0);
+    float sumWeight = 0.0;
+    for (int y = -3; y <= 3; ++y) {
+        for (int x = -3; x <= 3; ++x) {
+            ivec2 samplePixel = clamp(pixel + ivec2(x, y), ivec2(0), size - ivec2(1));
+            vec3 sampleG = gatForward3(imageLoad(currentLinear, samplePixel).rgb);
+            float sampleGJ = jzazbzLuma(sampleG);
+            float spatial = exp(-float(x * x + y * y) / 18.0);
+            // Stabilized domain → uniform noise; ≈3σ range kernel (2·3² = 18).
+            float range = exp(-pow(sampleGJ - centerGJ, 2.0) / 18.0);
+            float weight = spatial * range;
+            sumColor += sampleG * weight;
+            sumWeight += weight;
+        }
+    }
+    vec3 avgG = sumColor / max(sumWeight, 0.000001);
+    return gatInverseExact3(avgG);
+}
+
+// ── CP20: bilinear sample of the previous (history) frame along the motion vector ──
+vec3 sampleHistoryBilinear(vec2 uv) {
+    ivec2 size = imageSize(previousAligned);
+    vec2 p = uv - vec2(0.5);
+    ivec2 i0 = ivec2(floor(p));
+    vec2 fr = p - vec2(i0);
+    ivec2 maxC = size - ivec2(1);
+    vec3 c00 = imageLoad(previousAligned, clamp(i0 + ivec2(0, 0), ivec2(0), maxC)).rgb;
+    vec3 c10 = imageLoad(previousAligned, clamp(i0 + ivec2(1, 0), ivec2(0), maxC)).rgb;
+    vec3 c01 = imageLoad(previousAligned, clamp(i0 + ivec2(0, 1), ivec2(0), maxC)).rgb;
+    vec3 c11 = imageLoad(previousAligned, clamp(i0 + ivec2(1, 1), ivec2(0), maxC)).rgb;
+    return mix(mix(c00, c10, fr.x), mix(c01, c11, fr.x), fr.y);
+}
+
+// ── CP22: perceptual opponent-channel chroma low-pass ─────────────────────────────
+// Decompose into luma L=jzazbzLuma(rgb) and a luma-free opponent residual c=rgb−L·𝟙 (the jzazbz
+// weights sum to 1, so dot(c, w)=0 ⇒ the residual carries zero luma). Averaging luma-free vectors
+// stays luma-free, so re-composing keeps the crisp denoised luma untouched while colour noise is
+// low-passed far more aggressively than luma (cinema "clean colour, crisp detail").
+vec3 perceptualChromaLowPass(ivec2 pixel, float lumaKeep) {
+    ivec2 size = imageSize(currentLinear);
+    vec3 sumChroma = vec3(0.0);
+    float sumW = 0.0;
+    for (int y = -CHROMA_LP_RADIUS; y <= CHROMA_LP_RADIUS; ++y) {
+        for (int x = -CHROMA_LP_RADIUS; x <= CHROMA_LP_RADIUS; ++x) {
+            ivec2 sp = clamp(pixel + ivec2(x, y), ivec2(0), size - ivec2(1));
+            vec3 s = imageLoad(currentLinear, sp).rgb;
+            vec3 chroma = s - vec3(jzazbzLuma(s));
+            float w = exp(-float(x * x + y * y) / float(2 * CHROMA_LP_RADIUS * CHROMA_LP_RADIUS + 1));
+            sumChroma += chroma * w;
+            sumW += w;
+        }
+    }
+    vec3 chromaLp = sumChroma / max(sumW, 0.000001);
+    return vec3(lumaKeep) + chromaLp; // luma exactly preserved (chromaLp is luma-free)
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(currentLinear);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    vec3 current = imageLoad(currentLinear, pixel).rgb;
+    // CP20: warp the history sample along the per-pixel Argus flow before the temporal blend so
+    // pixels are averaged along true motion trajectories (no fixed-coordinate ghosting). Default
+    // OFF → fixed-coordinate read (today's behaviour) bit-for-bit.
+    vec3 previous;
+    if (SC_TEMPORAL_MOTION_COMP) {
+        vec2 flow = imageLoad(omniFlowField, pixel).rg;
+        previous = sampleHistoryBilinear(vec2(pixel) + vec2(0.5) + flow);
+    } else {
+        previous = imageLoad(previousAligned, pixel).rgb;
+    }
+    float y = jzazbzLuma(current);
+    float variance = 0.0012 * clamp(y, 0.0, 1.0) + 0.00022;
+
+    // Perceptual luma-based motion estimation for real-time suppression of motion blur
+    float currentLuma = jzazbzLuma(current);
+    float prevLuma = jzazbzLuma(previous);
+    float lumaDelta = abs(currentLuma - prevLuma);
+
+    // TSC (Layer 7): Flow-guided temporal denoising with motion-adaptive blending
+    // 1. Calculate sudden motion outlier veto mask (ghostVetoMask)
+    // If the difference between frames exceeds the 4-sigma noise threshold, flag as ghost risk
+    float noiseSigma = sqrt(variance);
+    float ghostVetoMask = smoothstep(noiseSigma * 3.5, noiseSigma * 6.5, lumaDelta);
+
+    // 2. Spatial gradient analysis & structure tensor computation (IDPM - Layer 4 equivalent)
+    // Compute local Sobel gradients across a 3x3 window
+    // Structure tensor = outer product of the SUMMED Sobel gradient, NOT the sum
+    // of per-sample squared responses. The previous s11 += (gx*lum)^2 made a flat
+    // field read as maximum detail (Sum((gx*lum)^2) != (Sum gx*lum)^2), so DetailMask
+    // saturated everywhere and temporal averaging was cut on flats where it matters
+    // most (audit rank 5). Accumulate the gradient first, then build the tensor.
+    float gradX = 0.0, gradY = 0.0;
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 samplePixel = clamp(pixel + ivec2(dx, dy), ivec2(0), size - ivec2(1));
+
+            // Sobel kernels
+            float gx = float(dx) * (dy == 0 ? 2.0 : 1.0);
+            float gy = float(dy) * (dx == 0 ? 2.0 : 1.0);
+
+            float lum = jzazbzLuma(imageLoad(currentLinear, samplePixel).rgb);
+            gradX += gx * lum;
+            gradY += gy * lum;
+        }
+    }
+    float s11 = gradX * gradX;
+    float s12 = gradX * gradY;
+    float s22 = gradY * gradY;
+
+    // Compute eigenvalues λ1, λ2 of the averaged local structure tensor
+    float trace = s11 + s22;
+    float diff = s11 - s22;
+    float term = sqrt(diff * diff + 4.0 * s12 * s12);
+    float lambda1 = 0.5 * (trace + term);
+    float lambda2 = 0.5 * (trace - term);
+
+    // Coherent edge indicator (high lambda1, low lambda2)
+    // Isotropic microtexture indicator (high lambda1, high lambda2)
+    float detailIntensity = lambda1 + lambda2;
+    float DetailMask = smoothstep(0.015, 0.08, detailIntensity);
+    float isotropicTextured = lambda2 / max(lambda1, 0.000001);
+
+    // 3. Focus field estimation V(x,y)
+    // Estimate focus map value based on sharpness ratio and contrast gradients
+    float V = clamp(detailIntensity / max(detailIntensity + variance * 25.0, 0.0001), 0.0, 1.0);
+
+    // 4. Motion-adaptive temporal blend factor (alpha)
+    float motionSuppress = exp(-max(lumaDelta - 0.002, 0.0) * 150.0);
+    float alphaBase = 0.96 * motionSuppress;
+
+    // Apply foveated temporal scaling:
+    // Scale temporal blend down in focus domains on fine details to prevent trailing/motion blur,
+    // while keeping massive temporal blending in flat or background regions
+    float alpha = alphaBase * (1.0 - ghostVetoMask) * (1.0 - DetailMask * V * 0.72);
+
+    // Combine spatial & temporal pipelines
+    float temporalWeight = tukeyBiweight(length(current - previous), noiseSigma * 4.0) * alpha;
+    vec3 burstMerged = mix(current, previous, temporalWeight);
+    // CP21: stabilize the noise before the bilateral so a fixed-strength kernel behaves uniformly
+    // across shadows/highlights; default OFF → today's non-stabilized bilateral bit-for-bit.
+    vec3 spatial;
+    if (SC_VST_DENOISE) {
+        spatial = edgeAwareSpatialDenoiseVst(pixel, burstMerged);
+    } else {
+        spatial = edgeAwareSpatialDenoise(pixel, burstMerged, variance);
+    }
+    // CP22: aggressive perceptual chroma low-pass that leaves luma untouched; default OFF → today's
+    // microtexture-only path bit-for-bit.
+    if (SC_PERCEPTUAL_CHROMA) {
+        spatial = perceptualChromaLowPass(pixel, jzazbzLuma(spatial));
+    }
+    float snrDb = localSnrDb(y, variance);
+
+    // Reinject microtexture and write back denoised linear frame. Use burstMerged
+    // (post-temporal) as the detail reference, NOT current (raw): current-spatial
+    // carries the full per-frame noise the temporal+bilateral just removed, so
+    // reinjecting 35% of it undid the denoise on midtones/highlights (audit rank
+    // 6). burstMerged-spatial carries only the bilateral high-freq (real detail).
+    imageStore(denoisedLinear, pixel, vec4(microTextureReinject(burstMerged, spatial, snrDb), 1.0));
+}

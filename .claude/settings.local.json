@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk '{printf \"%8.1fKB  %s\\\\n\", $1/1024, $2}')",
+      "Bash(cat nivukx_vision_v1_to_v4.frag)",
+      "Bash(cat nivukx_vision_sharpen.frag)",
+      "Bash(cat ndr10_knee_curve.comp)",
+      "Bash(cat realtime_preview_enhance.comp)",
+      "Bash(node -e ' *)",
+      "Bash(xargs ls -la)",
+      "Bash(sh ./gradlew assembleDebug)",
+      "Bash(echo \"--- exit: $? ---\")",
+      "Bash(curl -sI --max-time 8 https://dl.google.com)",
+      "Bash(curl -sI --max-time 8 http://archive.ubuntu.com)",
+      "Bash(awk 'NR==1 || /[0-9]%/')",
+      "Read(//usr/lib/**)",
+      "Bash(dpkg -l)",
+      "Bash(command -v java)",
+      "Bash(java -version)",
+      "Read(//var/lib/dpkg/**)",
+      "Bash(fuser /var/lib/dpkg/lock-frontend)",
+      "Bash(timeout 180 apt-get update)",
+      "Bash(echo \"EXIT=$?\")",
+      "WebSearch",
+      "Bash(command -v uv)",
+      "Bash(command -v pipx)",
+      "Bash(command -v pip)",
+      "Bash(command -v python)",
+      "Bash(command -v python3)",
+      "Bash(uv tool *)",
+      "Bash(uv python *)",
+      "Bash(graphify --version)",
+      "Bash(graphify --help)"
+    ]
+  }
+}

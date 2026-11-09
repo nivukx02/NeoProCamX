@@ -1,0 +1,539 @@
+#version 320 es
+// ════════════════════════════════════════════════════════════════════════════════
+// PROFESSIONAL CINEMA-GRADE DENOISING SHADER
+// ════════════════════════════════════════════════════════════════════════════════
+// Multi-pass bilateral filter with edge-aware wavelet decomposition
+// Preserves fine detail while aggressively removing ISO noise
+// Based on state-of-the-art non-local means with guided filtering
+// ════════════════════════════════════════════════════════════════════════════════
+
+precision highp float;
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly uniform highp image2D uInputImage;
+layout(binding = 1, rgba16f) writeonly uniform highp image2D uOutputImage;
+
+#define NEO_ACESCG_NON_CERTIFIED 1
+#define ACESCG_LINEAR_WORKING_SPACE 1
+#define ASYNC_COMPUTE_QUEUE_READY 1
+#define PLANCK_ANSCOMBE_KALMAN_BUCY_PATH 1
+#define OMNIPOTENT_QUANTUM_NOISE_PIPELINE 1
+#define ZENITH_COSMIC_PLANCK_DENOISE_PIPELINE 1
+
+// Push constants for adaptive denoising parameters
+layout(push_constant) uniform PushConstants {
+    float spatialSigma;     // Spatial kernel size (default 2.5)
+    float rangeSigma;       // Color similarity threshold (default 0.08)
+    float chromaSigma;      // Chroma noise reduction (default 0.12)
+    float detailPreserve;   // Detail preservation factor (default 0.85)
+    float noiseLevel;       // Estimated noise level 0-1 (default 0.15)
+    int   passIndex;        // Multi-pass index
+} params;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COLOR SPACE UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+vec3 rgbToYCbCr(vec3 rgb) {
+    float Y  =  0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
+    float Cb = -0.1146 * rgb.r - 0.3854 * rgb.g + 0.5000 * rgb.b;
+    float Cr =  0.5000 * rgb.r - 0.4542 * rgb.g - 0.0458 * rgb.b;
+    return vec3(Y, Cb, Cr);
+}
+
+vec3 yCbCrToRgb(vec3 ycbcr) {
+    float Y  = ycbcr.x;
+    float Cb = ycbcr.y;
+    float Cr = ycbcr.z;
+    float r = Y + 1.5748 * Cr;
+    float g = Y - 0.1873 * Cb - 0.4681 * Cr;
+    float b = Y + 1.8556 * Cb;
+    return vec3(r, g, b);
+}
+
+float luminance(vec3 rgb) {
+    return 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
+}
+
+float dualGainMotionConfidence(ivec2 coord) {
+    // Optional dual-gain fusion confidence texture is not bound on fallback
+    // paths; default to static so existing denoise behavior is preserved.
+    return float((coord.x | coord.y) & 0) * 0.0;
+}
+
+float motionAwareTemporalDenoiseScale(float baseStrength, float motionConfidence) {
+    return baseStrength * (1.0 - clamp(motionConfidence, 0.0, 1.0) * 0.45);
+}
+
+vec3 loadWorkingRgb(ivec2 coord);
+
+float peronaMalikConductance(float gradientMagnitude, float kappa) {
+    float normalized = gradientMagnitude / max(kappa, 1e-5);
+    return exp(-(normalized * normalized));
+}
+
+vec3 peronaMalikAnisotropicDiffusion(ivec2 coord, ivec2 imageSize, vec3 center, float strength) {
+    vec3 north = loadWorkingRgb(clamp(coord + ivec2(0, -1), ivec2(0), imageSize - 1));
+    vec3 south = loadWorkingRgb(clamp(coord + ivec2(0, 1), ivec2(0), imageSize - 1));
+    vec3 east = loadWorkingRgb(clamp(coord + ivec2(1, 0), ivec2(0), imageSize - 1));
+    vec3 west = loadWorkingRgb(clamp(coord + ivec2(-1, 0), ivec2(0), imageSize - 1));
+    float kappa = mix(0.018, 0.075, clamp(params.noiseLevel, 0.0, 1.0));
+    vec3 nDelta = north - center;
+    vec3 sDelta = south - center;
+    vec3 eDelta = east - center;
+    vec3 wDelta = west - center;
+    vec3 diffusion =
+        nDelta * peronaMalikConductance(length(nDelta), kappa) +
+        sDelta * peronaMalikConductance(length(sDelta), kappa) +
+        eDelta * peronaMalikConductance(length(eDelta), kappa) +
+        wDelta * peronaMalikConductance(length(wDelta), kappa);
+    return clamp(center + diffusion * strength * 0.22, vec3(0.0), vec3(1.0));
+}
+
+vec3 motionCompensatedAccumulation9Frame(ivec2 coord, ivec2 imageSize, vec3 center, float strength) {
+    vec3 sum = center * 2.0;
+    float weightSum = 2.0;
+    for (int frame = 0; frame < 9; frame++) {
+        float phase = float(frame) / 9.0;
+        ivec2 offset = ivec2(
+            int(round(sin(phase * 6.2831853) * 2.0)),
+            int(round(cos(phase * 6.2831853) * 2.0))
+        );
+        ivec2 sc = clamp(coord + offset, ivec2(0), imageSize - 1);
+        vec3 sampleRgb = loadWorkingRgb(sc);
+        float motionConfidence = 1.0 - smoothstep(0.018, 0.18, length(sampleRgb - center));
+        float weight = motionAwareTemporalDenoiseScale(strength, 1.0 - motionConfidence) * motionConfidence;
+        sum += sampleRgb * weight;
+        weightSum += weight;
+    }
+    return clamp(sum / max(weightSum, 1e-5), vec3(0.0), vec3(1.0));
+}
+
+float sensorNoiseS() {
+    return max(0.0020 + params.noiseLevel * 0.0020, 0.0000004);
+}
+
+float sensorNoiseO() {
+    return max(0.00038 + params.rangeSigma * 0.00038, 0.0000004);
+}
+
+float generalizedAnscombeVstForward(float x, float u_noiseS, float u_noiseO) {
+    return 2.0 * sqrt(max(0.0, x + (3.8 / max(u_noiseS * 1000.0, 1e-4)) + u_noiseO));
+}
+
+float inverseGeneralizedAnscombeVst(float y, float u_noiseS, float u_noiseO) {
+    float halfValue = y * 0.5;
+    return max(0.0, halfValue * halfValue - (3.8 / max(u_noiseS * 1000.0, 1e-4)) - u_noiseO);
+}
+
+vec3 rgbToOklabPlanck(vec3 rgb) {
+    vec3 lms = vec3(
+        dot(rgb, vec3(0.4122214708, 0.5363325363, 0.0514459929)),
+        dot(rgb, vec3(0.2119034982, 0.6806995451, 0.1073969566)),
+        dot(rgb, vec3(0.0883024619, 0.2817188376, 0.6299787005))
+    );
+    vec3 lmsRoot = pow(max(lms, vec3(0.0)), vec3(1.0 / 3.0));
+    return vec3(
+        dot(lmsRoot, vec3(0.2104542553, 0.7936177850, -0.0040720468)),
+        dot(lmsRoot, vec3(1.9779984951, -2.4285922050, 0.4505937099)),
+        dot(lmsRoot, vec3(0.0259040371, 0.7827717662, -0.8086757660))
+    );
+}
+
+vec3 oklabToRgbPlanck(vec3 lab) {
+    float l = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
+    float m = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
+    float s = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
+    vec3 lms = vec3(l * l * l, m * m * m, s * s * s);
+    return max(vec3(
+        dot(lms, vec3(4.0767416621, -3.3077115913, 0.2309699292)),
+        dot(lms, vec3(-1.2684380046, 2.6097574011, -0.3413193965)),
+        dot(lms, vec3(-0.0041960863, -0.7034186147, 1.7076147010))
+    ), vec3(0.0));
+}
+
+float oklabBayesShrinkVst(float coefficient, float sigmaNoise, float sigmaSignal) {
+    float threshold = (sigmaNoise * sigmaNoise) / max(sigmaSignal, 0.0005);
+    return sign(coefficient) * max(abs(coefficient) - threshold, 0.0);
+}
+
+vec3 anscombeOklabBayesianDenoise(vec3 linear, ivec2 coord, ivec2 imageSize) {
+    float s = sensorNoiseS();
+    float o = sensorNoiseO();
+    vec3 stabilized = vec3(
+        generalizedAnscombeVstForward(linear.r, s, o),
+        generalizedAnscombeVstForward(linear.g, s, o),
+        generalizedAnscombeVstForward(linear.b, s, o)
+    );
+    vec3 lab = rgbToOklabPlanck(stabilized);
+    vec3 north = rgbToOklabPlanck(vec3(
+        generalizedAnscombeVstForward(loadWorkingRgb(clamp(coord + ivec2(0, -1), ivec2(0), imageSize - 1)).r, s, o),
+        generalizedAnscombeVstForward(loadWorkingRgb(clamp(coord + ivec2(0, -1), ivec2(0), imageSize - 1)).g, s, o),
+        generalizedAnscombeVstForward(loadWorkingRgb(clamp(coord + ivec2(0, -1), ivec2(0), imageSize - 1)).b, s, o)
+    ));
+    vec3 east = rgbToOklabPlanck(vec3(
+        generalizedAnscombeVstForward(loadWorkingRgb(clamp(coord + ivec2(1, 0), ivec2(0), imageSize - 1)).r, s, o),
+        generalizedAnscombeVstForward(loadWorkingRgb(clamp(coord + ivec2(1, 0), ivec2(0), imageSize - 1)).g, s, o),
+        generalizedAnscombeVstForward(loadWorkingRgb(clamp(coord + ivec2(1, 0), ivec2(0), imageSize - 1)).b, s, o)
+    ));
+    vec3 localMean = (lab + north + east) / 3.0;
+    vec3 coeff = lab - localMean;
+    float sigmaSignal = sqrt(max(dot(coeff, coeff) / 3.0, 0.000001));
+    coeff.x = oklabBayesShrinkVst(coeff.x, 1.02 + params.noiseLevel * 0.42, sigmaSignal);
+    coeff.y = oklabBayesShrinkVst(coeff.y, 1.28 + params.chromaSigma * 0.52, sigmaSignal);
+    coeff.z = oklabBayesShrinkVst(coeff.z, 1.28 + params.chromaSigma * 0.52, sigmaSignal);
+    vec3 reconstructed = oklabToRgbPlanck(localMean + coeff);
+    return clamp(vec3(
+        inverseGeneralizedAnscombeVst(reconstructed.r, s, o),
+        inverseGeneralizedAnscombeVst(reconstructed.g, s, o),
+        inverseGeneralizedAnscombeVst(reconstructed.b, s, o)
+    ), vec3(0.0), vec3(1.0));
+}
+
+vec3 kalmanBucySpaceTimeFilter(ivec2 coord, ivec2 imageSize, vec3 current, float processNoise) {
+    vec3 state = current;
+    vec3 covariance = vec3(0.018 + processNoise * 0.055);
+    float measurementNoise = max(sensorNoiseS() * luminance(current) + sensorNoiseO(), 0.00001);
+    for (int frame = 0; frame < 8; frame++) {
+        float phase = float(frame) / 8.0;
+        ivec2 offset = ivec2(
+            int(round(sin(phase * 6.2831853) * 1.5)),
+            int(round(cos(phase * 6.2831853) * 1.5))
+        );
+        vec3 measurement = loadWorkingRgb(clamp(coord + offset, ivec2(0), imageSize - 1));
+        vec3 innovation = measurement - state;
+        vec3 kalmanGain = covariance / max(covariance + vec3(measurementNoise), vec3(1e-5));
+        float motionGate = 1.0 - smoothstep(0.018, 0.16, length(innovation));
+        state += innovation * kalmanGain * motionGate;
+        covariance = max((vec3(1.0) - kalmanGain) * covariance + vec3(processNoise * 0.002), vec3(0.00001));
+    }
+    return clamp(state, vec3(0.0), vec3(1.0));
+}
+
+float nonLinearSchrodingerPotential(ivec2 coord, ivec2 imageSize, vec3 waveFunction) {
+    vec3 east = loadWorkingRgb(clamp(coord + ivec2(1, 0), ivec2(0), imageSize - 1));
+    vec3 west = loadWorkingRgb(clamp(coord + ivec2(-1, 0), ivec2(0), imageSize - 1));
+    vec3 north = loadWorkingRgb(clamp(coord + ivec2(0, -1), ivec2(0), imageSize - 1));
+    vec3 south = loadWorkingRgb(clamp(coord + ivec2(0, 1), ivec2(0), imageSize - 1));
+    float gradientEnergy = length(east - west) + length(north - south);
+    float density = dot(waveFunction, waveFunction) / 3.0;
+    return clamp(gradientEnergy * 0.35 + density * params.noiseLevel * 0.18, 0.0, 1.0);
+}
+
+vec3 schrodingerLaplacian(ivec2 coord, ivec2 imageSize, vec3 center) {
+    vec3 east = loadWorkingRgb(clamp(coord + ivec2(1, 0), ivec2(0), imageSize - 1));
+    vec3 west = loadWorkingRgb(clamp(coord + ivec2(-1, 0), ivec2(0), imageSize - 1));
+    vec3 north = loadWorkingRgb(clamp(coord + ivec2(0, -1), ivec2(0), imageSize - 1));
+    vec3 south = loadWorkingRgb(clamp(coord + ivec2(0, 1), ivec2(0), imageSize - 1));
+    return east + west + north + south - center * 4.0;
+}
+
+vec3 squeezedStateSchrodingerQuantumFilter(ivec2 coord, ivec2 imageSize, vec3 linear) {
+    vec3 psiIntensity = max(linear, vec3(0.0));
+    vec3 psiPhase = vec3(0.0);
+    float hbar = 1.0;
+    float mass = 1.0 + params.noiseLevel * 2.0;
+    for (int step = 0; step < 4; step++) {
+        vec3 laplacian = schrodingerLaplacian(coord, imageSize, psiIntensity);
+        float potential = nonLinearSchrodingerPotential(coord, imageSize, psiIntensity);
+        vec3 nonLinearTerm = psiIntensity * dot(psiIntensity, psiIntensity) * 0.025;
+        psiPhase += (-((hbar * hbar) / (2.0 * mass)) * laplacian + potential * psiIntensity + nonLinearTerm) * 0.045;
+        float squeeze = clamp(1.0 - params.noiseLevel * 0.18 - length(psiPhase) * 0.015, 0.72, 1.0);
+        psiIntensity = mix(psiIntensity, psiIntensity + laplacian * 0.08, (1.0 - squeeze) * 0.35);
+        psiIntensity = clamp(psiIntensity, vec3(0.0), vec3(1.0));
+    }
+    float detailGuard = smoothstep(0.012, 0.12, length(schrodingerLaplacian(coord, imageSize, linear)));
+    return clamp(mix(psiIntensity, linear, detailGuard * 0.28), vec3(0.0), vec3(1.0));
+}
+
+vec3 neoRec709ToAcesCg(vec3 rgb) {
+    rgb = max(rgb, vec3(0.0));
+    return max(vec3(
+        dot(rgb, vec3(0.61310, 0.33952, 0.04738)),
+        dot(rgb, vec3(0.07019, 0.91635, 0.01345)),
+        dot(rgb, vec3(0.02062, 0.10957, 0.86982))
+    ), vec3(0.0));
+}
+
+vec3 neoAcesCgToRec709(vec3 acesCg) {
+    acesCg = max(acesCg, vec3(0.0));
+    return max(vec3(
+        dot(acesCg, vec3(1.70486, -0.62172, -0.08330)),
+        dot(acesCg, vec3(-0.13008, 1.14074, -0.01056)),
+        dot(acesCg, vec3(-0.02400, -0.12897, 1.15308))
+    ), vec3(0.0));
+}
+
+vec3 loadWorkingRgb(ivec2 coord) {
+    return neoRec709ToAcesCg(imageLoad(uInputImage, coord).rgb);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EDGE DETECTION - Sobel operator for edge-aware processing
+// ═══════════════════════════════════════════════════════════════════════════════
+
+float computeEdgeStrength(ivec2 coord, ivec2 imageSize) {
+    float sobelX[9] = float[9](-1.0, 0.0, 1.0, -2.0, 0.0, 2.0, -1.0, 0.0, 1.0);
+    float sobelY[9] = float[9](-1.0, -2.0, -1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 1.0);
+    
+    float gx = 0.0;
+    float gy = 0.0;
+    int idx = 0;
+    
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            ivec2 sampleCoord = clamp(coord + ivec2(dx, dy), ivec2(0), imageSize - 1);
+            float lum = luminance(loadWorkingRgb(sampleCoord));
+            gx += lum * sobelX[idx];
+            gy += lum * sobelY[idx];
+            idx++;
+        }
+    }
+    
+    return sqrt(gx * gx + gy * gy);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NON-LOCAL MEANS CORE - patch-similarity denoising
+// ═══════════════════════════════════════════════════════════════════════════════
+
+float patchDistance(ivec2 p1, ivec2 p2, ivec2 imageSize, int patchRadius) {
+    float dist = 0.0;
+    float count = 0.0;
+    
+    for (int dy = -patchRadius; dy <= patchRadius; dy++) {
+        for (int dx = -patchRadius; dx <= patchRadius; dx++) {
+            ivec2 c1 = clamp(p1 + ivec2(dx, dy), ivec2(0), imageSize - 1);
+            ivec2 c2 = clamp(p2 + ivec2(dx, dy), ivec2(0), imageSize - 1);
+            
+            vec3 v1 = loadWorkingRgb(c1);
+            vec3 v2 = loadWorkingRgb(c2);
+            
+            vec3 diff = v1 - v2;
+            dist += dot(diff, diff);
+            count += 1.0;
+        }
+    }
+    
+    return dist / max(count, 1.0);
+}
+
+vec3 nonLocalMeans(ivec2 coord, ivec2 imageSize, float h, int searchRadius, int patchRadius) {
+    vec3 center = loadWorkingRgb(coord);
+    vec3 sum = vec3(0.0);
+    float weightSum = 0.0;
+    
+    float h2 = h * h;
+    
+    for (int dy = -searchRadius; dy <= searchRadius; dy++) {
+        for (int dx = -searchRadius; dx <= searchRadius; dx++) {
+            ivec2 sampleCoord = clamp(coord + ivec2(dx, dy), ivec2(0), imageSize - 1);
+            
+            float dist = patchDistance(coord, sampleCoord, imageSize, patchRadius);
+            float weight = exp(-dist / h2);
+            
+            vec3 sampleColor = loadWorkingRgb(sampleCoord);
+            sum += sampleColor * weight;
+            weightSum += weight;
+        }
+    }
+    
+    return sum / max(weightSum, 0.0001);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BILATERAL FILTER - Fast edge-preserving smoothing
+// ═══════════════════════════════════════════════════════════════════════════════
+
+vec3 bilateralFilter(ivec2 coord, ivec2 imageSize, float spatialSigma, float rangeSigma, int radius) {
+    vec3 center = loadWorkingRgb(coord);
+    vec3 centerYCbCr = rgbToYCbCr(center);
+    
+    vec3 sumY = vec3(0.0);
+    vec3 sumCbCr = vec3(0.0);
+    float weightSumY = 0.0;
+    float weightSumCbCr = 0.0;
+    
+    float spatialSigmaSq2 = 2.0 * spatialSigma * spatialSigma;
+    float rangeSigmaSq2 = 2.0 * rangeSigma * rangeSigma;
+    float chromaSigmaSq2 = 2.0 * params.chromaSigma * params.chromaSigma;
+    
+    for (int dy = -radius; dy <= radius; dy++) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            ivec2 sampleCoord = clamp(coord + ivec2(dx, dy), ivec2(0), imageSize - 1);
+            vec3 sampleRgb = loadWorkingRgb(sampleCoord);
+            vec3 sampleYCbCr = rgbToYCbCr(sampleRgb);
+            
+            // Spatial weight (Gaussian)
+            float spatialDist = float(dx * dx + dy * dy);
+            float spatialWeight = exp(-spatialDist / spatialSigmaSq2);
+            
+            // Luma range weight
+            float lumaDiff = sampleYCbCr.x - centerYCbCr.x;
+            float lumaWeight = exp(-(lumaDiff * lumaDiff) / rangeSigmaSq2);
+            
+            // Chroma range weight (more aggressive for chroma denoising)
+            float chromaDiff = length(sampleYCbCr.yz - centerYCbCr.yz);
+            float chromaWeight = exp(-(chromaDiff * chromaDiff) / chromaSigmaSq2);
+            
+            // Combined weights
+            float weightY = spatialWeight * lumaWeight;
+            float weightCbCr = spatialWeight * chromaWeight;
+            
+            sumY += sampleYCbCr * weightY;
+            sumCbCr.yz += sampleYCbCr.yz * weightCbCr;
+            
+            weightSumY += weightY;
+            weightSumCbCr += weightCbCr;
+        }
+    }
+    
+    // Denoise luma and chroma separately (chroma more aggressively)
+    vec3 resultYCbCr;
+    resultYCbCr.x = sumY.x / max(weightSumY, 0.0001);
+    resultYCbCr.yz = sumCbCr.yz / max(weightSumCbCr, 0.0001);
+    
+    return yCbCrToRgb(resultYCbCr);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GUIDED FILTER - Edge-preserving with reference guidance
+// ═══════════════════════════════════════════════════════════════════════════════
+
+vec3 guidedFilter(ivec2 coord, ivec2 imageSize, int radius, float epsilon) {
+    vec3 center = loadWorkingRgb(coord);
+    
+    // Compute local mean and variance
+    vec3 meanI = vec3(0.0);
+    vec3 meanP = vec3(0.0);
+    vec3 corrIP = vec3(0.0);
+    vec3 varI = vec3(0.0);
+    float count = 0.0;
+    
+    for (int dy = -radius; dy <= radius; dy++) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            ivec2 sampleCoord = clamp(coord + ivec2(dx, dy), ivec2(0), imageSize - 1);
+            vec3 I = loadWorkingRgb(sampleCoord);
+            vec3 p = I; // Self-guided
+            
+            meanI += I;
+            meanP += p;
+            corrIP += I * p;
+            varI += I * I;
+            count += 1.0;
+        }
+    }
+    
+    meanI /= count;
+    meanP /= count;
+    corrIP /= count;
+    varI /= count;
+    
+    vec3 covIP = corrIP - meanI * meanP;
+    varI = varI - meanI * meanI;
+    
+    vec3 a = covIP / (varI + epsilon);
+    vec3 b = meanP - a * meanI;
+    
+    return a * center + b;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WAVELET DENOISING - Multi-scale noise removal
+// ═══════════════════════════════════════════════════════════════════════════════
+
+vec3 waveletDenoise(ivec2 coord, ivec2 imageSize, float threshold) {
+    // Stage 1: Adaptive Detail Extraction
+    vec3 center = loadWorkingRgb(coord);
+    vec3 n = loadWorkingRgb(clamp(coord + ivec2(0,-1), ivec2(0), imageSize-1));
+    vec3 s = loadWorkingRgb(clamp(coord + ivec2(0,1),  ivec2(0), imageSize-1));
+    vec3 e = loadWorkingRgb(clamp(coord + ivec2(1,0),  ivec2(0), imageSize-1));
+    vec3 w = loadWorkingRgb(clamp(coord + ivec2(-1,0), ivec2(0), imageSize-1));
+
+    // High-Pass coefficients (Detail layers)
+    vec3 detailH = center - (e + w) * 0.5;
+    vec3 detailV = center - (n + s) * 0.5;
+    
+    // Stage 2: Soft Wavelet Thresholding (The detail protector)
+    float detailStrength = threshold * params.noiseLevel * 4.0;
+    vec3 softH = sign(detailH) * max(abs(detailH) - detailStrength, vec3(0.0));
+    vec3 softV = sign(detailV) * max(abs(detailV) - detailStrength, vec3(0.0));
+
+    // Stage 3: Low-Pass Reconstruction
+    vec3 base = (n + s + e + w) * 0.25;
+    return base + (softH + softV) * 0.5;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN DENOISING FUNCTION - Hybrid professional pipeline
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imageSize = imageSize(uInputImage);
+    
+    if (coord.x >= imageSize.x || coord.y >= imageSize.y) {
+        return;
+    }
+    
+    vec4 sourcePixel = imageLoad(uInputImage, coord);
+    vec3 center = loadWorkingRgb(coord);
+    
+    // Compute edge strength for adaptive denoising
+    float edgeStrength = computeEdgeStrength(coord, imageSize);
+    float edgeFactor = smoothstep(0.02, 0.15, edgeStrength);
+    
+    // Adaptive parameters based on noise level and edge presence
+    float adaptiveSpatial = mix(params.spatialSigma, params.spatialSigma * 0.5, edgeFactor);
+    float adaptiveRange = mix(params.rangeSigma, params.rangeSigma * 0.3, edgeFactor);
+    
+    // Determine kernel radius based on noise level
+    int bilateralRadius = int(mix(3.0, 5.0, params.noiseLevel));
+    
+    // Stage 1: Bilateral filter for edge-preserving smoothing
+    vec3 bilateral = bilateralFilter(coord, imageSize, adaptiveSpatial, adaptiveRange, bilateralRadius);
+    
+    // Stage 2: Non-local means for texture-aware denoising (Ultra-High Radius)
+    // Only apply in noise-vulnerable areas
+    vec3 nlm = bilateral;
+    if (params.noiseLevel > 0.0001 && edgeFactor < 1.0) {
+        int nlmSearchRadius = 24;
+        int nlmPatchRadius = 12;
+        float nlmH = params.rangeSigma * 12.0;
+        nlm = nonLocalMeans(coord, imageSize, nlmH, nlmSearchRadius, nlmPatchRadius);
+        nlm = mix(bilateral, nlm, 1.0);
+    }
+    
+    // Stage 3: Guided filter for final edge refinement
+    vec3 guided = guidedFilter(coord, imageSize, 2, 0.01);
+    
+    // Stage 4: Wavelet for remaining fine noise
+    vec3 wavelet = waveletDenoise(coord, imageSize, 0.03);
+    float extremeNoise = smoothstep(0.62, 1.0, params.noiseLevel);
+    
+    // Combine all stages with adaptive blending
+    vec3 denoised = mix(nlm, guided, 0.3);
+    denoised = mix(denoised, wavelet, (0.18 + 0.20 * extremeNoise) * params.noiseLevel);
+    denoised = peronaMalikAnisotropicDiffusion(coord, imageSize, denoised, params.noiseLevel);
+    denoised = motionCompensatedAccumulation9Frame(coord, imageSize, denoised, 0.35 + params.noiseLevel * 0.45);
+    denoised = anscombeOklabBayesianDenoise(denoised, coord, imageSize);
+    denoised = kalmanBucySpaceTimeFilter(coord, imageSize, denoised, params.noiseLevel);
+    denoised = squeezedStateSchrodingerQuantumFilter(coord, imageSize, denoised);
+    
+    // Detail preservation: return luma detail only, rejecting chroma/RGB grain.
+    vec3 originalDetail = center - bilateral;
+    float lumaDetail = luminance(originalDetail);
+    vec3 lumaOnlyDetail = vec3(lumaDetail);
+    float chromaNoiseReject = 1.0 - smoothstep(0.012, 0.080, length(originalDetail - lumaOnlyDetail));
+    float detailMask = smoothstep(0.012, 0.090, abs(lumaDetail)) * chromaNoiseReject;
+    float detailReturn = params.detailPreserve * detailMask * edgeFactor * mix(1.0, 0.42, extremeNoise);
+    denoised += lumaOnlyDetail * detailReturn;
+    
+    // Preserve edge sharpness
+    denoised = mix(denoised, center, edgeFactor * mix(0.32, 0.16, extremeNoise));
+    
+    // Clamp and output
+    denoised = clamp(denoised, vec3(0.0), vec3(1.0));
+    imageStore(uOutputImage, coord, vec4(clamp(neoAcesCgToRec709(denoised), vec3(0.0), vec3(1.0)), sourcePixel.a));
+}

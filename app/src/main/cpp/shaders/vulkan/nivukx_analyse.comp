@@ -1,0 +1,113 @@
+#version 450
+
+#define NIVUKX_DR_ELITE 1
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) uniform readonly image2D inputLinearAces;
+layout(binding = 1) buffer HistogramBuffer {
+    uint histogram[256];
+    float percentileP01;
+    float percentileP10;
+    float percentileP50;
+    float percentileP90;
+    float percentileP99;
+    float percentileP999;
+    float percentileP9999;
+    vec4 rtileDeltas[];
+};
+layout(binding = 2) buffer SaliencyBuffer {
+    uint saliencyClass[];
+};
+
+float bt2100Luma(vec3 linearRgb) {
+    return dot(linearRgb, vec3(0.2627, 0.6780, 0.0593));
+}
+
+uint luminanceBin(float nits) {
+    float pqLike = clamp(log2(max(nits, 0.0001)) / log2(10000.0), 0.0, 1.0);
+    return uint(clamp(round(pqLike * 255.0), 0.0, 255.0));
+}
+
+uint classifySaliency(vec3 linearRgb, float nits) {
+    float maxChannel = max(max(linearRgb.r, linearRgb.g), linearRgb.b);
+    float minChannel = min(min(linearRgb.r, linearRgb.g), linearRgb.b);
+    float saturation = (maxChannel - minChannel) / max(maxChannel, 0.0001);
+    if (nits > 2500.0) return 4u;
+    if (linearRgb.r > linearRgb.g * 1.12 && linearRgb.g > linearRgb.b * 0.86 && nits > 60.0 && nits < 320.0) return 1u;
+    if (linearRgb.b > linearRgb.r * 1.18 && linearRgb.b > linearRgb.g * 0.92) return 2u;
+    if (linearRgb.g > linearRgb.r * 1.05 && linearRgb.g > linearRgb.b * 1.08) return 3u;
+    if (saturation > 0.85 && nits > 180.0) return 6u;
+    return 9u;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inputLinearAces);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    vec3 rgb = max(imageLoad(inputLinearAces, pixel).rgb, vec3(0.0));
+    float nits = bt2100Luma(rgb) * 10000.0;
+    atomicAdd(histogram[luminanceBin(nits)], 1u);
+
+    ivec2 tileCount = max((size + ivec2(15)) / ivec2(16), ivec2(1));
+    ivec2 tile = min(pixel / ivec2(16), tileCount - ivec2(1));
+    uint tileIndex = uint(tile.y * tileCount.x + tile.x);
+    // FIX #15 (per-tile write race): a 16x16 tile is covered by up to 256 invocations that all
+    // previously wrote the SAME rtileDeltas/saliencyClass slot non-atomically — a last-writer-wins
+    // data race that made the tile saliency nondeterministic. Elect a single well-defined writer per
+    // output cell: the tile-origin pixel (top-left pixel of each 16x16 tile, i.e. coordinates
+    // divisible by 16). Every valid tile has exactly one in-bounds origin invocation, so each cell is
+    // now written exactly once, deterministically. Buffer layout is unchanged.
+    if ((pixel.x % 16) == 0 && (pixel.y % 16) == 0) {
+        rtileDeltas[tileIndex] = vec4(0.0, 0.0, 0.0, 1.0);
+        saliencyClass[tileIndex] = classifySaliency(rgb, nits);
+    }
+
+    // FIX #15 (real percentiles): the P01..P9999 outputs were hardcoded placeholder constants
+    // (0.01/0.10/0.50/0.90/0.99/0.999/0.9999) that never reflected scene content. Reduce them from
+    // the luminance histogram instead: a single invocation (global 0,0) walks the cumulative
+    // distribution once and, for each target fraction, records the normalized luminance (bin/255) at
+    // which the CDF first reaches that fraction. The targets are ascending, so one scan resolves all.
+    //
+    // CORRECTNESS NOTE: a single compute dispatch gives NO cross-workgroup completion ordering, so
+    // histogram[] is only fully populated once this whole dispatch retires. This reduction is exact
+    // only when the histogram is complete — i.e. it must run as a SECOND pass over a histogram filled
+    // by a prior build dispatch (the standard two-pass histogram->reduce pattern), and that build
+    // pass must have cleared histogram[] beforehand. This shader is currently a dormant foundation
+    // (no dispatcher references it), so the note documents the wiring contract for when it is wired.
+    if (pixel.x == 0 && pixel.y == 0) {
+        uint total = 0u;
+        for (int b = 0; b < 256; ++b) {
+            total += histogram[b];
+        }
+        float targets[7] = float[7](0.01, 0.10, 0.50, 0.90, 0.99, 0.999, 0.9999);
+        float results[7] = float[7](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        if (total > 0u) {
+            float invTotal = 1.0 / float(total);
+            uint cumulative = 0u;
+            int t = 0;
+            for (int b = 0; b < 256 && t < 7; ++b) {
+                cumulative += histogram[b];
+                float cdf = float(cumulative) * invTotal;
+                // A single populated bin can satisfy several consecutive percentile targets.
+                while (t < 7 && cdf >= targets[t]) {
+                    results[t] = float(b) / 255.0;
+                    ++t;
+                }
+            }
+            // Any target not reached (numerical edge as cdf approaches 1) clamps to peak luminance.
+            while (t < 7) {
+                results[t] = 1.0;
+                ++t;
+            }
+        }
+        percentileP01 = results[0];
+        percentileP10 = results[1];
+        percentileP50 = results[2];
+        percentileP90 = results[3];
+        percentileP99 = results[4];
+        percentileP999 = results[5];
+        percentileP9999 = results[6];
+    }
+}

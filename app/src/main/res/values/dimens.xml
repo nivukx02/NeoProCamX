@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="space_1">4dp</dimen>
+    <dimen name="space_2">8dp</dimen>
+    <dimen name="space_3">12dp</dimen>
+    <dimen name="space_4">16dp</dimen>
+    <dimen name="space_5">20dp</dimen>
+    <dimen name="space_6">24dp</dimen>
+    <dimen name="space_7">28dp</dimen>
+    <dimen name="space_8">32dp</dimen>
+
+    <dimen name="radius_m">14dp</dimen>
+    <dimen name="radius_l">18dp</dimen>
+    <dimen name="radius_xl">24dp</dimen>
+    <dimen name="radius_xxl">30dp</dimen>
+
+    <dimen name="touch_target">48dp</dimen>
+    <dimen name="icon_touch_target">48dp</dimen>
+    <dimen name="camera_dock_panel_width">280dp</dimen>
+    <dimen name="camera_dock_panel_height">86dp</dimen>
+    <dimen name="camera_dock_panel_radius">43dp</dimen>
+    <dimen name="camera_dock_bottom_margin">76dp</dimen>
+    <dimen name="camera_dock_button">50dp</dimen>
+    <dimen name="camera_dock_icon_padding">6dp</dimen>
+    <dimen name="shutter_outer_size">68dp</dimen>
+    <dimen name="shutter_inner_size">48dp</dimen>
+    <dimen name="top_sensor_dock_height">40dp</dimen>
+    <dimen name="top_sensor_dock_min_width">224dp</dimen>
+    <dimen name="top_sensor_dock_margin_top">16dp</dimen>
+    <dimen name="top_sensor_dock_padding_horizontal">8dp</dimen>
+    <dimen name="runtime_health_chip_min_height">20dp</dimen>
+    <dimen name="sensor_dock_preview_gap">8dp</dimen>
+    <dimen name="bottom_capture_panel_height">236dp</dimen>
+    <dimen name="mode_rail_height">52dp</dimen>
+    <dimen name="mode_rail_preview_gap">24dp</dimen>
+    <dimen name="camera_dock_mode_gap">8dp</dimen>
+    <dimen name="camera_dock_lower_stack_lift">24dp</dimen>
+    <dimen name="mode_rail_item_width">84dp</dimen>
+    <dimen name="mode_rail_item_height">32dp</dimen>
+    <dimen name="manual_controller_height">174dp</dimen>
+</resources>

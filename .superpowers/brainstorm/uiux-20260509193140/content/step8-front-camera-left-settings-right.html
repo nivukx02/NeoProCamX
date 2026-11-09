@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NeoProCamX Bottom Buttons Updated</title>
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #090909;
+      overflow: hidden;
+    }
+
+    iframe {
+      width: min(430px, 100vw);
+      height: min(932px, 100vh);
+      border: 0;
+      background: #000;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <iframe id="layout" src="/files/step6-center-mode-access-no-extra-slide-ui.html" title="NeoProCamX updated bottom buttons"></iframe>
+  <script>
+    const frame = document.getElementById('layout');
+
+    frame.addEventListener('load', () => {
+      const doc = frame.contentDocument;
+      const proOverlay = doc.querySelector('.pro-overlay');
+      const preview = doc.querySelector('.preview');
+      const leftButton = doc.querySelector('.thumb');
+      const rightButton = doc.querySelector('.switch');
+      const style = doc.createElement('style');
+
+      style.textContent = `
+        .thumb {
+          width: 54px !important;
+          height: 54px !important;
+          justify-self: start !important;
+          border-radius: 50% !important;
+          display: grid !important;
+          place-items: center !important;
+          background: rgba(255,255,255,.12) !important;
+          border: 1px solid rgba(255,255,255,.16) !important;
+        }
+
+        .thumb svg,
+        .switch svg {
+          width: 28px !important;
+          height: 28px !important;
+          stroke: #fff !important;
+          fill: none !important;
+          stroke-width: 2.4 !important;
+          stroke-linecap: round !important;
+          stroke-linejoin: round !important;
+        }
+      `;
+      doc.head.appendChild(style);
+
+      if (proOverlay) {
+        proOverlay.style.bottom = '184px';
+        proOverlay.style.height = '174px';
+        proOverlay.style.borderBottom = '1px solid rgba(255,255,255,.14)';
+      }
+
+      if (preview) {
+        preview.style.inset = '0 0 184px';
+      }
+
+      if (leftButton) {
+        leftButton.setAttribute('aria-label', 'Front camera');
+        leftButton.innerHTML = `
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M20 11a8 8 0 0 0-14.7-4.4"/>
+            <path d="M4 7V3h4"/>
+            <path d="M4 13a8 8 0 0 0 14.7 4.4"/>
+            <path d="M20 17v4h-4"/>
+          </svg>
+        `;
+      }
+
+      if (rightButton) {
+        rightButton.setAttribute('aria-label', 'Settings');
+        rightButton.innerHTML = `
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 15.5A3.5 3.5 0 1 0 12 8a3.5 3.5 0 0 0 0 7.5z"/>
+            <path d="M19.4 15a1.8 1.8 0 0 0 .36 2l.05.05a2 2 0 1 1-2.83 2.83l-.05-.05a1.8 1.8 0 0 0-2-.36 1.8 1.8 0 0 0-1 1.63V21a2 2 0 1 1-4 0v-.1a1.8 1.8 0 0 0-1-1.63 1.8 1.8 0 0 0-2 .36l-.05.05a2 2 0 1 1-2.83-2.83L4.1 17a1.8 1.8 0 0 0 .36-2 1.8 1.8 0 0 0-1.63-1H2.7a2 2 0 1 1 0-4h.13a1.8 1.8 0 0 0 1.63-1 1.8 1.8 0 0 0-.36-2l-.05-.05A2 2 0 1 1 6.88 4.1l.05.05a1.8 1.8 0 0 0 2 .36 1.8 1.8 0 0 0 1-1.63V2.8a2 2 0 1 1 4 0v.08a1.8 1.8 0 0 0 1 1.63 1.8 1.8 0 0 0 2-.36l.05-.05A2 2 0 1 1 19.8 6.93l-.05.05a1.8 1.8 0 0 0-.36 2 1.8 1.8 0 0 0 1.63 1h.18a2 2 0 1 1 0 4h-.18a1.8 1.8 0 0 0-1.63 1z"/>
+          </svg>
+        `;
+      }
+    });
+  </script>
+</body>
+</html>

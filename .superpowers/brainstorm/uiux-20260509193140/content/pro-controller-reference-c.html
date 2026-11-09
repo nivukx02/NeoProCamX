@@ -1,0 +1,69 @@
+<style>
+  .stage{display:grid;grid-template-columns:minmax(260px,390px) 1fr;gap:22px;align-items:start;margin-top:16px}
+  .phone{height:620px;border-radius:30px;overflow:hidden;background:#070809;position:relative;border:1px solid rgba(255,255,255,.18);box-shadow:0 18px 58px rgba(0,0,0,.45)}
+  .preview{position:absolute;inset:0;background:linear-gradient(145deg,#243230,#111 46%,#20240f);opacity:.94}
+  .gridline{position:absolute;background:rgba(255,255,255,.16)}.v1{left:33%;top:0;bottom:0;width:1px}.v2{left:66%;top:0;bottom:0;width:1px}.h1{top:39%;left:0;right:0;height:1px}
+  .topbar{position:absolute;left:14px;right:14px;top:14px;height:42px;display:flex;align-items:center;justify-content:space-between}
+  .pill{border-radius:999px;background:rgba(0,0,0,.5);border:1px solid rgba(255,255,255,.16);color:#fff;padding:7px 10px;font-size:11px}
+  .side{position:absolute;right:10px;top:84px;display:flex;flex-direction:column;gap:10px}.side .pill{padding:9px 8px}
+  .modebar{position:absolute;left:0;right:0;bottom:104px;text-align:center;color:#fff;font-size:12px;letter-spacing:.6px}.modebar span{display:inline-block;margin:0 7px;opacity:.62}.modebar b{color:#ffd45f}
+  .dock{position:absolute;left:0;right:0;bottom:0;height:98px;background:rgba(0,0,0,.76);display:flex;align-items:center;justify-content:center;gap:38px}
+  .thumb{width:42px;height:42px;border-radius:10px;background:linear-gradient(135deg,#5b7578,#151617);border:1px solid rgba(255,255,255,.22)}
+  .shutter{width:72px;height:72px;border-radius:50%;border:5px solid rgba(255,255,255,.9);box-shadow:inset 0 0 0 18px #e84437;background:#151515}
+  .gear{width:42px;height:42px;border-radius:50%;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22)}
+  .prostrip{position:absolute;left:0;right:0;bottom:99px;height:184px;background:linear-gradient(180deg,rgba(0,0,0,.38),rgba(0,0,0,.86));border-top:1px solid rgba(255,255,255,.12)}
+  .scale{position:absolute;left:24px;right:24px;top:18px;height:62px;color:#fff}
+  .scale-value{position:absolute;left:50%;top:-8px;transform:translateX(-50%);font-size:26px;font-weight:500}
+  .ticks{position:absolute;left:0;right:0;top:34px;height:38px;display:flex;align-items:flex-start;justify-content:space-between}.tick{width:2px;height:18px;background:rgba(255,255,255,.88);border-radius:2px}.tick.short{height:10px;opacity:.74}.tick.active{height:42px;background:#ffd21f;box-shadow:0 0 14px rgba(255,210,31,.42);margin-top:-12px}
+  .scale-labels{position:absolute;left:54px;right:54px;top:66px;display:flex;justify-content:space-between;color:rgba(255,255,255,.86);font-size:16px}
+  .divider{position:absolute;top:90px;bottom:0;width:1px;background:rgba(255,255,255,.2)}.d1{left:25%}.d2{left:50%}.d3{left:75%}
+  .tiles{position:absolute;left:0;right:0;bottom:0;height:90px;display:grid;grid-template-columns:repeat(6,1fr);align-items:center;text-align:center;color:#fff}
+  .tile{min-width:0}.tile .box{display:inline-flex;align-items:center;justify-content:center;width:34px;height:28px;border:2px solid rgba(255,255,255,.86);border-radius:4px;font-size:13px;font-weight:700}.tile.active .box{border-color:#ffd21f;color:#ffd21f}.tile .val{display:block;margin-top:9px;font-size:13px;color:rgba(255,255,255,.82)}.tile.active .val{color:#ffd21f}
+  .auto{position:absolute;left:18px;top:88px;color:#fff;text-align:center}.auto .circle{display:inline-flex;width:36px;height:36px;border-radius:50%;align-items:center;justify-content:center;background:#fff;color:#222;font-weight:800;font-size:22px}.auto span{display:block;margin-top:8px;font-size:13px}
+  .notes{padding-top:4px}.notes h3{margin:0 0 8px}.notes p,.notes li{color:rgba(255,255,255,.76);line-height:1.5}.notes ul{padding-left:20px}
+  @media(max-width:900px){.stage{grid-template-columns:1fr}.phone{height:560px}}
+</style>
+
+<h2>Chosen Direction: Adaptive Hybrid + Reference Pro Controller</h2>
+<p class="subtitle">This refines option C using your image: pro controls appear as a camera-native horizontal controller, not a desktop-style panel.</p>
+
+<div class="stage">
+  <div class="phone">
+    <div class="preview"></div><div class="gridline v1"></div><div class="gridline v2"></div><div class="gridline h1"></div>
+    <div class="topbar"><span class="pill">LOG 4K60</span><span class="pill">10-bit</span><span class="pill">⚙</span></div>
+    <div class="side"><span class="pill">LUT</span><span class="pill">HDR</span><span class="pill">WAVE</span></div>
+    <div class="prostrip">
+      <div class="auto"><div class="circle">A</div><span>Manual</span></div>
+      <div class="scale">
+        <div class="scale-value">500</div>
+        <div class="ticks">
+          <div class="tick short"></div><div class="tick"></div><div class="tick short"></div><div class="tick"></div><div class="tick short"></div><div class="tick active"></div><div class="tick short"></div><div class="tick"></div><div class="tick short"></div><div class="tick"></div><div class="tick short"></div>
+        </div>
+        <div class="scale-labels"><span>250</span><span>1000</span></div>
+      </div>
+      <div class="divider d1"></div><div class="divider d2"></div><div class="divider d3"></div>
+      <div class="tiles">
+        <div class="tile"><div class="box">+/-</div><span class="val">0</span></div>
+        <div class="tile active"><div class="box">ISO</div><span class="val">500</span></div>
+        <div class="tile"><div class="box">S</div><span class="val">0.4</span></div>
+        <div class="tile"><div class="box">WB</div><span class="val">☁</span></div>
+        <div class="tile"><div class="box">AF</div><span class="val">AF</span></div>
+        <div class="tile"><div class="box">▣</div><span class="val">Meter</span></div>
+      </div>
+    </div>
+    <div class="modebar"><span>VIDEO</span><b>PRO</b><span>HDR</span><span>LOG</span><span>RAW</span></div>
+    <div class="dock"><div class="thumb"></div><div class="shutter"></div><div class="gear"></div></div>
+  </div>
+
+  <div class="notes">
+    <h3>Design Contract</h3>
+    <ul>
+      <li>Default screen stays clean and fast like Vivo/iQOO.</li>
+      <li>Pro mode opens this reference-style strip above the shutter zone.</li>
+      <li>Tap ISO/S/WB/AF/EV/Meter to make it active; the scale changes to that parameter.</li>
+      <li>Swipe left/right on the scale for fine values; vertical drag can be optional later.</li>
+      <li>Manual controls stay only in Pro mode. Normal/HDR/LOG/RAW get mode controls, not the full manual strip unless the mode is Pro.</li>
+    </ul>
+    <p>Confirm this shape and I’ll write the UI/UX rebuild design spec around it.</p>
+  </div>
+</div>

@@ -1,0 +1,41 @@
+#version 450
+
+// OmniClarity — upsample a reduced-resolution motion field to full resolution and rescale its
+// displacement values from reduced-pixel units to full-pixel units (x divisor), so the full-res
+// Riven deblur and Chronos warp consume it unchanged. Bilinear interpolation. Classical.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rg16f) readonly uniform highp image2D uReducedFlow;
+layout(binding = 1, rg16f) writeonly uniform highp image2D uFullFlow;
+
+layout(push_constant) uniform OmniFlowUpsampleParams {
+    int divisor;
+} uParams;
+
+ivec2 clampCoord(ivec2 c, ivec2 s) {
+    return clamp(c, ivec2(0), s - ivec2(1));
+}
+
+vec2 sampleReduced(vec2 c, ivec2 s) {
+    ivec2 b = ivec2(floor(c));
+    vec2 f = fract(c);
+    vec2 a = imageLoad(uReducedFlow, clampCoord(b, s)).rg;
+    vec2 bx = imageLoad(uReducedFlow, clampCoord(b + ivec2(1, 0), s)).rg;
+    vec2 cy = imageLoad(uReducedFlow, clampCoord(b + ivec2(0, 1), s)).rg;
+    vec2 d = imageLoad(uReducedFlow, clampCoord(b + ivec2(1, 1), s)).rg;
+    return mix(mix(a, bx, f.x), mix(cy, d, f.x), f.y);
+}
+
+void main() {
+    ivec2 fullSize = imageSize(uFullFlow);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= fullSize.x || p.y >= fullSize.y) {
+        return;
+    }
+    int dv = max(uParams.divisor, 1);
+    ivec2 reducedSize = imageSize(uReducedFlow);
+    vec2 reducedCoord = (vec2(p) + vec2(0.5)) / float(dv) - vec2(0.5); // full px -> reduced grid
+    vec2 flow = sampleReduced(reducedCoord, reducedSize) * float(dv);  // reduced-px -> full-px units
+    imageStore(uFullFlow, p, vec4(flow, 0.0, 0.0));
+}

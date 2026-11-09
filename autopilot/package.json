@@ -1,0 +1,23 @@
+{
+  "name": "copilot-cli",
+  "version": "1.0.0",
+  "description": "CLI Copilot – code suggestion & editing powered by NVIDIA Nemotron",
+  "main": "copilot.js",
+  "bin": {
+    "copilot": "./copilot.js"
+  },
+  "type": "commonjs",
+  "scripts": {
+    "start": "node copilot.js"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "openai": "^6.38.0",
+    "yargs": "^18.0.0",
+    "readline-sync": "^1.4.10",
+    "chalk": "^5.6.2",
+    "figlet": "^1.11.0"
+  }
+}

@@ -1,0 +1,163 @@
+#version 450
+
+// NIV99 bounded quality telemetry. One record is emitted per configured tile; this pass never
+// modifies image output and is suitable for selectively copied debug/quality evidence.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 4, rgba16f) uniform readonly image2D referenceLinearInput;
+layout(binding = 9, rgba16f) uniform readonly image2D motionConfidenceInput;
+layout(binding = 11, rgba16f) uniform readonly image2D processedLinearInput;
+
+struct Niv99TelemetryRecord {
+    uvec4 identityLow;
+    uvec4 identityHigh;
+    vec4 distortion; // RGB MSE and luma MSE
+    vec4 detail;     // reference gradient, output gradient, overshoot, ghost residual
+    vec4 boundary;   // vertical seam, horizontal seam, flat residual, sample count
+};
+
+layout(std430, binding = 14) writeonly buffer Niv99TelemetryBuffer {
+    Niv99TelemetryRecord records[];
+} telemetryOutput;
+
+layout(std140, binding = 15) uniform Niv99UniformBlock {
+    ivec4 frameExtent;
+    ivec4 tileAndCfa;
+    uvec4 identityLow;
+    uvec4 identityHigh;
+    uvec4 flags;
+    vec4 blackLevelRggb;
+    vec4 whiteAndThresholds;
+    vec4 shotNoiseRggb;
+    vec4 readNoiseRggb;
+    vec4 whiteBalanceRggb;
+    vec4 colorMatrixRow0;
+    vec4 colorMatrixRow1;
+    vec4 colorMatrixRow2;
+    vec4 motionParameters;
+    vec4 temporalParameters;
+    vec4 reconstructionParameters;
+} uniforms;
+
+const uint LOCAL_COUNT = 64u;
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+shared vec4 distortionSum[LOCAL_COUNT];
+shared vec4 detailSum[LOCAL_COUNT];
+shared vec4 boundarySum[LOCAL_COUNT];
+
+ivec2 clampCoordinate(ivec2 coordinate) {
+    return clamp(coordinate, ivec2(0), uniforms.frameExtent.xy - ivec2(1));
+}
+
+vec3 loadReference(ivec2 coordinate) {
+    return max(imageLoad(referenceLinearInput, clampCoordinate(coordinate)).rgb, vec3(0.0));
+}
+
+vec3 loadProcessed(ivec2 coordinate) {
+    return max(imageLoad(processedLinearInput, clampCoordinate(coordinate)).rgb, vec3(0.0));
+}
+
+float gradientMagnitudeReference(ivec2 coordinate) {
+    float left = dot(loadReference(coordinate + ivec2(-1, 0)), LUMA);
+    float right = dot(loadReference(coordinate + ivec2(1, 0)), LUMA);
+    float top = dot(loadReference(coordinate + ivec2(0, -1)), LUMA);
+    float bottom = dot(loadReference(coordinate + ivec2(0, 1)), LUMA);
+    return 0.5 * length(vec2(right - left, bottom - top));
+}
+
+float gradientMagnitudeProcessed(ivec2 coordinate) {
+    float left = dot(loadProcessed(coordinate + ivec2(-1, 0)), LUMA);
+    float right = dot(loadProcessed(coordinate + ivec2(1, 0)), LUMA);
+    float top = dot(loadProcessed(coordinate + ivec2(0, -1)), LUMA);
+    float bottom = dot(loadProcessed(coordinate + ivec2(0, 1)), LUMA);
+    return 0.5 * length(vec2(right - left, bottom - top));
+}
+
+void main() {
+    uint lane = gl_LocalInvocationIndex;
+    ivec2 tileIndex = ivec2(gl_WorkGroupID.xy);
+    ivec2 tileSize = max(uniforms.tileAndCfa.xy, ivec2(1));
+    ivec2 tileBegin = tileIndex * tileSize;
+    ivec2 tileEnd = min(tileBegin + tileSize, uniforms.frameExtent.xy);
+    vec4 localDistortion = vec4(0.0);
+    vec4 localDetail = vec4(0.0);
+    vec4 localBoundary = vec4(0.0);
+
+    for (int y = tileBegin.y + int(gl_LocalInvocationID.y); y < tileEnd.y; y += 8) {
+        for (int x = tileBegin.x + int(gl_LocalInvocationID.x); x < tileEnd.x; x += 8) {
+            ivec2 coordinate = ivec2(x, y);
+            vec3 reference = loadReference(coordinate);
+            vec3 processed = loadProcessed(coordinate);
+            vec3 difference = processed - reference;
+            float lumaDifference = dot(difference, LUMA);
+            localDistortion += vec4(difference * difference, lumaDifference * lumaDifference);
+            float referenceGradient = gradientMagnitudeReference(coordinate);
+            float processedGradient = gradientMagnitudeProcessed(coordinate);
+
+            vec3 neighbourhoodMin = min(min(loadReference(coordinate + ivec2(-1, 0)),
+                loadReference(coordinate + ivec2(1, 0))), min(
+                loadReference(coordinate + ivec2(0, -1)),
+                loadReference(coordinate + ivec2(0, 1))));
+            vec3 neighbourhoodMax = max(max(loadReference(coordinate + ivec2(-1, 0)),
+                loadReference(coordinate + ivec2(1, 0))), max(
+                loadReference(coordinate + ivec2(0, -1)),
+                loadReference(coordinate + ivec2(0, 1))));
+            neighbourhoodMin = min(neighbourhoodMin, reference);
+            neighbourhoodMax = max(neighbourhoodMax, reference);
+            vec3 overshootVector = max(processed - neighbourhoodMax, vec3(0.0)) +
+                max(neighbourhoodMin - processed, vec3(0.0));
+            float overshoot = max(overshootVector.r,
+                max(overshootVector.g, overshootVector.b));
+            float motionConfidence = clamp(imageLoad(motionConfidenceInput, coordinate).x, 0.0, 1.0);
+            float ghostResidual = abs(lumaDifference) * (1.0 - motionConfidence);
+            localDetail += vec4(referenceGradient, processedGradient, overshoot, ghostResidual);
+
+            float verticalSeam = 0.0;
+            float horizontalSeam = 0.0;
+            if (x > 0 && x == tileBegin.x) {
+                verticalSeam = abs(dot(processed - loadProcessed(coordinate + ivec2(-1, 0)), LUMA));
+            }
+            if (y > 0 && y == tileBegin.y) {
+                horizontalSeam = abs(dot(processed - loadProcessed(coordinate + ivec2(0, -1)), LUMA));
+            }
+            float processedLuma = dot(processed, LUMA);
+            float localMean = 0.25 * (
+                dot(loadProcessed(coordinate + ivec2(-1, 0)), LUMA) +
+                dot(loadProcessed(coordinate + ivec2(1, 0)), LUMA) +
+                dot(loadProcessed(coordinate + ivec2(0, -1)), LUMA) +
+                dot(loadProcessed(coordinate + ivec2(0, 1)), LUMA)
+            );
+            float flatGate = 1.0 - smoothstep(0.002, 0.025, referenceGradient);
+            float flatResidual = abs(processedLuma - localMean) * flatGate;
+            localBoundary += vec4(verticalSeam, horizontalSeam, flatResidual, 1.0);
+        }
+    }
+
+    distortionSum[lane] = localDistortion;
+    detailSum[lane] = localDetail;
+    boundarySum[lane] = localBoundary;
+    barrier();
+    for (uint stride = LOCAL_COUNT / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            distortionSum[lane] += distortionSum[lane + stride];
+            detailSum[lane] += detailSum[lane + stride];
+            boundarySum[lane] += boundarySum[lane + stride];
+        }
+        barrier();
+    }
+    if (lane != 0u) return;
+
+    uint outputIndex = uint(tileIndex.y * uniforms.frameExtent.z + tileIndex.x);
+    float count = max(boundarySum[0].w, 1.0);
+    telemetryOutput.records[outputIndex].identityLow = uniforms.identityLow;
+    telemetryOutput.records[outputIndex].identityHigh = uniforms.identityHigh;
+    telemetryOutput.records[outputIndex].distortion = distortionSum[0] / count;
+    telemetryOutput.records[outputIndex].detail = detailSum[0] / count;
+    telemetryOutput.records[outputIndex].boundary = vec4(
+        boundarySum[0].x / count,
+        boundarySum[0].y / count,
+        boundarySum[0].z / count,
+        count
+    );
+}

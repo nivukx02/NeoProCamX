@@ -1,0 +1,71 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define NEOPROCAMX_SHADOW_LIFT_COMPUTE 1
+#define NDR10_NIVUKX_PROJECT_OWNED_SHADOW_RECOVERY 1
+
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D uInputToneMappedRgba16f;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D uOutputShadowLiftedRgba16f;
+
+layout(push_constant) uniform ShadowLiftParams {
+    float shadowLift;
+    float contrastRecovery;
+    float luminanceThreshold;
+} params;
+
+const float DEFAULT_SHADOW_LIFT = 0.03;
+const float DEFAULT_CONTRAST_RECOVERY = 1.10;
+const float DEFAULT_LUMINANCE_THRESHOLD = 0.4;
+const vec3 LUMA_WEIGHTS = vec3(0.2126, 0.7152, 0.0722);
+
+float hashNoise(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+float triangularDither(ivec2 coord) {
+    vec2 p = vec2(coord);
+    return (hashNoise(p) + hashNoise(p + vec2(19.19, 73.73)) - 1.0);
+}
+
+vec3 exponentialShadowLift(vec3 color, float luma, float shadowLift, float contrastRecovery, float luminanceThreshold) {
+    float threshold = max(luminanceThreshold, 0.0001);
+    float shadowGate = 1.0 - smoothstep(threshold * 0.80, threshold, luma);
+    float normalizedShadow = clamp(1.0 - luma / threshold, 0.0, 1.0);
+    float liftCurve = shadowLift * (1.0 - exp(-luma * 18.0)) * pow(normalizedShadow, 1.20);
+    float liftedLuma = max(luma + liftCurve * shadowGate, 0.0);
+    float ratio = liftedLuma / max(luma, 0.0001);
+    vec3 lifted = color * ratio;
+    vec3 contrastPivot = vec3(0.18);
+    vec3 recovered = contrastPivot + (lifted - contrastPivot) * contrastRecovery;
+    return mix(color, max(recovered, vec3(0.0)), shadowGate);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = imageSize(uOutputShadowLiftedRgba16f);
+    if (coord.x >= extent.x || coord.y >= extent.y) {
+        return;
+    }
+
+    vec4 source = imageLoad(uInputToneMappedRgba16f, coord);
+    vec3 color = max(source.rgb, vec3(0.0));
+    float luma = dot(color, LUMA_WEIGHTS);
+    float requestedThreshold = clamp(params.luminanceThreshold, 0.05, 0.40);
+    float luminanceThreshold = params.luminanceThreshold > 0.0 ? requestedThreshold : DEFAULT_LUMINANCE_THRESHOLD;
+    if (luma >= luminanceThreshold) {
+        imageStore(uOutputShadowLiftedRgba16f, coord, source);
+        return;
+    }
+
+    float requestedShadowLift = clamp(params.shadowLift, 0.01, 0.10);
+    float requestedContrastRecovery = clamp(params.contrastRecovery, 1.05, 1.15);
+    float shadowLift = params.shadowLift > 0.0 ? requestedShadowLift : DEFAULT_SHADOW_LIFT;
+    float contrastRecovery = params.contrastRecovery > 0.0 ? requestedContrastRecovery : DEFAULT_CONTRAST_RECOVERY;
+    vec3 lifted = exponentialShadowLift(color, luma, shadowLift, contrastRecovery, luminanceThreshold);
+    float dither = triangularDither(coord) * (1.0 / 1023.0);
+    vec3 mapped = max(lifted + vec3(dither), vec3(0.0));
+    imageStore(uOutputShadowLiftedRgba16f, coord, vec4(mapped, source.a));
+}

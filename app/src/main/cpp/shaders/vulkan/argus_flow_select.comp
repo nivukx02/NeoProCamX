@@ -1,0 +1,78 @@
+#version 450
+
+// OmniClarity Engine — §2 Argus Hybrid Optical Flow, occlusion + hybrid selection.
+//
+// 100% classical. Combines the refined forward flow with a forward/backward consistency check and a
+// texture gate, per the design: "refined flow where forward-backward agreement is good and texture
+// is sufficient; block matching elsewhere." Disagreement flags occlusion and falls back to the
+// Stage-A coarse field rather than a wrong refined vector.
+//
+// Convention: forward f_fwd has previous(p - f_fwd) ~= current(p); backward f_bwd (computed with the
+// frames swapped) has current(q - f_bwd) ~= previous(q). With no occlusion, f_bwd(p - f_fwd) ~= -f_fwd,
+// so the consistency residual is |f_fwd(p) + f_bwd(p - f_fwd)|.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rg16f) readonly uniform highp image2D uFlowForward;   // refined forward flow
+layout(binding = 1, rg16f) readonly uniform highp image2D uFlowBackward;  // refined backward flow
+layout(binding = 2, rg16f) readonly uniform highp image2D uFlowCoarse;    // Stage-A forward fallback
+layout(binding = 3, rgba16f) readonly uniform highp image2D uCurrentFrame;
+layout(binding = 4, rg16f) writeonly uniform highp image2D uFlowOut;
+
+layout(push_constant) uniform ArgusSelectParams {
+    float occlusionThreshold; // px residual above which flow is treated as occluded/unreliable
+    float minTexture;         // local gradient floor for trusting refined flow
+    float maxFlow;            // clamp on |flow|, px
+    float previousValid;      // 0 => emit zero flow
+} uParams;
+
+float lumaOf(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+ivec2 clampCoord(ivec2 c, ivec2 s) {
+    return clamp(c, ivec2(0), s - ivec2(1));
+}
+
+float currentLuma(ivec2 c, ivec2 s) {
+    return lumaOf(imageLoad(uCurrentFrame, clampCoord(c, s)).rgb);
+}
+
+void main() {
+    ivec2 s = imageSize(uFlowOut);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= s.x || p.y >= s.y) {
+        return;
+    }
+    if (uParams.previousValid < 0.5) {
+        imageStore(uFlowOut, p, vec4(0.0));
+        return;
+    }
+
+    vec2 forwardFlow = imageLoad(uFlowForward, p).rg;
+    vec2 coarseFlow = imageLoad(uFlowCoarse, p).rg;
+
+    // Forward/backward consistency: sample the backward field at the forward-warped location.
+    ivec2 src = clampCoord(ivec2(round(vec2(p) - forwardFlow)), s);
+    vec2 backwardFlow = imageLoad(uFlowBackward, src).rg;
+    float consistencyResidual = length(forwardFlow + backwardFlow);
+    float consistent = 1.0 - smoothstep(uParams.occlusionThreshold, uParams.occlusionThreshold * 2.0 + 1e-4, consistencyResidual);
+
+    // Texture gate: only trust refined flow where the current frame has structure.
+    float centerLuma = currentLuma(p, s);
+    float gx = abs(currentLuma(p + ivec2(1, 0), s) - currentLuma(p - ivec2(1, 0), s));
+    float gy = abs(currentLuma(p + ivec2(0, 1), s) - currentLuma(p - ivec2(0, 1), s));
+    float texture = gx + gy;
+    float textureGate = smoothstep(uParams.minTexture, uParams.minTexture * 4.0 + 1e-4, texture);
+
+    // Hybrid selection: refined where consistent + textured, coarse Stage-A flow elsewhere.
+    float useRefined = consistent * textureGate;
+    vec2 finalFlow = mix(coarseFlow, forwardFlow, useRefined);
+
+    float mag = length(finalFlow);
+    if (mag > uParams.maxFlow && mag > 1e-5) {
+        finalFlow *= uParams.maxFlow / mag;
+    }
+
+    imageStore(uFlowOut, p, vec4(finalFlow, 0.0, 0.0));
+}

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Shutter center: frosted-glass bright core (idle). Recording state swaps to bg_shutter_recording. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <gradient
+        android:angle="270"
+        android:startColor="@color/glass_shutter_center_top"
+        android:endColor="@color/glass_shutter_center_bottom"
+        android:type="linear" />
+    <stroke
+        android:width="1dp"
+        android:color="@color/glass_border" />
+</shape>

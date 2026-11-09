@@ -1,0 +1,1819 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define NEO_ACESCG_NON_CERTIFIED 1
+#define ACESCG_LINEAR_WORKING_SPACE 1
+#define FP32_BAYESIAN_PIPELINE 1
+#define PHASE_SHIFTED_FILM_GRAIN 1
+#define OMNIPOTENT_NPV10_EXPORT_PIPELINE 1
+#define ZENITH_COSMIC_PLANCK_NPV10_EXPORT_PIPELINE 1
+
+// ── NDR10+ / NIVUKX genuine full-RGB → PQ delivery (Phase 1) ─────────────────
+// When enabled, NDR10+/NIVUKX recorded pixels are reconstructed to real RGB,
+// run through the canonical NeoProCamX color engine (hue-preserving tone,
+// 203-nit diffuse-white anchor, master-peak shoulder) and re-encoded to genuine
+// PQ (ST.2084) — NOT plain HLG and NOT the old gray-fed luma curve. ENABLED (1)
+// in lock-step with the encoder/container ST.2084 retag in
+// RecordingHdrVideoLookPolicy, so the recorded pixels and the container tag are
+// a coherent PQ HDR10 stream. Mirrors the host-golden com.neoproc.neoproccamx
+// .color.NdrNivukxDeliveryEngine (CPU↔GPU parity is source-locked in tests).
+// Legacy Camera2-P010 -> HLG-linear -> NDR delivery is deliberately compile-disabled. Proprietary
+// NDR10+/NIVUKX pixels are produced only by the RAW_SENSOR -> ACEScg -> offscreen delivery path.
+// Generic P010 enhancement remains available for non-NDR modes.
+#define NEO_PQ_DELIVERY_ENABLED 0
+
+layout(std430, set = 0, binding = 0) readonly buffer CurrentP010 {
+    uint currentData[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer PreviousP010 {
+    uint previousData[];
+};
+
+layout(std430, set = 0, binding = 2) buffer OutputP010 {
+    uint outputData[];
+};
+
+layout(push_constant) uniform EnhancementPushConstants {
+    uint width;
+    uint height;
+    uint hasPreviousFrame;
+} pushData;
+
+// The Riven motion search used to issue 441 uncached SSBO reads per luma invocation, followed by
+// another 12 reads for the directional deblur. A 16x16 workgroup needs only a six-pixel halo to
+// cover both the +/-3 search with a 3x3 patch and every deblur tap. Cooperatively cache that 28x28
+// footprint once (6.125 reads/invocation for both frames) and preserve the exact search, tie-break,
+// edge-clamp, FP32 math, and output packing. 6.125 KiB is below Vulkan's mandatory 16-KiB
+// maxComputeSharedMemorySize floor, so this remains portable to every conformant Vulkan device.
+const int RIVEN_TILE_HALO = 6;
+const int RIVEN_WORKGROUP_EDGE = 16;
+const int RIVEN_TILE_EDGE = RIVEN_WORKGROUP_EDGE + RIVEN_TILE_HALO * 2;
+const int RIVEN_TILE_SAMPLE_COUNT = RIVEN_TILE_EDGE * RIVEN_TILE_EDGE;
+shared uint rivenCurrentLumaTile[RIVEN_TILE_SAMPLE_COUNT];
+shared uint rivenPreviousLumaTile[RIVEN_TILE_SAMPLE_COUNT];
+
+struct EnhancementUniforms {
+    float signalFamily;
+    float colorSpace;
+    float colorScience;
+    float activeTransport;
+    float temporalBlend;
+    float spatialDenoise;
+    float chromaDenoise;
+    float shadowBoost;
+    float sharpening;
+    float warmth;
+    float contrast;
+    float saturation;
+    float highlightCompression;
+    float logStrength;
+    float videoHdrFusionStrength;
+    float shadowChromaDeadband;
+    float aliasSafeMaxDetailDelta;
+    float fineTextureThreshold;
+    float mediumEdgeThreshold;
+    float strongEdgeThreshold;
+    float fineTextureDetailGain;
+    float mediumDetailGain;
+    float strongDetailGain;
+    float temporalLumaBlend;
+    float temporalChromaBlend;
+    float iso;
+    float noiseMetric;
+    float localChromaSpikeSmoothing;
+    float sharpeningFloor;
+    float sharpeningCeiling;
+    float skinDetailProtection;
+    float migrationApplied;
+    float dualGainFusionEnabled;
+    float dualGainMotionMaskEnabled;
+    float dualGainKGain;
+    float dualGainNoiseFloor;
+    float dualGainSaturationThreshold;
+    float dualGainTimestampSkew;
+    float shotNoiseCoefficient;
+    float readNoiseCoefficient;
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer UniformBlock {
+    EnhancementUniforms uniforms;
+};
+
+const int COLOR_SCIENCE_NDR10_PLUS = 20;
+const int COLOR_SCIENCE_NIVUKX_VISION = 21;
+const int COLOR_SCIENCE_NEO_ACES_HIGH_END = 31;
+const int COLOR_SCIENCE_COSMIC_SINGULARITY = COLOR_SCIENCE_NDR10_PLUS;
+const int COLOR_SPACE_NEO_ACES_AP1 = 4;
+const int COLOR_SPACE_NEO_ACES_AP0 = 5;
+const int SIGNAL_FAMILY_SDR = 1;
+const int SIGNAL_FAMILY_HDR = 2;
+const int SIGNAL_FAMILY_LOG = 3;
+const int SIGNAL_FAMILY_RAW = 4;
+const int ACTIVE_TRANSPORT_REC709_SDR = 1;
+const int ACTIVE_TRANSPORT_BT2020_SDR = 2;
+// Matches GpuActiveTransport.BT2100_PQ_MAIN10 (id 4) — the NDR/NIVUKX PQ delivery transport.
+const int ACTIVE_TRANSPORT_BT2100_PQ = 4;
+const uint kP010LaneMask = 0xFFFFu;
+const int COHERENT_CHROMA_MIN_DELTA = 96;
+const int COHERENT_CHROMA_SUPPORT_WINDOW = 48;
+const float COHERENT_CHROMA_RETAIN_FLOOR = 0.44;
+const float JND_EXPORT_DITHER_VISIBILITY_SCALE = 0.28;
+const float P010_MAX_TEMPORAL_PREVIOUS_WEIGHT = 0.72;
+const float P010_MAX_CUMULATIVE_DETAIL_CODES = 40.0;
+
+uint unpackP010(uint packedValue) {
+    return clamp(packedValue >> 6u, 0u, 1023u);
+}
+
+uint packP010(uint sampleValue) {
+    return clamp(sampleValue, 0u, 1023u) << 6u;
+}
+
+uint packedWordIndex(uint sampleIndex) {
+    return sampleIndex >> 1u;
+}
+
+uint packedLaneShift(uint sampleIndex) {
+    return (sampleIndex & 1u) * 16u;
+}
+
+uint unpackPackedP010Lane(uint packedWord, uint sampleIndex) {
+    return (packedWord >> packedLaneShift(sampleIndex)) & kP010LaneMask;
+}
+
+uint readCurrentP010Sample(uint sampleIndex) {
+    uint wordIndex = sampleIndex >> 1u;
+    return unpackPackedP010Lane(currentData[wordIndex], sampleIndex);
+}
+
+uint readPreviousP010Sample(uint sampleIndex) {
+    uint wordIndex = sampleIndex >> 1u;
+    return unpackPackedP010Lane(previousData[wordIndex], sampleIndex);
+}
+
+void loadRivenLumaTiles() {
+    int width = int(max(pushData.width, 1u));
+    int height = int(max(pushData.height, 1u));
+    int originX = int(gl_WorkGroupID.x) * RIVEN_WORKGROUP_EDGE - RIVEN_TILE_HALO;
+    int originY = int(gl_WorkGroupID.y) * RIVEN_WORKGROUP_EDGE - RIVEN_TILE_HALO;
+    const uint workgroupInvocationCount = 16u * 16u;
+
+    for (
+        uint tileIndex = gl_LocalInvocationIndex;
+        tileIndex < uint(RIVEN_TILE_SAMPLE_COUNT);
+        tileIndex += workgroupInvocationCount
+    ) {
+        int tileX = int(tileIndex) - (int(tileIndex) / RIVEN_TILE_EDGE) * RIVEN_TILE_EDGE;
+        int tileY = int(tileIndex) / RIVEN_TILE_EDGE;
+        int sourceX = clamp(originX + tileX, 0, width - 1);
+        int sourceY = clamp(originY + tileY, 0, height - 1);
+        uint sourceIndex = uint(sourceY * width + sourceX);
+        uint currentValue = unpackP010(readCurrentP010Sample(sourceIndex));
+        rivenCurrentLumaTile[tileIndex] = currentValue;
+        rivenPreviousLumaTile[tileIndex] = pushData.hasPreviousFrame != 0u
+            ? unpackP010(readPreviousP010Sample(sourceIndex))
+            : currentValue;
+    }
+    memoryBarrierShared();
+    barrier();
+}
+
+void writePackedP010Sample(uint sampleIndex, uint sampleValue) {
+    uint wordIndex = sampleIndex >> 1u;
+    uint lane = sampleIndex & 1u;
+    uint shift = lane * 16u;
+    uint laneMask = kP010LaneMask << shift;
+    uint oldWord = outputData[wordIndex];
+    while (true) {
+        uint preservedWord = oldWord & ~laneMask;
+        uint newWord = preservedWord | ((packP010(sampleValue) & kP010LaneMask) << shift);
+        uint observedWord = atomicCompSwap(outputData[wordIndex], oldWord, newWord);
+        if (observedWord == oldWord) return;
+        oldWord = observedWord;
+    }
+}
+
+uint blendSample(uint currentValue, uint previousValue, float weight) {
+    float blended = float(currentValue) * (1.0 - weight) + float(previousValue) * weight;
+    return uint(clamp(blended + 0.5, 0.0, 1023.0));
+}
+
+float heteroscedasticNoiseVariance(float normalizedLuma) {
+    return max(
+        uniforms.shotNoiseCoefficient * clamp(normalizedLuma, 0.0, 1.0) +
+            uniforms.readNoiseCoefficient,
+        0.00000002
+    );
+}
+
+float bayesShrinkThreshold(float noiseVariance, float signalSigma) {
+    return (noiseVariance * 0.064) / max(signalSigma, 0.0005);
+}
+
+float bayesianWaveletShrink(float coefficient, float normalizedLuma, float signalSigma) {
+    float threshold = bayesShrinkThreshold(heteroscedasticNoiseVariance(normalizedLuma), signalSigma);
+    return sign(coefficient) * max(abs(coefficient) - threshold, 0.0);
+}
+
+float p010NormalizeStrength(float rawStrength) {
+    return clamp(rawStrength > 1.0 ? rawStrength * 0.1 : rawStrength, 0.0, 1.0);
+}
+
+float p010StrictNormalProSdrExportAuthority();
+float p010StrictVisibleCleanExportAuthority();
+bool p010ZeroVisibleGrainExport();
+float p010ExportStrictCeiling();
+float p010ExportNoiseShape();
+float p010ExportLocalChromaSpikeShape();
+
+float abrBackpressureScale() {
+    // Export reads the initial 40 fields of the shared 44-float uniform ABI.
+    // The subject-mask tail is ignored until export receives mask input.
+    float pressure = smoothstep(0.72, 1.0, p010ExportNoiseShape());
+    return clamp(1.0 - pressure * 0.30, 0.60, 1.0);
+}
+
+float abrDetailGainScale() {
+    return clamp(mix(1.0, 0.78, 1.0 - abrBackpressureScale()), 0.68, 1.0);
+}
+
+float abrDitherAmplitudeScale() {
+    return clamp(mix(1.0, 0.72, 1.0 - abrBackpressureScale()), 0.58, 1.0);
+}
+
+bool p010BoundedNormalProSdrExport() {
+    int signalFamily = int(uniforms.signalFamily + 0.5);
+    int activeTransport = int(uniforms.activeTransport + 0.5);
+    return signalFamily == SIGNAL_FAMILY_SDR &&
+        (activeTransport == ACTIVE_TRANSPORT_REC709_SDR ||
+            activeTransport == ACTIVE_TRANSPORT_BT2020_SDR);
+}
+
+float p010StrictNormalProSdrExportAuthority() {
+    return p010BoundedNormalProSdrExport() ? 1.0 : 0.0;
+}
+
+bool p010ZeroVisibleGrainExport() {
+    return uniforms.temporalLumaBlend >= 0.99 &&
+        uniforms.temporalChromaBlend >= 0.99;
+}
+
+float p010StrictVisibleCleanExportAuthority() {
+    int signalFamily = int(uniforms.signalFamily + 0.5);
+    bool strictEncodedSignal =
+        signalFamily == SIGNAL_FAMILY_HDR ||
+        signalFamily == SIGNAL_FAMILY_LOG ||
+        signalFamily == SIGNAL_FAMILY_RAW;
+    bool strictVisibleCleanProfile = strictEncodedSignal &&
+        p010ZeroVisibleGrainExport() &&
+        uniforms.spatialDenoise >= 0.98 &&
+        uniforms.chromaDenoise >= 0.99 &&
+        uniforms.sharpening >= 0.90 &&
+        uniforms.noiseMetric >= 0.70 &&
+        uniforms.aliasSafeMaxDetailDelta <= 0.2201;
+    return p010BoundedNormalProSdrExport()
+        ? 1.0
+        : (strictVisibleCleanProfile ? 10.0 : 1.0);
+}
+
+float p010ExportStrictCeiling() {
+    return p010BoundedNormalProSdrExport()
+        ? 1.0
+        : (p010StrictVisibleCleanExportAuthority() > 1.0 ? 10.0 : 1.0);
+}
+
+float p010ExportNoiseShape() {
+    return p010BoundedNormalProSdrExport()
+        ? p010NormalizeStrength(uniforms.noiseMetric)
+        : clamp(uniforms.noiseMetric / p010ExportStrictCeiling(), 0.0, 1.0);
+}
+
+float p010ExportLocalChromaSpikeShape() {
+    return p010BoundedNormalProSdrExport()
+        ? p010NormalizeStrength(uniforms.localChromaSpikeSmoothing)
+        : clamp(uniforms.localChromaSpikeSmoothing / p010ExportStrictCeiling(), 0.0, 1.0);
+}
+
+float p010StrictTexturelessGrainGate(float sampleValue, float localRange, float singlePixelNoise) {
+    bool strictQuality = p010BoundedNormalProSdrExport() ||
+        p010StrictVisibleCleanExportAuthority() > 1.0;
+    if (!strictQuality) return 0.0;
+    float flatLumaGate = (1.0 - smoothstep(128.0, 560.0, sampleValue)) *
+        (1.0 - smoothstep(42.0, 210.0, localRange));
+    float noiseGate = smoothstep(2.0, 34.0, singlePixelNoise);
+    return clamp(flatLumaGate * noiseGate, 0.0, 1.0);
+}
+
+uint applyTemporalDenoise(uint sampleIndex, uint currentValue, bool chromaSample) {
+    if (pushData.hasPreviousFrame == 0u) return currentValue;
+    uint previousValue = unpackP010(readPreviousP010Sample(sampleIndex));
+    uint delta = uint(abs(int(currentValue) - int(previousValue)));
+    float variance = heteroscedasticNoiseVariance(float(currentValue) / 1023.0);
+    uint adaptiveBoost = uint(clamp(sqrt(variance) * 1023.0 * 1.90, 0.0, 48.0));
+    uint threshold = (chromaSample ? 48u : 32u) + adaptiveBoost;
+    if (delta > threshold) return currentValue;
+    float legacyWeight = chromaSample ? uniforms.temporalChromaBlend : uniforms.temporalLumaBlend;
+    if (!p010BoundedNormalProSdrExport()) {
+        return blendSample(currentValue, previousValue, clamp(legacyWeight, 0.0, 1.0));
+    }
+    float weight = p010NormalizeStrength(legacyWeight);
+    float temporalCap = chromaSample ? 0.64 : P010_MAX_TEMPORAL_PREVIOUS_WEIGHT;
+    return blendSample(currentValue, previousValue, min(weight, temporalCap));
+}
+
+bool sameChromaDirection(int a, int b) {
+    return (a < 0 && b < 0) || (a > 0 && b > 0);
+}
+
+uint chromaSampleIndex(uint chromaWidth, uint row, uint column, uint componentOffset) {
+    return pushData.width * pushData.height + (row * chromaWidth + column) * 2u + componentOffset;
+}
+
+uint chromaNeighborAverage(
+    uint chromaWidth,
+    uint chromaHeight,
+    uint row,
+    uint column,
+    uint componentOffset
+) {
+    uint total = 0u;
+    uint count = 0u;
+    if (row > 0u) {
+        total += unpackP010(readCurrentP010Sample(chromaSampleIndex(chromaWidth, row - 1u, column, componentOffset)));
+        count += 1u;
+    }
+    if (row + 1u < chromaHeight) {
+        total += unpackP010(readCurrentP010Sample(chromaSampleIndex(chromaWidth, row + 1u, column, componentOffset)));
+        count += 1u;
+    }
+    if (column > 0u) {
+        total += unpackP010(readCurrentP010Sample(chromaSampleIndex(chromaWidth, row, column - 1u, componentOffset)));
+        count += 1u;
+    }
+    if (column + 1u < chromaWidth) {
+        total += unpackP010(readCurrentP010Sample(chromaSampleIndex(chromaWidth, row, column + 1u, componentOffset)));
+        count += 1u;
+    }
+    return count == 0u ? 512u : total / count;
+}
+
+bool coherentChromaColor(uint chromaValue, uint neighborAverage) {
+    int delta = int(chromaValue) - 512;
+    int neighborDelta = int(neighborAverage) - 512;
+    return abs(delta) >= COHERENT_CHROMA_MIN_DELTA &&
+        abs(neighborDelta) >= COHERENT_CHROMA_MIN_DELTA &&
+        sameChromaDirection(delta, neighborDelta) &&
+        abs(int(chromaValue) - int(neighborAverage)) <= COHERENT_CHROMA_SUPPORT_WINDOW;
+}
+
+uint applyChromaDeadband(uint chromaValue, uint neighborAverage) {
+    int delta = int(chromaValue) - 512;
+    int neighborDelta = int(neighborAverage) - 512;
+    int threshold = int(clamp(uniforms.shadowChromaDeadband, 0.0, 1.0) * 1023.0);
+    bool strictVisibleCleanExport = p010BoundedNormalProSdrExport() ||
+        p010StrictVisibleCleanExportAuthority() > 1.0;
+    float retain = clamp(1.0 - uniforms.chromaDenoise, strictVisibleCleanExport ? 0.0005 : 0.002, 1.0);
+    if (coherentChromaColor(chromaValue, neighborAverage)) {
+        retain = max(retain, COHERENT_CHROMA_RETAIN_FLOOR);
+    } else if (strictVisibleCleanExport) {
+        float isolatedNeutralGate = smoothstep(8.0, 56.0, abs(float(delta))) *
+            (1.0 - smoothstep(40.0, 96.0, abs(float(neighborDelta))));
+        retain *= mix(1.0, 0.16, isolatedNeutralGate);
+    }
+    // Soft deadband: within the threshold band ramp retain smoothly to 0 instead
+    // of a hard snap to neutral 512. The hard return printed a visible chroma
+    // contour mid-gradient on smooth desaturated skies (audit rank 28); the ramp
+    // is C0-continuous into the above-threshold region (smoothstep==1 at threshold).
+    if (threshold > 0) {
+        retain *= smoothstep(0.0, float(threshold), abs(float(delta)));
+    }
+    // Colour-preserving denoise: blend toward the LOCAL CHROMA AVERAGE (which carries the region's
+    // real colour) instead of toward neutral 512. The old `512 + delta*retain` pulled every
+    // non-coherent chroma sample to gray as chromaDenoise -> 1 (retain -> 0.0005), desaturating real
+    // colour all the way to black-and-white — not just smoothing noise. Blending toward the
+    // neighbourhood keeps chroma SIGNAL while still removing chroma NOISE: isolated spikes in neutral
+    // surrounds have neighbourAverage ~= 512 so they still neutralize, but real weak/textured colour
+    // now survives (retain=1 keeps the sample; retain=0 falls back to the colour-carrying average).
+    float denoised = mix(float(neighborAverage), float(chromaValue), retain);
+    return uint(clamp(denoised, 0.0, 1023.0));
+}
+
+uint applyLocalChromaSpikeSmoothing(uint chromaValue, uint neighborAverage) {
+    int delta = int(chromaValue) - 512;
+    int neighborDelta = int(neighborAverage) - 512;
+    bool strictVisibleCleanExport = p010BoundedNormalProSdrExport() ||
+        p010StrictVisibleCleanExportAuthority() > 1.0;
+    int spikeThreshold = strictVisibleCleanExport ? 44 : 80;
+    int neighborNeutralWindow = strictVisibleCleanExport ? 96 : 72;
+    bool isolatedSpike = abs(delta) >= spikeThreshold &&
+        abs(int(chromaValue) - int(neighborAverage)) >= spikeThreshold &&
+        abs(neighborDelta) <= neighborNeutralWindow;
+    if (!isolatedSpike) return chromaValue;
+    float smoothingPressure = max(p010ExportNoiseShape(), p010ExportLocalChromaSpikeShape());
+    float retained = strictVisibleCleanExport ?
+        mix(0.018, 0.004, clamp(smoothingPressure, 0.0, 1.0)) :
+        mix(0.060, 0.024, clamp(smoothingPressure, 0.0, 1.0));
+    return uint(clamp(512.0 + float(delta) * retained, 0.0, 1023.0));
+}
+
+float csfMicroContrastWeight(float lightness, float baseGain) {
+    float l = clamp(lightness, 0.0, 1.0);
+    return max(baseGain, 0.0) * pow(max(1.0 - l, 0.0), 1.2) * pow(max(l, 0.0), 0.8);
+}
+
+uint applyEdgeAwareDetailLift(uint sampleIndex, uint centerValue) {
+    uint width = max(pushData.width, 1u);
+    uint height = max(pushData.height, 1u);
+    uint row = sampleIndex / width;
+    uint column = sampleIndex - row * width;
+    if (row == 0u || column == 0u || row + 1u >= height || column + 1u >= width) return centerValue;
+
+    uint northWest = unpackP010(readCurrentP010Sample(sampleIndex - width - 1u));
+    uint north = unpackP010(readCurrentP010Sample(sampleIndex - width));
+    uint northEast = unpackP010(readCurrentP010Sample(sampleIndex - width + 1u));
+    uint south = unpackP010(readCurrentP010Sample(sampleIndex + width));
+    uint southWest = unpackP010(readCurrentP010Sample(sampleIndex + width - 1u));
+    uint southEast = unpackP010(readCurrentP010Sample(sampleIndex + width + 1u));
+    uint west = unpackP010(readCurrentP010Sample(sampleIndex - 1u));
+    uint east = unpackP010(readCurrentP010Sample(sampleIndex + 1u));
+    float c = float(centerValue);
+    float nw = float(northWest);
+    float n = float(north);
+    float ne = float(northEast);
+    float s = float(south);
+    float sw = float(southWest);
+    float se = float(southEast);
+    float w = float(west);
+    float e = float(east);
+    float neighborAverage = (c * 4.40 + (n + s + w + e) * 1.26 + (nw + ne + sw + se) * 0.58) / 11.52;
+    float edgeSignal = float(centerValue) - neighborAverage;
+    float magnitude = abs(edgeSignal) / 1023.0;
+    float gain = 0.0;
+    if (magnitude >= uniforms.strongEdgeThreshold) {
+        gain = (p010BoundedNormalProSdrExport()
+            ? p010NormalizeStrength(uniforms.strongDetailGain)
+            : uniforms.strongDetailGain) * abrDetailGainScale();
+    } else if (magnitude >= uniforms.mediumEdgeThreshold) {
+        gain = (p010BoundedNormalProSdrExport()
+            ? p010NormalizeStrength(uniforms.mediumDetailGain)
+            : uniforms.mediumDetailGain) * abrDetailGainScale();
+    } else if (magnitude >= uniforms.fineTextureThreshold) {
+        gain = (p010BoundedNormalProSdrExport()
+            ? p010NormalizeStrength(uniforms.fineTextureDetailGain)
+            : uniforms.fineTextureDetailGain) * abrDetailGainScale();
+    }
+
+    float signalSigma = sqrt(max(magnitude * magnitude - heteroscedasticNoiseVariance(float(centerValue) / 1023.0) * 0.070, 0.000001));
+    float shrunkEdgeSignal = bayesianWaveletShrink(edgeSignal / 1023.0, float(centerValue) / 1023.0, signalSigma) * 1023.0;
+    float scharrX = (-3.0 * nw + 3.0 * ne) + (-10.0 * w + 10.0 * e) + (-3.0 * sw + 3.0 * se);
+    float scharrY = (-3.0 * nw - 10.0 * n - 3.0 * ne) + (3.0 * sw + 10.0 * s + 3.0 * se);
+    float scharrMagnitude = length(vec2(scharrX, scharrY)) / 1023.0;
+    float localMin = min(min(min(nw, n), min(ne, w)), min(min(e, sw), min(s, se)));
+    float localMax = max(max(max(nw, n), max(ne, w)), max(max(e, sw), max(s, se)));
+    float localRange = (localMax - localMin) / 1023.0;
+    float tangentTexture = min(abs(ne - nw) + abs(se - sw), abs(ne - se) + abs(nw - sw)) / 1023.0;
+    float normalTexture = (max(abs(e - w), abs(n - s)) + max(abs(ne - sw), abs(nw - se))) / 1023.0;
+    float tangentConfidence = clamp(tangentTexture / max(tangentTexture + normalTexture, 0.00001), 0.0, 1.0);
+    float hardEdge = smoothstep(0.16, 0.62, localRange) * smoothstep(0.12, 0.82, scharrMagnitude);
+    float anisotropicHaloGuard = clamp(1.0 - hardEdge * (1.0 - tangentConfidence * 0.70), 0.04, 1.0);
+    float csfGain = 0.82 + csfMicroContrastWeight(float(centerValue) / 1023.0, 1.0) * 2.36;
+    float aliasLimit = p010BoundedNormalProSdrExport()
+        ? min(clamp(uniforms.aliasSafeMaxDetailDelta, 0.0, 1.0) * 1023.0, 64.0)
+        : clamp(uniforms.aliasSafeMaxDetailDelta, 0.0, 1.0) * 1023.0;
+    float lift = clamp(shrunkEdgeSignal * gain * anisotropicHaloGuard * csfGain, -aliasLimit, aliasLimit);
+    float overshoot = max(6.20, (localMax - localMin) * 0.22);
+    float candidate = clamp(float(centerValue) + lift, localMin - overshoot, localMax + overshoot);
+    return uint(clamp(candidate, 0.0, 1023.0));
+}
+
+uint applyApexMicroTextureRecover(uint sampleIndex, uint detailedValue) {
+    uint width = max(pushData.width, 1u);
+    uint height = max(pushData.height, 1u);
+    uint row = sampleIndex / width;
+    uint column = sampleIndex - row * width;
+    if (row < 2u || column < 2u || row + 2u >= height || column + 2u >= width) return detailedValue;
+
+    float c = float(unpackP010(readCurrentP010Sample(sampleIndex)));
+    float x1n = float(unpackP010(readCurrentP010Sample(sampleIndex - 1u)));
+    float x1p = float(unpackP010(readCurrentP010Sample(sampleIndex + 1u)));
+    float y1n = float(unpackP010(readCurrentP010Sample(sampleIndex - width)));
+    float y1p = float(unpackP010(readCurrentP010Sample(sampleIndex + width)));
+    float d1a = float(unpackP010(readCurrentP010Sample(sampleIndex - width - 1u)));
+    float d1b = float(unpackP010(readCurrentP010Sample(sampleIndex - width + 1u)));
+    float d1c = float(unpackP010(readCurrentP010Sample(sampleIndex + width - 1u)));
+    float d1d = float(unpackP010(readCurrentP010Sample(sampleIndex + width + 1u)));
+    float x2n = float(unpackP010(readCurrentP010Sample(sampleIndex - 2u)));
+    float x2p = float(unpackP010(readCurrentP010Sample(sampleIndex + 2u)));
+    float y2n = float(unpackP010(readCurrentP010Sample(sampleIndex - width * 2u)));
+    float y2p = float(unpackP010(readCurrentP010Sample(sampleIndex + width * 2u)));
+
+    float axial1 = x1n + x1p + y1n + y1p;
+    float diag1 = d1a + d1b + d1c + d1d;
+    float axial2 = x2n + x2p + y2n + y2p;
+    float microLowPass = (c * 4.0 + axial1 * 1.0 + diag1 * 0.66 + axial2 * 0.36) / 12.08;
+    float microTexture = c - microLowPass;
+    float localMin = min(min(min(x1n, x1p), min(y1n, y1p)), min(min(d1a, d1b), min(d1c, d1d)));
+    localMin = min(localMin, min(min(x2n, x2p), min(y2n, y2p)));
+    float localMax = max(max(max(x1n, x1p), max(y1n, y1p)), max(max(d1a, d1b), max(d1c, d1d)));
+    localMax = max(localMax, max(max(x2n, x2p), max(y2n, y2p)));
+    float localRange = max(localMax - localMin, 1.0);
+    float textureGate = smoothstep(uniforms.fineTextureThreshold * 1023.0, uniforms.mediumEdgeThreshold * 2046.0, abs(microTexture));
+    float shadowGate = smoothstep(10.0, 64.0, c);
+    float highlightGuard = 1.0 - smoothstep(920.0, 1006.0, c);
+    bool strictNormalProSdrExport = p010BoundedNormalProSdrExport();
+    float profileLift = strictNormalProSdrExport
+        ? p010NormalizeStrength(uniforms.fineTextureDetailGain) * abrDetailGainScale()
+        : clamp(uniforms.fineTextureDetailGain * abrDetailGainScale() / 10.0, 0.0, 1.0);
+    // Strict visible-clean HDR/LOG/RAW export gets the intended EXTRA micro-texture
+    // authority. The gate was p010StrictNormalProSdrExportAuthority() which only ever
+    // returns 0.0/1.0, so the > 1.0 boost was permanently DEAD — HDR/NIVUKX exports
+    // silently missed their intended detail recovery (audit rank 18). Enable it via
+    // the correct p010StrictVisibleCleanExportAuthority(), but CONSERVATIVELY: a
+    // modest gain boost and a bounded limit (NOT 10x of localRange, which the audit
+    // warned would overshoot/ring).
+    bool strictVisibleCleanExport = p010StrictVisibleCleanExportAuthority() > 1.0;
+    float microGain = strictNormalProSdrExport
+        ? mix(1.20, 2.60, profileLift)
+        : mix(2.0, 10.0, profileLift) *
+            (strictVisibleCleanExport ? 1.5 : 1.0);
+    float microLimit = strictNormalProSdrExport
+        ? max(3.0, localRange * mix(0.16, 0.28, profileLift))
+        : max(3.0, localRange * (strictVisibleCleanExport ? mix(0.30, 0.55, profileLift) : mix(0.18, 0.42, profileLift)));
+    float limitedMicro = clamp(
+        microTexture * microGain * textureGate * shadowGate * highlightGuard,
+        -microLimit,
+        microLimit
+    );
+    float candidate = clamp(float(detailedValue) + limitedMicro, 0.0, 1023.0);
+    return uint(candidate);
+}
+
+uint applyApexLocalContrastLuma(uint sampleIndex, uint microValue) {
+    uint width = max(pushData.width, 1u);
+    uint height = max(pushData.height, 1u);
+    uint row = sampleIndex / width;
+    uint column = sampleIndex - row * width;
+    if (row == 0u || column == 0u || row + 1u >= height || column + 1u >= width) return microValue;
+
+    float c = float(unpackP010(readCurrentP010Sample(sampleIndex)));
+    float n = float(unpackP010(readCurrentP010Sample(sampleIndex - width)));
+    float s = float(unpackP010(readCurrentP010Sample(sampleIndex + width)));
+    float w = float(unpackP010(readCurrentP010Sample(sampleIndex - 1u)));
+    float e = float(unpackP010(readCurrentP010Sample(sampleIndex + 1u)));
+    float nw = float(unpackP010(readCurrentP010Sample(sampleIndex - width - 1u)));
+    float ne = float(unpackP010(readCurrentP010Sample(sampleIndex - width + 1u)));
+    float sw = float(unpackP010(readCurrentP010Sample(sampleIndex + width - 1u)));
+    float se = float(unpackP010(readCurrentP010Sample(sampleIndex + width + 1u)));
+
+    float localMean = (c * 4.0 + (n + s + w + e) * 1.5 + (nw + ne + sw + se) * 0.75) / 13.0;
+    float localContrast = c - localMean;
+    float localMin = min(min(min(nw, n), min(ne, w)), min(min(e, sw), min(s, se)));
+    float localMax = max(max(max(nw, n), max(ne, w)), max(max(e, sw), max(s, se)));
+    float localRange = max(localMax - localMin, 1.0);
+    float textureGate = smoothstep(4.0, 36.0, abs(localContrast)) * smoothstep(8.0, 96.0, localRange);
+    float shadowGate = smoothstep(12.0, 80.0, c);
+    float highlightGuard = 1.0 - smoothstep(900.0, 1010.0, c);
+    bool strictNormalProSdrExport = p010BoundedNormalProSdrExport();
+    float profileLift = strictNormalProSdrExport
+        ? p010NormalizeStrength(uniforms.strongDetailGain) * abrDetailGainScale()
+        : clamp(uniforms.strongDetailGain * abrDetailGainScale() / 10.0, 0.0, 1.0);
+    float contrastGain = strictNormalProSdrExport
+        ? 1.0 + 0.45 * profileLift
+        : 1.0 + 3.0 * profileLift;
+    float contrastLimit = strictNormalProSdrExport
+        ? max(3.0, localRange * 0.24)
+        : max(3.0, localRange * 0.16);
+    float limitedContrast = clamp(
+        localContrast * contrastGain * textureGate * shadowGate * highlightGuard,
+        -contrastLimit,
+        contrastLimit
+    );
+    float candidate = clamp(float(microValue) + limitedContrast, 0.0, 1023.0);
+    return uint(candidate);
+}
+
+uint applyApexShadowNoiseFloorLuma(uint sampleIndex, uint contrastValue) {
+    uint width = max(pushData.width, 1u);
+    uint height = max(pushData.height, 1u);
+    uint row = sampleIndex / width;
+    uint column = sampleIndex - row * width;
+    if (row == 0u || column == 0u || row + 1u >= height || column + 1u >= width) return contrastValue;
+
+    float c = float(unpackP010(readCurrentP010Sample(sampleIndex)));
+    float n = float(unpackP010(readCurrentP010Sample(sampleIndex - width)));
+    float s = float(unpackP010(readCurrentP010Sample(sampleIndex + width)));
+    float w = float(unpackP010(readCurrentP010Sample(sampleIndex - 1u)));
+    float e = float(unpackP010(readCurrentP010Sample(sampleIndex + 1u)));
+    float nw = float(unpackP010(readCurrentP010Sample(sampleIndex - width - 1u)));
+    float ne = float(unpackP010(readCurrentP010Sample(sampleIndex - width + 1u)));
+    float sw = float(unpackP010(readCurrentP010Sample(sampleIndex + width - 1u)));
+    float se = float(unpackP010(readCurrentP010Sample(sampleIndex + width + 1u)));
+
+    float localMean = (c * 4.0 + (n + s + w + e) * 1.5 + (nw + ne + sw + se) * 0.75) / 13.0;
+    float localMin = min(min(min(nw, n), min(ne, w)), min(min(e, sw), min(s, se)));
+    float localMax = max(max(max(nw, n), max(ne, w)), max(max(e, sw), max(s, se)));
+    float localRange = max(localMax - localMin, 1.0);
+    bool strictVisibleCleanExport = p010BoundedNormalProSdrExport() ||
+        p010StrictVisibleCleanExportAuthority() > 1.0;
+    float legacyShadowNoiseGate = (1.0 - smoothstep(96.0, 360.0, c)) *
+        (1.0 - smoothstep(80.0, 260.0, localRange));
+    float strictShadowNoiseGate = max(
+        (1.0 - smoothstep(128.0, 520.0, c)) *
+            (1.0 - smoothstep(96.0, 340.0, localRange)),
+        p010StrictTexturelessGrainGate(c, localRange, abs(c - localMean))
+    );
+    float shadowNoiseGate = strictVisibleCleanExport ? strictShadowNoiseGate : legacyShadowNoiseGate;
+    float noiseFloorWeight = strictVisibleCleanExport ? 1.0 :
+        clamp(p010ExportNoiseShape() * 0.50, 0.0, 1.0);
+    noiseFloorWeight *= shadowNoiseGate;
+    float candidate = mix(float(contrastValue), localMean, noiseFloorWeight);
+    return uint(clamp(candidate, 0.0, 1023.0));
+}
+
+uint applyApexHighlightTextureLuma(uint sampleIndex, uint shadowCleanValue) {
+    uint width = max(pushData.width, 1u);
+    uint height = max(pushData.height, 1u);
+    uint row = sampleIndex / width;
+    uint column = sampleIndex - row * width;
+    if (row == 0u || column == 0u || row + 1u >= height || column + 1u >= width) return shadowCleanValue;
+
+    float c = float(unpackP010(readCurrentP010Sample(sampleIndex)));
+    float n = float(unpackP010(readCurrentP010Sample(sampleIndex - width)));
+    float s = float(unpackP010(readCurrentP010Sample(sampleIndex + width)));
+    float w = float(unpackP010(readCurrentP010Sample(sampleIndex - 1u)));
+    float e = float(unpackP010(readCurrentP010Sample(sampleIndex + 1u)));
+    float nw = float(unpackP010(readCurrentP010Sample(sampleIndex - width - 1u)));
+    float ne = float(unpackP010(readCurrentP010Sample(sampleIndex - width + 1u)));
+    float sw = float(unpackP010(readCurrentP010Sample(sampleIndex + width - 1u)));
+    float se = float(unpackP010(readCurrentP010Sample(sampleIndex + width + 1u)));
+
+    float localMean = (c * 4.0 + (n + s + w + e) * 1.5 + (nw + ne + sw + se) * 0.75) / 13.0;
+    float highlightDetail = c - localMean;
+    float localMin = min(min(min(nw, n), min(ne, w)), min(min(e, sw), min(s, se)));
+    float localMax = max(max(max(nw, n), max(ne, w)), max(max(e, sw), max(s, se)));
+    float localRange = max(localMax - localMin, 1.0);
+    float highlightTextureGate = smoothstep(600.0, 880.0, c) *
+        (1.0 - smoothstep(980.0, 1023.0, c));
+    float textureGate = smoothstep(4.0, 32.0, abs(highlightDetail)) *
+        smoothstep(10.0, 96.0, localRange);
+    bool strictNormalProSdrExport = p010BoundedNormalProSdrExport();
+    float profileLift = strictNormalProSdrExport
+        ? p010NormalizeStrength(uniforms.mediumDetailGain) * abrDetailGainScale()
+        : clamp(uniforms.mediumDetailGain * abrDetailGainScale() / 10.0, 0.0, 1.0);
+    float highlightGain = strictNormalProSdrExport
+        ? 1.0 + 0.55 * profileLift
+        : 1.0 + 4.0 * profileLift;
+    float highlightLimit = strictNormalProSdrExport
+        ? max(4.0, localRange * 0.24)
+        : max(4.0, localRange * 0.18);
+    float headroomGuard = highlightDetail > 0.0 ?
+        smoothstep(0.0, 32.0, 1023.0 - float(shadowCleanValue)) : 1.0;
+    float limitedHighlight = clamp(
+        highlightDetail * highlightGain * highlightTextureGate * textureGate * headroomGuard,
+        -highlightLimit,
+        highlightLimit
+    );
+    float candidate = clamp(float(shadowCleanValue) + limitedHighlight, 0.0, 1023.0);
+    return uint(candidate);
+}
+
+uint applyApexEdgeCoherenceLuma(uint sampleIndex, uint highlightedValue) {
+    uint width = max(pushData.width, 1u);
+    uint height = max(pushData.height, 1u);
+    uint row = sampleIndex / width;
+    uint column = sampleIndex - row * width;
+    if (row == 0u || column == 0u || row + 1u >= height || column + 1u >= width) return highlightedValue;
+
+    float c = float(unpackP010(readCurrentP010Sample(sampleIndex)));
+    float n = float(unpackP010(readCurrentP010Sample(sampleIndex - width)));
+    float s = float(unpackP010(readCurrentP010Sample(sampleIndex + width)));
+    float w = float(unpackP010(readCurrentP010Sample(sampleIndex - 1u)));
+    float e = float(unpackP010(readCurrentP010Sample(sampleIndex + 1u)));
+    float nw = float(unpackP010(readCurrentP010Sample(sampleIndex - width - 1u)));
+    float ne = float(unpackP010(readCurrentP010Sample(sampleIndex - width + 1u)));
+    float sw = float(unpackP010(readCurrentP010Sample(sampleIndex + width - 1u)));
+    float se = float(unpackP010(readCurrentP010Sample(sampleIndex + width + 1u)));
+
+    float localMean = (c * 4.0 + (n + s + w + e) * 1.5 + (nw + ne + sw + se) * 0.75) / 13.0;
+    float gx = (e - w) + (ne + se - nw - sw) * 0.5;
+    float gy = (s - n) + (sw + se - nw - ne) * 0.5;
+    float localMin = min(c, min(min(min(nw, n), min(ne, w)), min(min(e, sw), min(s, se))));
+    float localMax = max(c, max(max(max(nw, n), max(ne, w)), max(max(e, sw), max(s, se))));
+    float localRange = max(localMax - localMin, 1.0);
+    float detail = c - localMean;
+    float edgeCoherenceGate = smoothstep(18.0, 96.0, abs(gx) + abs(gy)) *
+        smoothstep(10.0, 96.0, localRange);
+    float haloRisk = smoothstep(localRange * 0.52, localRange, abs(detail));
+    bool strictNormalProSdrExport = p010BoundedNormalProSdrExport();
+    float profileLift = strictNormalProSdrExport
+        ? p010NormalizeStrength(uniforms.strongDetailGain) * abrDetailGainScale()
+        : clamp(uniforms.strongDetailGain * abrDetailGainScale() / 10.0, 0.0, 1.0);
+    float edgeGain = strictNormalProSdrExport
+        ? 1.0 + 0.60 * profileLift
+        : 1.0 + 4.0 * profileLift;
+    float edgeLimit = strictNormalProSdrExport
+        ? max(4.0, localRange * 0.26)
+        : max(4.0, localRange * 0.20);
+    float coherentLift = clamp(
+        detail * edgeGain * edgeCoherenceGate * (1.0 - haloRisk * 0.48),
+        -edgeLimit,
+        edgeLimit
+    );
+    float candidate = float(highlightedValue) + coherentLift;
+    float haloSafe = clamp(candidate, max(localMin - edgeLimit, 0.0), min(localMax + edgeLimit, 1023.0));
+    return uint(clamp(haloSafe, 0.0, 1023.0));
+}
+
+uint applyApexTonalDensityLuma(uint sampleIndex, uint edgeValue) {
+    uint width = max(pushData.width, 1u);
+    uint height = max(pushData.height, 1u);
+    uint row = sampleIndex / width;
+    uint column = sampleIndex - row * width;
+    if (row == 0u || column == 0u || row + 1u >= height || column + 1u >= width) return edgeValue;
+
+    float c = float(unpackP010(readCurrentP010Sample(sampleIndex)));
+    float n = float(unpackP010(readCurrentP010Sample(sampleIndex - width)));
+    float s = float(unpackP010(readCurrentP010Sample(sampleIndex + width)));
+    float w = float(unpackP010(readCurrentP010Sample(sampleIndex - 1u)));
+    float e = float(unpackP010(readCurrentP010Sample(sampleIndex + 1u)));
+    float nw = float(unpackP010(readCurrentP010Sample(sampleIndex - width - 1u)));
+    float ne = float(unpackP010(readCurrentP010Sample(sampleIndex - width + 1u)));
+    float sw = float(unpackP010(readCurrentP010Sample(sampleIndex + width - 1u)));
+    float se = float(unpackP010(readCurrentP010Sample(sampleIndex + width + 1u)));
+
+    float localMin = min(c, min(min(min(nw, n), min(ne, w)), min(min(e, sw), min(s, se))));
+    float localMax = max(c, max(max(max(nw, n), max(ne, w)), max(max(e, sw), max(s, se))));
+    float localRange = max(localMax - localMin, 1.0);
+    float neighborMean = (n + s + w + e + nw + ne + sw + se) * 0.125;
+    float isolatedBrightDetail = max(c - neighborMean, 0.0);
+    float isolatedDetailGuard = 1.0 - smoothstep(6.0, 18.0, isolatedBrightDetail);
+    float midtoneGate = smoothstep(160.0, 360.0, c) *
+        (1.0 - smoothstep(760.0, 980.0, c));
+    float flatMidtoneGate = (1.0 - smoothstep(96.0, 260.0, localRange)) *
+        midtoneGate;
+    bool strictNormalProSdrExport = p010BoundedNormalProSdrExport();
+    float profileLift = strictNormalProSdrExport
+        ? p010NormalizeStrength(uniforms.mediumDetailGain) * abrDetailGainScale()
+        : clamp(uniforms.mediumDetailGain * abrDetailGainScale() / 10.0, 0.0, 1.0);
+    float normalized = clamp((float(edgeValue) - 512.0) / 512.0, -1.0, 1.0);
+    float densityGain = strictNormalProSdrExport
+        ? 1.0 + 0.35 * profileLift
+        : 1.0 + 3.0 * profileLift;
+    float densityDelta = normalized * (1.0 - abs(normalized)) * densityGain;
+    float positiveDensityGuard = densityDelta > 0.0 ? isolatedDetailGuard : 1.0;
+    float densityLimit = strictNormalProSdrExport
+        ? max(2.0, localRange * 0.10)
+        : max(2.0, localRange * 0.06);
+    float candidate = float(edgeValue) + densityDelta * flatMidtoneGate * positiveDensityGuard * 24.0;
+    float densitySafe = clamp(candidate, float(edgeValue) - densityLimit, float(edgeValue) + densityLimit);
+    return uint(clamp(densitySafe, 0.0, 1023.0));
+}
+
+uint applyApexLongDistanceDetailLuma(uint sampleIndex, uint tonalValue) {
+    uint width = max(pushData.width, 1u);
+    uint height = max(pushData.height, 1u);
+    uint row = sampleIndex / width;
+    uint column = sampleIndex - row * width;
+    if (row < 2u || column < 2u || row + 2u >= height || column + 2u >= width) return tonalValue;
+
+    float c = float(unpackP010(readCurrentP010Sample(sampleIndex)));
+    float x1n = float(unpackP010(readCurrentP010Sample(sampleIndex - 1u)));
+    float x1p = float(unpackP010(readCurrentP010Sample(sampleIndex + 1u)));
+    float y1n = float(unpackP010(readCurrentP010Sample(sampleIndex - width)));
+    float y1p = float(unpackP010(readCurrentP010Sample(sampleIndex + width)));
+    float d1a = float(unpackP010(readCurrentP010Sample(sampleIndex - width - 1u)));
+    float d1b = float(unpackP010(readCurrentP010Sample(sampleIndex - width + 1u)));
+    float d1c = float(unpackP010(readCurrentP010Sample(sampleIndex + width - 1u)));
+    float d1d = float(unpackP010(readCurrentP010Sample(sampleIndex + width + 1u)));
+    float x2n = float(unpackP010(readCurrentP010Sample(sampleIndex - 2u)));
+    float x2p = float(unpackP010(readCurrentP010Sample(sampleIndex + 2u)));
+    float y2n = float(unpackP010(readCurrentP010Sample(sampleIndex - width * 2u)));
+    float y2p = float(unpackP010(readCurrentP010Sample(sampleIndex + width * 2u)));
+    bool hasWideRing = row >= 3u && column >= 3u && row + 3u < height && column + 3u < width;
+    float x3n = x2n;
+    float x3p = x2p;
+    float y3n = y2n;
+    float y3p = y2p;
+    if (hasWideRing) {
+        x3n = float(unpackP010(readCurrentP010Sample(sampleIndex - 3u)));
+        x3p = float(unpackP010(readCurrentP010Sample(sampleIndex + 3u)));
+        y3n = float(unpackP010(readCurrentP010Sample(sampleIndex - width * 3u)));
+        y3p = float(unpackP010(readCurrentP010Sample(sampleIndex + width * 3u)));
+    }
+
+    float axial1 = x1n + x1p + y1n + y1p;
+    float diagonal1 = d1a + d1b + d1c + d1d;
+    float axial2 = x2n + x2p + y2n + y2p;
+    float axial3 = x3n + x3p + y3n + y3p;
+    float nearMean = (c * 4.0 + axial1 * 1.0 + diagonal1 * 0.75) / 11.0;
+    float farMean = (c * 4.0 + axial1 * 1.0 + diagonal1 * 0.66 + axial2 * 0.50) / 12.64;
+    float longDistanceDetail = (c - farMean) + (nearMean - farMean);
+    float wideMean = hasWideRing ?
+        (c * 4.0 + axial1 * 0.82 + diagonal1 * 0.56 + axial2 * 0.44 + axial3 * 0.30) / 13.92 :
+        farMean;
+    float longDistanceStructure = mix(
+        longDistanceDetail,
+        (c - wideMean) + (nearMean - wideMean),
+        hasWideRing ? 0.42 : 0.18
+    );
+    float singlePixelNoise = abs(c - nearMean);
+    float localMin = min(min(min(c, x1n), min(x1p, y1n)), min(min(y1p, d1a), min(d1b, d1c)));
+    localMin = min(localMin, min(min(d1d, x2n), min(x2p, min(y2n, y2p))));
+    localMin = min(localMin, min(min(x3n, x3p), min(y3n, y3p)));
+    float localMax = max(max(max(c, x1n), max(x1p, y1n)), max(max(y1p, d1a), max(d1b, d1c)));
+    localMax = max(localMax, max(max(d1d, x2n), max(x2p, max(y2n, y2p))));
+    localMax = max(localMax, max(max(x3n, x3p), max(y3n, y3p)));
+    float localRange = max(localMax - localMin, 1.0);
+    float textureGate = smoothstep(0.35, 2.2, abs(longDistanceStructure)) *
+        (1.0 - smoothstep(56.0, 144.0, localRange));
+    float midtoneGate = smoothstep(64.0, 180.0, c) *
+        (1.0 - smoothstep(900.0, 1016.0, c));
+    float wideAgreement = hasWideRing ?
+        1.0 - smoothstep(2.0, 18.0, abs(farMean - wideMean)) :
+        0.38;
+    float noiseReject = clamp(
+        1.0 - smoothstep(18.0, 42.0, singlePixelNoise) * (0.62 - wideAgreement * 0.22),
+        0.34 + wideAgreement * 0.24,
+        1.0
+    );
+    bool strictNormalProSdrExport = p010BoundedNormalProSdrExport();
+    float profileLift = strictNormalProSdrExport
+        ? p010NormalizeStrength(uniforms.fineTextureDetailGain) * abrDetailGainScale()
+        : clamp(uniforms.fineTextureDetailGain * abrDetailGainScale() / 10.0, 0.0, 1.0);
+    if (!strictNormalProSdrExport) return tonalValue;
+    float longDistanceGain = strictNormalProSdrExport
+        ? 1.0 + 1.40 * profileLift
+        : 1.0 + 4.0 * profileLift;
+    float detailLimit = strictNormalProSdrExport
+        ? max(2.0, localRange * 0.18)
+        : max(2.0, localRange * 0.10);
+    float current = float(tonalValue);
+    float detailLift = clamp(
+        longDistanceStructure * longDistanceGain * textureGate * midtoneGate * noiseReject,
+        -detailLimit,
+        detailLimit
+    );
+    float candidate = current + detailLift;
+    float safeDetail = clamp(candidate, max(localMin - detailLimit, current - detailLimit), min(min(localMax + detailLimit, current + detailLimit), 1023.0));
+    return uint(clamp(safeDetail, 0.0, 1023.0));
+}
+
+float p010DetailNoiseConfidence(uint sampleIndex, float baseValue, float localMean, float localRange) {
+    float residual = abs(baseValue - localMean);
+    float expectedNoise = sqrt(heteroscedasticNoiseVariance(baseValue / 1023.0)) * 1023.0;
+    float residualConfidence = smoothstep(expectedNoise * 1.35, expectedNoise * 4.5, residual);
+    float rangeConfidence = smoothstep(expectedNoise * 2.0, expectedNoise * 8.0, localRange);
+    return clamp(max(residualConfidence, rangeConfidence * 0.72) * (1.0 - p010ExportNoiseShape() * 0.52), 0.0, 1.0);
+}
+
+float p010SkinDetailGuard(float lumaCode) {
+    float normalizedLuma = clamp(lumaCode / 1023.0, 0.0, 1.0);
+    float skinExposureWindow = smoothstep(0.08, 0.24, normalizedLuma) *
+        (1.0 - smoothstep(0.72, 0.94, normalizedLuma));
+    float protection = p010NormalizeStrength(uniforms.skinDetailProtection);
+    return mix(1.0, 0.68, skinExposureWindow * protection);
+}
+
+uint applyCumulativeDetailBudget(uint sampleIndex, uint detailBase, uint candidateValue) {
+    uint width = max(pushData.width, 1u);
+    uint height = max(pushData.height, 1u);
+    uint row = sampleIndex / width;
+    uint column = sampleIndex - row * width;
+    if (row == 0u || column == 0u || row + 1u >= height || column + 1u >= width) {
+        return detailBase;
+    }
+
+    float n = float(unpackP010(readCurrentP010Sample(sampleIndex - width)));
+    float s = float(unpackP010(readCurrentP010Sample(sampleIndex + width)));
+    float w = float(unpackP010(readCurrentP010Sample(sampleIndex - 1u)));
+    float e = float(unpackP010(readCurrentP010Sample(sampleIndex + 1u)));
+    float nw = float(unpackP010(readCurrentP010Sample(sampleIndex - width - 1u)));
+    float ne = float(unpackP010(readCurrentP010Sample(sampleIndex - width + 1u)));
+    float sw = float(unpackP010(readCurrentP010Sample(sampleIndex + width - 1u)));
+    float se = float(unpackP010(readCurrentP010Sample(sampleIndex + width + 1u)));
+    float baseValue = float(detailBase);
+    float candidate = float(candidateValue);
+    float localMin = min(baseValue, min(min(min(nw, n), min(ne, w)), min(min(e, sw), min(s, se))));
+    float localMax = max(baseValue, max(max(max(nw, n), max(ne, w)), max(max(e, sw), max(s, se))));
+    float localRange = max(localMax - localMin, 1.0);
+    float localMean = (n + s + w + e + nw + ne + sw + se) * 0.125;
+
+    float noiseConfidence = p010DetailNoiseConfidence(sampleIndex, baseValue, localMean, localRange);
+    float edgeGuard = mix(1.0, 0.62, smoothstep(164.0, 532.0, localRange));
+    float highlightGuard = 1.0 - smoothstep(736.0, 1006.0, baseValue) * 0.76;
+    float skinGuard = p010SkinDetailGuard(baseValue);
+    float requestedDelta = candidate - baseValue;
+    float haloGuard = 1.0 - smoothstep(localRange * 0.42, localRange, abs(requestedDelta)) * 0.80;
+    float detailBudget = min(
+        P010_MAX_CUMULATIVE_DETAIL_CODES,
+        max(3.0, localRange * 0.20)
+    ) * noiseConfidence * edgeGuard * highlightGuard * skinGuard * haloGuard;
+    float boundedDelta = clamp(requestedDelta, -detailBudget, detailBudget);
+    float cumulativeOvershoot = min(6.0, max(1.5, localRange * 0.08));
+    float bounded = clamp(
+        baseValue + boundedDelta,
+        max(0.0, localMin - cumulativeOvershoot),
+        min(1023.0, localMax + cumulativeOvershoot)
+    );
+    return uint(clamp(bounded + 0.5, 0.0, 1023.0));
+}
+
+const int BLUE_NOISE_8X8[64] = int[64](
+     0, 48, 12, 60,  3, 51, 15, 63,
+    32, 16, 44, 28, 35, 19, 47, 31,
+     8, 56,  4, 52, 11, 59,  7, 55,
+    40, 24, 36, 20, 43, 27, 39, 23,
+     2, 50, 14, 62,  1, 49, 13, 61,
+    34, 18, 46, 30, 33, 17, 45, 29,
+    10, 58,  6, 54,  9, 57,  5, 53,
+    42, 26, 38, 22, 41, 25, 37, 21
+);
+
+uint applyBlueNoiseDither(uint sampleIndex, uint sampleValue) {
+    if (p010ZeroVisibleGrainExport()) return sampleValue;
+    uint width = max(pushData.width, 1u);
+    uint x = sampleIndex - (sampleIndex / width) * width;
+    uint y = sampleIndex / width;
+    uint matrixIndex = ((y & 7u) << 3u) + (x & 7u);
+    float centeredBlueNoise = (float(BLUE_NOISE_8X8[int(matrixIndex)]) - 31.5) / 31.5;
+    float exportNoiseShape = p010ExportNoiseShape();
+    float amplitude = clamp(0.35 + exportNoiseShape * 0.18, 0.0, 1.0) * abrDitherAmplitudeScale();
+    float dither = centeredBlueNoise * amplitude * 2.0;
+    float quantized = float(sampleValue) + (dither >= 0.33 ? 1.0 : (dither <= -0.33 ? -1.0 : 0.0));
+    return uint(clamp(quantized, 0.0, 1023.0));
+}
+
+uint applyPhaseShiftedFilmGrain(uint sampleIndex, uint sampleValue) {
+    if (p010ZeroVisibleGrainExport()) return sampleValue;
+    uint width = max(pushData.width, 1u);
+    uint x = sampleIndex - (sampleIndex / width) * width;
+    uint y = sampleIndex / width;
+    uint phase = uint(clamp(uniforms.temporalLumaBlend * 11.0 + p010ExportNoiseShape() * 17.0, 0.0, 63.0));
+    uint matrixIndex = (((y + phase) & 7u) << 3u) + ((x + (phase >> 1u)) & 7u);
+    float grain = (float(BLUE_NOISE_8X8[int(matrixIndex)]) - 31.5) / 31.5;
+    float shadowWeight = 1.0 - smoothstep(256.0, 760.0, float(sampleValue));
+    float highlightProtect = 1.0 - smoothstep(820.0, 1000.0, float(sampleValue));
+    float amplitude = clamp(p010ExportNoiseShape() * 0.42 + 0.10, 0.0, 0.55) * abrDitherAmplitudeScale();
+    float signedLift = grain * amplitude * shadowWeight * highlightProtect;
+    return uint(clamp(float(sampleValue) + signedLift, 0.0, 1023.0));
+}
+
+uint applyWarmHighlightHalation(uint sampleIndex, uint sampleValue) {
+    uint width = max(pushData.width, 1u);
+    uint height = max(pushData.height, 1u);
+    uint row = sampleIndex / width;
+    uint column = sampleIndex - row * width;
+    if (row == 0u || column == 0u || row + 1u >= height || column + 1u >= width) return sampleValue;
+    uint north = unpackP010(readCurrentP010Sample(sampleIndex - width));
+    uint south = unpackP010(readCurrentP010Sample(sampleIndex + width));
+    uint west = unpackP010(readCurrentP010Sample(sampleIndex - 1u));
+    uint east = unpackP010(readCurrentP010Sample(sampleIndex + 1u));
+    float computedNeighborPeak = max(max(float(north), float(south)), max(float(west), float(east)));
+    float highlightBleed = smoothstep(820.0, 1010.0, computedNeighborPeak) *
+        smoothstep(64.0, 260.0, computedNeighborPeak - float(sampleValue));
+    return uint(clamp(float(sampleValue) + highlightBleed * 2.0, 0.0, 1023.0));
+}
+
+float planckBlueNoiseJndThreshold(uint sampleValue) {
+    float luma = clamp(float(sampleValue) / 1023.0, 0.0, 1.0);
+    float shadowSensitivity = mix(1.45, 0.72, smoothstep(0.03, 0.34, luma));
+    float highlightProtect = 1.0 - smoothstep(0.82, 1.0, luma);
+    return clamp((0.35 + sqrt(max(luma, 0.0)) * 0.62) * shadowSensitivity * highlightProtect, 0.0, 1.0);
+}
+
+uint applyPlanckBlueNoiseJndDither(uint sampleIndex, uint sampleValue) {
+    uint width = max(pushData.width, 1u);
+    uint x = sampleIndex - (sampleIndex / width) * width;
+    uint y = sampleIndex / width;
+    uint phase = uint(clamp(uniforms.temporalBlend * 23.0 + p010ExportNoiseShape() * 29.0, 0.0, 63.0));
+    uint matrixIndex = (((y + phase) & 7u) << 3u) + ((x + phase * 3u) & 7u);
+    float blue = (float(BLUE_NOISE_8X8[int(matrixIndex)]) - 31.5) / 31.5;
+    float jnd = planckBlueNoiseJndThreshold(sampleValue);
+    float shaped = blue * jnd * abrDitherAmplitudeScale() * JND_EXPORT_DITHER_VISIBILITY_SCALE;
+    float quantized = float(sampleValue) + (shaped >= 0.50 ? 1.0 : (shaped <= -0.50 ? -1.0 : 0.0));
+    return uint(clamp(quantized, 0.0, 1023.0));
+}
+
+uint applyFitzHughNagumoChemicalHalation(uint sampleIndex, uint sampleValue) {
+    float activator = smoothstep(820.0, 1023.0, float(sampleValue));
+    float inhibitor = smoothstep(128.0, 640.0, float(sampleValue));
+    for (int step = 0; step < 4; step++) {
+        float reaction = activator - activator * activator * activator * 0.3333 - inhibitor + 0.045;
+        inhibitor += 0.14 * (activator + 0.58 - 0.80 * inhibitor);
+        activator = clamp(activator + reaction * 0.20, 0.0, 1.0);
+    }
+    float warmthLift = activator * (1.0 - smoothstep(940.0, 1023.0, float(sampleValue))) * 2.0;
+    return uint(clamp(float(sampleValue) + warmthLift, 0.0, 1023.0));
+}
+
+uint applyPlanckGrain(uint sampleIndex, uint sampleValue) {
+    if (p010ZeroVisibleGrainExport()) return sampleValue;
+    uint width = max(pushData.width, 1u);
+    uint x = sampleIndex - (sampleIndex / width) * width;
+    uint y = sampleIndex / width;
+    uint matrixIndex = (((x * 5u + y * 3u) & 7u) << 3u) + ((x * 3u + y * 7u) & 7u);
+    float grain = (float(BLUE_NOISE_8X8[int(matrixIndex)]) - 31.5) / 31.5;
+    float jnd = planckBlueNoiseJndThreshold(sampleValue) * 0.38;
+    return uint(clamp(float(sampleValue) + grain * jnd, 0.0, 1023.0));
+}
+
+float highEntropyPlanckBlueNoiseTexture(uint sampleIndex) {
+    uint width = max(pushData.width, 1u);
+    uint x = sampleIndex - (sampleIndex / width) * width;
+    uint y = sampleIndex / width;
+    uint hash = x * 1664525u + y * 1013904223u + uint(uniforms.temporalBlend * 65535.0);
+    hash ^= hash >> 13u;
+    hash *= 1274126177u;
+    uint matrixIndex = ((hash >> 3u) & 63u);
+    return (float(BLUE_NOISE_8X8[int(matrixIndex)]) - 31.5) / 31.5;
+}
+
+float jndShapedQuantizationError(uint sampleIndex, uint sampleValue) {
+    if (p010ZeroVisibleGrainExport()) return 0.0;
+    float highEntropyBlue = highEntropyPlanckBlueNoiseTexture(sampleIndex);
+    float jnd = planckBlueNoiseJndThreshold(sampleValue);
+    return highEntropyBlue * jnd * abrDitherAmplitudeScale() * JND_EXPORT_DITHER_VISIBILITY_SCALE;
+}
+
+vec2 neuralOpticalFlowVector(uint sampleIndex) {
+    uint width = max(pushData.width, 1u);
+    uint x = sampleIndex - (sampleIndex / width) * width;
+    uint y = sampleIndex / width;
+    float gyroPhase = uniforms.dualGainTimestampSkew * 6.2831853;
+    float flowX = (sin(float(y) * 0.03125 + gyroPhase) * 0.35 + uniforms.dualGainKGain * 0.18) *
+        clamp(uniforms.dualGainMotionMaskEnabled, 0.0, 1.0);
+    float flowY = (cos(float(x) * 0.03125 + gyroPhase) * 0.35 + uniforms.dualGainNoiseFloor * 0.12) *
+        clamp(uniforms.dualGainMotionMaskEnabled, 0.0, 1.0);
+    return vec2(flowX, flowY);
+}
+
+uint motionCompensatedPreviousIndex(uint sampleIndex, out float boundaryGuard) {
+    uint width = max(pushData.width, 1u);
+    uint height = max(pushData.height, 1u);
+    uint row = sampleIndex / width;
+    uint column = sampleIndex - row * width;
+    vec2 flow = neuralOpticalFlowVector(sampleIndex);
+    vec2 warped = vec2(float(column), float(row)) - flow;
+    boundaryGuard = step(0.0, warped.x) * step(0.0, warped.y) *
+        step(warped.x, float(width - 1u)) * step(warped.y, float(height - 1u));
+    vec2 clampedWarp = clamp(warped, vec2(0.0), vec2(float(width - 1u), float(height - 1u)));
+    uint warpedX = uint(clampedWarp.x + 0.5);
+    uint warpedY = uint(clampedWarp.y + 0.5);
+    return warpedY * width + warpedX;
+}
+
+float p010TemporalMotionConfidence(
+    uint currentValue,
+    uint previousValue,
+    float flowMagnitude,
+    bool chromaSample
+) {
+    float delta = abs(float(currentValue) - float(previousValue));
+    float variance = heteroscedasticNoiseVariance(float(currentValue) / 1023.0);
+    float noiseCodes = sqrt(variance) * 1023.0;
+    float photometricConfidence = 1.0 - smoothstep(
+        noiseCodes * (chromaSample ? 2.8 : 2.2),
+        noiseCodes * (chromaSample ? 7.0 : 5.5) + 8.0,
+        delta
+    );
+    float flowConfidence = 1.0 - smoothstep(0.35, 2.25, flowMagnitude);
+    float timestampConfidence = 1.0 - smoothstep(0.001, 0.012, abs(uniforms.dualGainTimestampSkew));
+    return clamp(photometricConfidence * flowConfidence * timestampConfidence, 0.0, 1.0);
+}
+
+uint motionCompensatedBilateralTemporalBlend(uint sampleIndex, uint currentValue, bool chromaSample) {
+    if (pushData.hasPreviousFrame == 0u) return currentValue;
+    float boundaryGuard = 0.0;
+    uint previousIndex = chromaSample ? sampleIndex : motionCompensatedPreviousIndex(sampleIndex, boundaryGuard);
+    if (chromaSample) boundaryGuard = 1.0;
+    uint previousValue = unpackP010(readPreviousP010Sample(previousIndex));
+    float currentNorm = float(currentValue) / 1023.0;
+    float previousNorm = float(previousValue) / 1023.0;
+    float colorSigma = mix(0.018, 0.075, p010ExportNoiseShape());
+    float colorDistance = currentNorm - previousNorm;
+    float bilateralWeight = exp(-(colorDistance * colorDistance) / max(2.0 * colorSigma * colorSigma, 0.000001));
+    float legacyWeight = chromaSample ? uniforms.temporalChromaBlend : uniforms.temporalLumaBlend;
+    float flowMagnitude = chromaSample ? 0.0 : length(neuralOpticalFlowVector(sampleIndex));
+    float motionConfidence = p010TemporalMotionConfidence(currentValue, previousValue, flowMagnitude, chromaSample);
+
+    // Strict beyond-IMAX high-end motion blur suppression gate
+    float strictMotionSuppress = exp(-max(abs(currentNorm - previousNorm) - 0.002, 0.0) * 150.0);
+    if (flowMagnitude > 0.04) {
+        strictMotionSuppress *= exp(-max(flowMagnitude - 0.04, 0.0) * 85.0);
+    }
+    motionConfidence *= strictMotionSuppress;
+
+    if (!p010BoundedNormalProSdrExport()) {
+        float legacyAlpha = clamp(legacyWeight * bilateralWeight * boundaryGuard, 0.0, 1.0) * motionConfidence;
+        return blendSample(currentValue, previousValue, legacyAlpha);
+    }
+    float baseAlpha = p010NormalizeStrength(legacyWeight);
+    float temporalCap = chromaSample ? 0.64 : P010_MAX_TEMPORAL_PREVIOUS_WEIGHT;
+    // Apply a SINGLE ceiling (the tightest cap) then modulate by the confidence
+    // terms. Previously the two cap terms were MULTIPLIED —
+    // min(baseAlpha,MAX)*min(temporalCap,MAX) — squaring them: with baseAlpha=1
+    // and temporalCap=MAX=0.72 the realized previous-frame weight was 0.72*0.72=
+    // 0.518, far below the intended 0.72 ceiling, leaving more residual temporal
+    // shimmer than designed on static shots (audit rank 19).
+    float cappedAlpha = min(min(baseAlpha, temporalCap), P010_MAX_TEMPORAL_PREVIOUS_WEIGHT);
+    float alphaTemp = clamp(
+        cappedAlpha * bilateralWeight * boundaryGuard * motionConfidence,
+        0.0,
+        P010_MAX_TEMPORAL_PREVIOUS_WEIGHT
+    );
+    return blendSample(currentValue, previousValue, alphaTemp);
+}
+
+// Real block-match optical flow in P010 luma space (NPV10 export). Searches the bound previous frame
+// for the best SAD-matching 3x3 patch within a +/-RADIUS window -> a genuine per-pixel motion vector
+// (replaces the analytic gyro-phase estimate for the deblur). Heavy by design (owner directive: real
+// flow, not approximation); offline export only. Returns zero flow when no previous frame is bound.
+vec2 rivenBlockMatchFlow(uint lumaIndex) {
+    if (pushData.hasPreviousFrame == 0u) return vec2(0.0);
+    const int RADIUS = 3;
+    const int PATCH = 1;
+    int tileX = int(gl_LocalInvocationID.x) + RIVEN_TILE_HALO;
+    int tileY = int(gl_LocalInvocationID.y) + RIVEN_TILE_HALO;
+    float bestSad = 1e20;
+    vec2 bestFlow = vec2(0.0);
+    for (int dy = -RADIUS; dy <= RADIUS; ++dy) {
+        for (int dx = -RADIUS; dx <= RADIUS; ++dx) {
+            float sad = 0.0;
+            for (int py = -PATCH; py <= PATCH; ++py) {
+                for (int px = -PATCH; px <= PATCH; ++px) {
+                    int currentTileIndex = (tileY + py) * RIVEN_TILE_EDGE + tileX + px;
+                    int previousTileIndex =
+                        (tileY + py + dy) * RIVEN_TILE_EDGE + tileX + px + dx;
+                    float cur = float(rivenCurrentLumaTile[currentTileIndex]);
+                    float prv = float(rivenPreviousLumaTile[previousTileIndex]);
+                    sad += abs(cur - prv);
+                }
+            }
+            if (sad < bestSad) {
+                bestSad = sad;
+                bestFlow = vec2(float(dx), float(dy));
+                // P010 sample differences are exact non-negative integers. Zero is the global SAD
+                // minimum, so no later candidate can beat it under the strict `<` tie rule. This
+                // exits only provably redundant work and leaves every selected vector/output bit exact.
+                if (bestSad == 0.0) return bestFlow;
+            }
+        }
+    }
+    return bestFlow;
+}
+
+// OmniClarity §4 Riven directional motion-deblur in P010 luma space (NPV10 export path).
+// Models intra-frame motion blur as a 1D line kernel along the export's analytic motion flow and
+// applies a Wiener-regularized directional inverse, ringing-clamped to the local line extremes.
+// No-op where there is no measurable motion (passes the luma through unchanged). Driven by the
+// export's analytic flow (neuralOpticalFlowVector), not the full Argus pyramid — bounded + safe.
+uint rivenP010LumaDeblur(uint lumaIndex, uint centerValue) {
+    uint width = max(pushData.width, 1u);
+    uint height = max(pushData.height, 1u);
+    uint x = lumaIndex - (lumaIndex / width) * width;
+    uint y = lumaIndex / width;
+    vec2 flow = rivenBlockMatchFlow(lumaIndex);
+    float speed = length(flow);
+    float exposureFraction = clamp(uniforms.temporalLumaBlend, 0.1, 1.0);
+    float kernelLength = min(speed * exposureFraction * 2.5, 12.0);
+    const float minKernel = 1.5;
+    if (kernelLength < minKernel || speed < 1e-5) {
+        return centerValue;
+    }
+    vec2 dir = flow / speed;
+    const int TAPS = 12;
+    float center = float(centerValue);
+    float acc = 0.0;
+    float lineMin = center;
+    float lineMax = center;
+    for (int i = 0; i < TAPS; ++i) {
+        float t = (float(i) / float(TAPS - 1) - 0.5) * kernelLength;
+        vec2 c = vec2(float(x), float(y)) + dir * t;
+        uint cx = uint(clamp(c.x + 0.5, 0.0, float(width - 1u)));
+        uint cy = uint(clamp(c.y + 0.5, 0.0, float(height - 1u)));
+        int tileX = int(cx) - int(gl_WorkGroupID.x) * RIVEN_WORKGROUP_EDGE + RIVEN_TILE_HALO;
+        int tileY = int(cy) - int(gl_WorkGroupID.y) * RIVEN_WORKGROUP_EDGE + RIVEN_TILE_HALO;
+        float tap = float(rivenCurrentLumaTile[tileY * RIVEN_TILE_EDGE + tileX]);
+        acc += tap;
+        lineMin = min(lineMin, tap);
+        lineMax = max(lineMax, tap);
+    }
+    float blurEstimate = acc / float(TAPS);
+    float residual = center - blurEstimate;
+    float variance = heteroscedasticNoiseVariance(center / 1023.0);
+    float snrInverse = sqrt(max(variance, 0.0));
+    float noiseReg = 1.0 / (1.0 + snrInverse * 4.0);
+    float lengthGate = smoothstep(minKernel, minKernel * 3.0 + 1e-4, kernelLength);
+    float gain = 0.6 * lengthGate * noiseReg;
+    float deblurred = clamp(center + gain * residual, lineMin, lineMax);
+    return uint(clamp(deblurred + 0.5, 0.0, 1023.0));
+}
+
+vec3 bt2020ToAcesCg(vec3 linearRgb) {
+    mat3 mBT2020ToAcesCg = mat3(
+         0.974894,  0.022822,  0.002284,
+         0.064687,  0.930107,  0.005206,
+         0.017528,  0.106057,  0.876415
+    );
+    return max(mBT2020ToAcesCg * linearRgb, vec3(0.0));
+}
+
+vec3 neoWideGamutToAcesCg(vec3 linearRgb) {
+    mat3 mNeoWideGamutToAcesCg = mat3(
+         1.062721, -0.055820,  0.006088,
+        -0.103178,  1.399098,  0.055571,
+        -0.116920, -0.034731,  1.326912
+    );
+    return max(mNeoWideGamutToAcesCg * linearRgb, vec3(0.0));
+}
+
+const mat3 NEO_WIDE_GAMUT_TO_XYZ = mat3(
+    0.774888889, 0.279812198, 0.000000000,
+    0.098962557, 0.709575275, 0.050512138,
+    0.082970662, 0.010612527, 0.871191949
+);
+
+const mat3 XYZ_TO_NEO_WIDE_GAMUT = mat3(
+    1.355511229, -0.534992949, 0.031019155,
+    -0.180015705, 1.481565471, -0.085901896,
+    -0.126903425, 0.032903847, 1.145944883
+);
+
+// s2-f11 / CP40: exact NeoWideGamut primary-triangle boundary in CIE xy. When the
+// USE_EXACT_GAMUT_BOUNDARY spec constant is enabled (device-gated), this replaces the analytic
+// 3-fold cosine guess with the true distance from the white point to the gamut triangle edge.
+// Mirrors com.neoproc.neoproccamx.color.NeoGamutXyBoundary (host reference / unit tests).
+layout(constant_id = 0) const bool USE_EXACT_GAMUT_BOUNDARY = true; // Default ON (user-directed 2026-07-04, device-verified): exact NeoWideGamut xy triangle boundary on the record/export path — matches the approved default-ON preview Oklab cusp (e013f02/4eec946)
+
+float exactGamutBoundaryRadius(vec2 center, float angle) {
+    vec2 prim[3] = vec2[3](
+        vec2(0.7347024, 0.2652976),  // R
+        vec2(0.1151875, 0.8259494),  // G
+        vec2(0.0859901, 0.0110001)   // B
+    );
+    vec2 d = vec2(cos(angle), sin(angle));
+    float best = 1e9;
+    for (int k = 0; k < 3; ++k) {
+        vec2 p = prim[k];
+        vec2 e = prim[(k + 1) % 3] - p;
+        float det = -d.x * e.y + e.x * d.y;
+        if (abs(det) < 1e-9) continue;
+        vec2 r = p - center;
+        float t = (-r.x * e.y + e.x * r.y) / det;
+        float s = (d.x * r.y - d.y * r.x) / det;
+        if (t > 0.0 && s >= 0.0 && s <= 1.0 && t < best) best = t;
+    }
+    return best;
+}
+
+vec3 neoWideGamutCompressXyPreserveY(vec3 xyz) {
+    float sumXyz = max(xyz.x + xyz.y + xyz.z, 1e-6);
+    vec2 xy = xyz.xy / sumXyz;
+    vec2 center = vec2(0.3324, 0.3474);
+    vec2 delta = xy - center;
+    float radius = length(delta);
+    float angle = atan(delta.y, delta.x);
+    float softBoundary = USE_EXACT_GAMUT_BOUNDARY
+        ? exactGamutBoundaryRadius(center, angle)
+        : clamp(0.365 + 0.080 * cos(3.0 * angle) + 0.035 * cos(6.0 * angle + 0.4), 0.18, 0.48);
+    if (radius > softBoundary) {
+        float excess = radius - softBoundary;
+        xy = center + normalize(delta) * softBoundary * (1.0 - 0.025 * (1.0 - exp(-excess * 6.0)));
+    }
+    float safeY = max(xy.y, 1e-5);
+    return vec3(xy.x * xyz.y / safeY, xyz.y, (1.0 - xy.x - xy.y) * xyz.y / safeY);
+}
+
+vec3 hpeXyzToNivukxOklab(vec3 xyz) {
+    vec3 lms = vec3(
+        dot(xyz, vec3(0.8189330, 0.3670669, -0.1574301)),
+        dot(xyz, vec3(-0.0351149, 1.0253456, 0.0097103)),
+        dot(xyz, vec3(0.0815124, -0.0435106, 1.1251144))
+    );
+    vec3 root = sign(lms) * pow(abs(lms), vec3(1.0 / 3.0));
+    return vec3(
+        dot(root, vec3(0.2104542553, 0.7936177850, -0.0040720403)),
+        dot(root, vec3(1.9779984951, -2.4285922050, 0.4505937099)),
+        dot(root, vec3(0.0259040371, 0.7827717658, -0.8086757660))
+    );
+}
+
+vec3 nivukxOklabToHpeXyz(vec3 lab) {
+    float lPrime = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
+    float mPrime = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
+    float sPrime = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
+    vec3 lms = vec3(lPrime * lPrime * lPrime, mPrime * mPrime * mPrime, sPrime * sPrime * sPrime);
+    return vec3(
+        dot(lms, vec3(1.18631848, -0.41749725, 0.16959721)),
+        dot(lms, vec3(0.04142649, 0.96034478, -0.00249171)),
+        dot(lms, vec3(-0.08434447, 0.06738549, 0.87641515))
+    );
+}
+
+vec3 nivukxApexSignalShape(vec3 lab, float sceneLux, float kelvin) {
+    float chroma = length(lab.yz);
+    if (chroma <= 1e-6) return vec3(max(lab.x, 0.0), 0.0, 0.0);
+    float hue = atan(lab.z, lab.y);
+    float highlight = smoothstep(0.56, 1.06, lab.x);
+    float deepShadow = 1.0 - smoothstep(0.04, 0.24, lab.x);
+    float lowLux = 1.0 - smoothstep(12.0, 900.0, max(sceneLux, 0.0));
+    float kelvinBias = clamp((6500.0 - clamp(kelvin, 1800.0, 12000.0)) / 6500.0, -0.45, 0.45);
+    float chromaScale = clamp(1.0 - highlight * 0.42 - deepShadow * lowLux * 0.10 + kelvinBias * 0.035, 0.16, 1.04);
+    float shapedChroma = chroma * chromaScale;
+    return vec3(max(lab.x + deepShadow * lowLux * 0.018, 0.0), cos(hue) * shapedChroma, sin(hue) * shapedChroma);
+}
+
+float ndr10RationalBezierToneMap(float x, float sceneMin, float sceneMax) {
+    float safeMin = max(sceneMin, 0.0001);
+    float safeMax = max(sceneMax, safeMin + 0.0001);
+    float contrastRatio = clamp(safeMax / safeMin, 1.0, 100000.0);
+    float highDynamicRange = smoothstep(80.0, 8000.0, contrastRatio);
+    float lowLight = 1.0 - smoothstep(0.24, 1.20, safeMax);
+    float alpha = clamp(0.16 + highDynamicRange * 0.68, 0.16, 0.84);
+    float beta = clamp(0.20 + lowLight * 0.58, 0.20, 0.78);
+    float gamma = clamp(0.12 + highDynamicRange * 0.34, 0.12, 0.46);
+    float normalized = clamp(x / max(safeMax, 1.0), 0.0, 1.0);
+    float denominator = normalized + beta * max(1.0 - gamma * normalized, 0.05);
+    return clamp(normalized * (1.0 + alpha * normalized) / max(denominator, 1e-6), 0.0, 1.0);
+}
+
+vec3 applySubtractiveFilmDensity(vec3 rgb) {
+    float saturation = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);
+    vec3 kappa = vec3(0.34, 0.30, 0.26);
+    return max(rgb * exp(-kappa * (vec3(1.0) - clamp(rgb, 0.0, 1.0)) * saturation), vec3(0.0));
+}
+
+vec3 highlightSaturationRolloff(vec3 rgb) {
+    float peak = max(max(rgb.r, rgb.g), rgb.b);
+    float rolloff = smoothstep(0.78, 1.0, peak);
+    float y = dot(rgb, vec3(0.2627, 0.6780, 0.0593));
+    return mix(rgb, vec3(y), rolloff);
+}
+
+float neoHighEndKneeCurve(float luma, float knee, float shoulder, float strength) {
+    float x = max(luma, 0.0);
+    float safeKnee = clamp(knee, 0.18, 0.92);
+    float safeShoulder = clamp(shoulder, safeKnee + 0.02, 1.0);
+    float safeStrength = max(strength, 0.05);
+    if (x <= safeKnee) return x;
+
+    float span = max(safeShoulder - safeKnee, 1e-5);
+    float normalized = max((x - safeKnee) / span, 0.0);
+    // C1 Reinhard highlight shoulder: unit slope at the knee join (no contrast
+    // kick / Mach band), monotone, and COMPRESSING (output <= input). The prior
+    // tanh(strength*n)/tanh(strength) had slope strength/tanh(strength) (~2.3) at
+    // the knee and EXPANDED upper-midtones (output exceeded input — audit rank 3).
+    // Gentle rolloff maps the shoulder just below itself into highlight headroom.
+    float kneeShoulderA = clamp((safeStrength - 1.0) * 0.14, 0.02, 0.35);
+    float normalizedMapped = normalized / (1.0 + kneeShoulderA * normalized);
+    return clamp(safeKnee + span * normalizedMapped, 0.0, safeShoulder);
+}
+
+vec4 resolveNeoHighEndKneeParams(bool nivukxVision, bool ndr10Plus, float highlightCompression) {
+    vec4 params = vec4(0.72, 1.00, 1.36, 0.42);
+    if (nivukxVision) {
+        params = vec4(0.54, 1.00, 2.25, 1.00);
+    } else if (ndr10Plus) {
+        params = vec4(0.58, 1.00, 2.05, 1.00);
+    }
+
+    float userCompression = clamp(highlightCompression, 0.0, 1.0);
+    params.x = clamp(params.x - userCompression * mix(0.035, 0.085, params.w), 0.42, 0.78);
+    params.z = clamp(params.z + userCompression * mix(0.28, 0.72, params.w), 1.12, 2.90);
+    return params;
+}
+
+uint applyNeoHighEndKneeCurveToLuma(uint sampleValue, vec4 kneeParams) {
+    float sourceY = float(sampleValue) / 1023.0;
+    float mappedY = neoHighEndKneeCurve(sourceY, kneeParams.x, kneeParams.y, kneeParams.z);
+    return uint(clamp(mappedY * 1023.0 + 0.5, 0.0, 1023.0));
+}
+
+vec3 encodeNLogV3Family(vec3 linear, float e, float a, float b, float d, float f) {
+    float c = a * (d * e + f) / d;
+    float g = a * e + b - c * log(d * e + f);
+    vec3 x = clamp(linear, 0.0, 1.0);
+    vec3 linearPart = a * x + vec3(b);
+    vec3 logPart = c * log(d * x + vec3(f)) + vec3(g);
+    return clamp(mix(logPart, linearPart, lessThan(x, vec3(e))), 0.0, 1.0);
+}
+
+vec3 applyEliteCinemaColorPipeline(vec3 rgb, bool nivukxVision, bool ndr10Plus, float sceneMin, float sceneMax) {
+    vec3 source = max(rgb, vec3(0.0));
+    vec3 mapped = max(XYZ_TO_NEO_WIDE_GAMUT * neoWideGamutCompressXyPreserveY(NEO_WIDE_GAMUT_TO_XYZ * source), vec3(0.0));
+    if (ndr10Plus) {
+        float y = max(dot(mapped, vec3(0.2627, 0.6780, 0.0593)), 1e-5);
+        mapped *= max(ndr10RationalBezierToneMap(y, sceneMin, sceneMax), 1e-5) / y;
+    }
+    if (nivukxVision) {
+        vec3 lab = hpeXyzToNivukxOklab(NEO_WIDE_GAMUT_TO_XYZ * mapped);
+        mapped = max(XYZ_TO_NEO_WIDE_GAMUT * neoWideGamutCompressXyPreserveY(nivukxOklabToHpeXyz(nivukxApexSignalShape(lab, 420.0, 5500.0))), vec3(0.0));
+    }
+    return clamp(highlightSaturationRolloff(applySubtractiveFilmDensity(mapped)), 0.0, 1.08);
+}
+
+float acesHighlightRollOff(float value) {
+    float a = mix(0.18, 0.72, clamp(uniforms.highlightCompression, 0.0, 1.0));
+    float b = mix(0.015, 0.055, clamp(uniforms.videoHdrFusionStrength, 0.0, 1.0));
+    return clamp((value * (1.0 + a * value)) / max(value + b, 0.0001), 0.0, 1.0);
+}
+
+uint applyAcesCgRollOff(uint sampleIndex, uint sampleValue) {
+    float y = float(sampleValue) / 1023.0;
+    vec3 linearNeoWideGamut = vec3(y);
+    bool nivukxVision = int(uniforms.colorScience + 0.5) == COLOR_SCIENCE_NIVUKX_VISION;
+    bool ndr10Plus = int(uniforms.colorScience + 0.5) == COLOR_SCIENCE_NDR10_PLUS;
+    bool neoAcesHighEnd = int(uniforms.colorScience + 0.5) == COLOR_SCIENCE_NEO_ACES_HIGH_END;
+    bool neoAcesAp0 = int(uniforms.colorSpace + 0.5) == COLOR_SPACE_NEO_ACES_AP0;
+    vec3 elite = applyEliteCinemaColorPipeline(linearNeoWideGamut, nivukxVision, ndr10Plus, 0.0004, 4.0);
+    vec3 aces = neoWideGamutToAcesCg(elite);
+    if (neoAcesHighEnd) {
+        aces = highlightSaturationRolloff(applySubtractiveFilmDensity(aces));
+        if (neoAcesAp0) {
+            float luma = dot(aces, vec3(0.272229, 0.674082, 0.053689));
+            aces = mix(aces, vec3(luma), 0.04);
+        }
+    }
+    float mapped = acesHighlightRollOff(dot(aces, vec3(0.272229, 0.674082, 0.053689)));
+    return uint(clamp(mapped * 1023.0 + 0.5, 0.0, 1023.0));
+}
+
+uint finalJndBlueNoiseQuantize(uint sampleIndex, uint sampleValue) {
+    if (p010ZeroVisibleGrainExport()) return sampleValue;
+    float quantizationError = jndShapedQuantizationError(sampleIndex, sampleValue);
+    float quantized = float(sampleValue) + (quantizationError >= 0.50 ? 1.0 : (quantizationError <= -0.50 ? -1.0 : 0.0));
+    return uint(clamp(quantized, 0.0, 1023.0));
+}
+
+// NEW TECHNOLOGY: NIVUKX Quantum-Detail Film Texture Synthesis (QD-FTS)
+// Reconstructs premium organic silver-halide texture modeling 15/70mm cinema analog stock on Vulkan
+uint applyQuantumDetailFilmTexture(uint sampleIndex, uint sampleValue) {
+    // Honor the zero-visible-grain clean-export contract like every other grain
+    // stage. Without this guard, NIVUKX_VISION (temporal blends == 1.0) still got
+    // ~8.7 codes of content-correlated fixed-pattern film texture stamped on every
+    // midtone, defeating the clean-export promise (audit rank 10).
+    if (p010ZeroVisibleGrainExport()) return sampleValue;
+    uint width = max(pushData.width, 1u);
+    uint height = max(pushData.height, 1u);
+    uint row = sampleIndex / width;
+    uint col = sampleIndex - row * width;
+    vec2 uv = vec2(float(col) / float(width), float(row) / float(height));
+
+    float luma = float(sampleValue) / 1023.0;
+
+    uint nextIdx = sampleIndex + 1u < width * height ? sampleIndex + 1u : sampleIndex;
+    uint prevIdx = sampleIndex > 0u ? sampleIndex - 1u : sampleIndex;
+    float noise1 = float(unpackP010(readCurrentP010Sample(nextIdx))) / 1023.0;
+    float noise2 = float(unpackP010(readCurrentP010Sample(prevIdx))) / 1023.0;
+
+    float temporalSeed = fract((luma + noise1) * 12.9898 + (luma - noise2) * 78.233);
+    float randomVal = fract(sin(dot(uv.xy * 1.5, vec2(12.9898, 78.233)) + temporalSeed) * 43758.5453);
+
+    float randomCoarse = fract(sin(dot(floor(uv.xy * vec2(1280.0, 720.0)) / vec2(1280.0, 720.0), vec2(12.9898, 78.233)) + temporalSeed * 1.618) * 43758.5453);
+    float combinedNoise = mix(randomVal, randomCoarse, 0.40) - 0.5;
+
+    float midtoneWeight = smoothstep(0.04, 0.28, luma) * (1.0 - smoothstep(0.68, 0.92, luma));
+    float shadowProtect = smoothstep(0.00, 0.08, luma);
+    float specularProtectVal = 1.0 - smoothstep(0.85, 1.0, luma);
+
+    float strength = uniforms.sharpening;
+    float textureOffset = combinedNoise * midtoneWeight * shadowProtect * specularProtectVal * 0.0085 * clamp(strength, 0.0, 2.0) * 1023.0;
+
+    return uint(clamp(float(sampleValue) + textureOffset, 0.0, 1023.0));
+}
+
+uint bakeCosmicSingularityExportLook(uint sampleIndex, uint sampleValue) {
+    return applyFitzHughNagumoChemicalHalation(sampleIndex, sampleValue);
+}
+
+uint processStandardCinemaPipeline(uint lumaIndex, uint yValue) {
+    uint processed = motionCompensatedBilateralTemporalBlend(lumaIndex, yValue, false);
+    uint detailBase = processed;
+    processed = applyEdgeAwareDetailLift(lumaIndex, processed);
+    processed = applyApexMicroTextureRecover(lumaIndex, processed);
+    processed = applyApexLocalContrastLuma(lumaIndex, processed);
+    processed = applyApexShadowNoiseFloorLuma(lumaIndex, processed);
+    processed = applyApexHighlightTextureLuma(lumaIndex, processed);
+    processed = applyApexEdgeCoherenceLuma(lumaIndex, processed);
+    processed = applyApexTonalDensityLuma(lumaIndex, processed);
+    processed = applyApexLongDistanceDetailLuma(lumaIndex, processed);
+    if (p010BoundedNormalProSdrExport()) {
+        processed = applyCumulativeDetailBudget(lumaIndex, detailBase, processed);
+    }
+    processed = applyWarmHighlightHalation(lumaIndex, processed);
+    processed = applyNeoHighEndKneeCurveToLuma(processed, resolveNeoHighEndKneeParams(false, false, uniforms.highlightCompression));
+    processed = applyQuantumDetailFilmTexture(lumaIndex, processed);
+    return finalJndBlueNoiseQuantize(lumaIndex, processed);
+}
+
+uint processNivukxApexPipeline(uint lumaIndex, uint yValue) {
+    uint processed = motionCompensatedBilateralTemporalBlend(lumaIndex, yValue, false);
+    processed = applyAcesCgRollOff(lumaIndex, processed);
+    uint detailBase = processed;
+    processed = applyEdgeAwareDetailLift(lumaIndex, processed);
+    processed = applyApexMicroTextureRecover(lumaIndex, processed);
+    processed = applyApexLocalContrastLuma(lumaIndex, processed);
+    processed = applyApexShadowNoiseFloorLuma(lumaIndex, processed);
+    processed = applyApexHighlightTextureLuma(lumaIndex, processed);
+    processed = applyApexEdgeCoherenceLuma(lumaIndex, processed);
+    processed = applyApexTonalDensityLuma(lumaIndex, processed);
+    processed = applyApexLongDistanceDetailLuma(lumaIndex, processed);
+    if (p010BoundedNormalProSdrExport()) {
+        processed = applyCumulativeDetailBudget(lumaIndex, detailBase, processed);
+    }
+    processed = applyFitzHughNagumoChemicalHalation(lumaIndex, processed);
+    processed = applyNeoHighEndKneeCurveToLuma(processed, resolveNeoHighEndKneeParams(true, false, uniforms.highlightCompression));
+    processed = applyQuantumDetailFilmTexture(lumaIndex, processed);
+    return finalJndBlueNoiseQuantize(lumaIndex, processed);
+}
+
+uint processNeoAcesHighEndPipeline(uint lumaIndex, uint yValue) {
+    uint processed = motionCompensatedBilateralTemporalBlend(lumaIndex, yValue, false);
+    processed = applyAcesCgRollOff(lumaIndex, processed);
+    uint detailBase = processed;
+    processed = applyEdgeAwareDetailLift(lumaIndex, processed);
+    processed = applyApexMicroTextureRecover(lumaIndex, processed);
+    processed = applyApexLocalContrastLuma(lumaIndex, processed);
+    processed = applyApexShadowNoiseFloorLuma(lumaIndex, processed);
+    processed = applyApexHighlightTextureLuma(lumaIndex, processed);
+    processed = applyApexEdgeCoherenceLuma(lumaIndex, processed);
+    processed = applyApexTonalDensityLuma(lumaIndex, processed);
+    processed = applyApexLongDistanceDetailLuma(lumaIndex, processed);
+    if (p010BoundedNormalProSdrExport()) {
+        processed = applyCumulativeDetailBudget(lumaIndex, detailBase, processed);
+    }
+    processed = applyWarmHighlightHalation(lumaIndex, processed);
+    processed = applyNeoHighEndKneeCurveToLuma(processed, resolveNeoHighEndKneeParams(false, false, uniforms.highlightCompression));
+    processed = applyQuantumDetailFilmTexture(lumaIndex, processed);
+    return finalJndBlueNoiseQuantize(lumaIndex, processed);
+}
+
+uint processCosmicSingularityPipeline(uint lumaIndex, uint yValue) {
+    uint processed = motionCompensatedBilateralTemporalBlend(lumaIndex, yValue, false);
+    processed = applyAcesCgRollOff(lumaIndex, processed);
+    uint detailBase = processed;
+    processed = applyEdgeAwareDetailLift(lumaIndex, processed);
+    processed = applyApexMicroTextureRecover(lumaIndex, processed);
+    processed = applyApexLocalContrastLuma(lumaIndex, processed);
+    processed = applyApexShadowNoiseFloorLuma(lumaIndex, processed);
+    processed = applyApexHighlightTextureLuma(lumaIndex, processed);
+    processed = applyApexEdgeCoherenceLuma(lumaIndex, processed);
+    processed = applyApexTonalDensityLuma(lumaIndex, processed);
+    processed = applyApexLongDistanceDetailLuma(lumaIndex, processed);
+    if (p010BoundedNormalProSdrExport()) {
+        processed = applyCumulativeDetailBudget(lumaIndex, detailBase, processed);
+    }
+    processed = bakeCosmicSingularityExportLook(lumaIndex, processed);
+    processed = applyNeoHighEndKneeCurveToLuma(processed, resolveNeoHighEndKneeParams(false, true, uniforms.highlightCompression));
+    processed = applyQuantumDetailFilmTexture(lumaIndex, processed);
+    return finalJndBlueNoiseQuantize(lumaIndex, processed);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  NDR10+ / NIVUKX genuine full-RGB → PQ delivery engine (Phase 1)
+//  GLSL port of com.neoproc.neoproccamx.color.NdrNivukxDeliveryEngine, composed
+//  with limited-range BT.2020 Y'CbCr <-> R'G'B' and HLG->scene-linear so the
+//  profile's OWN color science reaches recorded pixels as real PQ.
+// ════════════════════════════════════════════════════════════════════════════
+
+const float NEO_KR = 0.2627;
+const float NEO_KG = 0.6780;
+const float NEO_KB = 0.0593;
+// HLG signal at diffuse white (75%) mapped to scene-linear via the inverse OETF.
+// Dividing scene-linear by this anchors diffuse white to engine input 1.0.
+const float NEO_HLG_DIFFUSE_SCENE = 0.264967;
+
+float neoPqLuma(vec3 c) { return dot(c, vec3(NEO_KR, NEO_KG, NEO_KB)); }
+
+// Limited-range 10-bit BT.2020 NCL Y'CbCr code -> non-linear R'G'B' [0,1]-ish.
+vec3 neoPqYcbcrCodeToRgb(float yCode, float cbCode, float crCode) {
+    float Y = clamp((yCode - 64.0) / 876.0, 0.0, 1.0);
+    float Pb = (cbCode - 512.0) / 896.0;
+    float Pr = (crCode - 512.0) / 896.0;
+    return vec3(
+        Y + 1.4746 * Pr,
+        Y - 0.16455 * Pb - 0.57135 * Pr,
+        Y + 1.8814 * Pb
+    );
+}
+
+// Non-linear R'G'B' [0,1] -> limited-range 10-bit BT.2020 NCL codes.
+float neoPqRgbToYCode(vec3 c) { return neoPqLuma(c) * 876.0 + 64.0; }
+vec2 neoPqRgbToChromaCodes(vec3 c) {
+    float Y = neoPqLuma(c);
+    return vec2(
+        (c.b - Y) / 1.8814 * 896.0 + 512.0,  // Cb
+        (c.r - Y) / 1.4746 * 896.0 + 512.0   // Cr
+    );
+}
+
+// BT.2100 HLG inverse OETF: signal -> scene linear [0,1].
+float neoPqHlgInvOetf(float e) {
+    e = clamp(e, 0.0, 1.0);
+    return e <= 0.5
+        ? (e * e / 3.0)
+        : ((exp((e - 0.55991073) / 0.17883277) + 0.28466892) / 12.0);
+}
+
+vec3 neoPqHlgSignalToEngineLinear(vec3 e) {
+    return vec3(neoPqHlgInvOetf(e.r), neoPqHlgInvOetf(e.g), neoPqHlgInvOetf(e.b)) /
+        NEO_HLG_DIFFUSE_SCENE;
+}
+
+float neoDelSmoothstep(float e0, float e1, float x) {
+    if (e0 == e1) return x >= e1 ? 1.0 : 0.0;
+    float t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// NdrToneOperator.signalShape: gamma lift + fading toe, C1 linear past diffuse white.
+float neoDelSignalShape(float x, float g, float toeW, float toeA) {
+    if (x <= 0.0) return 0.0;
+    if (x <= 1.0) return pow(x, g) + neoDelSmoothstep(0.0, toeW, x) * toeA * (1.0 - x);
+    return 1.0 + (g - toeA) * (x - 1.0);
+}
+
+// NdrToneOperator.signalToDisplayNits: 203-nit diffuse anchor + C1 exp shoulder to peak.
+float neoDelSignalToNits(float signal, float diffuse, float peak) {
+    float s = max(signal, 0.0);
+    float raw = s * diffuse;
+    if (raw <= diffuse) return raw;
+    float range = peak - diffuse;
+    return min(diffuse + range * (1.0 - exp(-(raw - diffuse) / range)), peak);
+}
+
+// ST.2084 (PQ) OETF from absolute nits.
+float neoDelPqFromNits(float nits) {
+    float y = clamp(nits / 10000.0, 0.0, 1.0);
+    float ym = pow(y, 0.1593017578125);            // M1 = 2610/16384
+    return pow((0.8359375 + 18.8515625 * ym) / (1.0 + 18.6875 * ym), 78.84375); // C1,C2,C3 / M2
+}
+
+vec3 neoCompressPeakColorVolume(vec3 rgbNits, float luminanceNits, float peakNits) {
+    float peak = clamp(peakNits, 203.0, 10000.0);
+    float y = clamp(luminanceNits, 0.0, peak);
+    vec3 rgb = max(rgbNits, vec3(0.0));
+    float hi = max(max(rgb.r, rgb.g), rgb.b);
+    if (hi <= peak || hi <= y + 1e-8) return rgb;
+    float chromaScale = clamp((peak - y) / (hi - y), 0.0, 1.0);
+    return clamp(vec3(y) + (rgb - vec3(y)) * chromaScale, 0.0, peak);
+}
+
+// NdrToneOperator.mapRgbHuePreserving: luma-preserving scale + radial highlight desat.
+vec3 neoDelMapRgbHuePreserving(vec3 lin, float g, float toeW, float toeA, float desatCap) {
+    vec3 s = max(lin, vec3(0.0));
+    float y = max(neoPqLuma(s), 1e-8);
+    float mappedY = neoDelSignalShape(y, g, toeW, toeA);
+    vec3 o = s * (mappedY / y);
+    float desat = clamp(desatCap * neoDelSmoothstep(0.55, 1.0, mappedY), 0.0, desatCap);
+    o = mix(o, vec3(mappedY), desat);              // toward neutral (hue-constant)
+    return max(o, vec3(0.0));
+}
+
+// Linear BT.2020 RGB (1.0 == diffuse white) -> PQ R'G'B'. mode 1 = NIVUKX, else NDR10+.
+vec3 neoDeliverPq(vec3 lin, int mode) {
+    float g      = mode == 1 ? 0.88 : 0.92;
+    float toeW   = mode == 1 ? 0.24 : 0.20;
+    float toeA   = mode == 1 ? 0.026 : 0.018;
+    float peak   = mode == 1 ? 10000.0 : 5000.0;
+    float desat  = mode == 1 ? 0.26 : 0.20;
+    vec3 t = neoDelMapRgbHuePreserving(lin, g, toeW, toeA, desat);
+    float sl = max(neoPqLuma(t), 1e-8);
+    float nits = neoDelSignalToNits(sl, 203.0, peak);
+    float sc = nits / sl;
+    vec3 peakSafe = neoCompressPeakColorVolume(t * sc, nits, peak);
+    return vec3(
+        neoDelPqFromNits(peakSafe.r),
+        neoDelPqFromNits(peakSafe.g),
+        neoDelPqFromNits(peakSafe.b)
+    );
+}
+
+// Spatial/temporal detail recovery on the luma code WITHOUT the old luma "look"
+// stages (the color engine below owns tone). Reuses the proven Apex detail lanes.
+uint neoPqDetailLuma(uint lumaIndex, uint yValue) {
+    uint p = motionCompensatedBilateralTemporalBlend(lumaIndex, yValue, false);
+    p = applyEdgeAwareDetailLift(lumaIndex, p);
+    p = applyApexMicroTextureRecover(lumaIndex, p);
+    p = applyApexLocalContrastLuma(lumaIndex, p);
+    p = applyApexShadowNoiseFloorLuma(lumaIndex, p);
+    p = applyApexHighlightTextureLuma(lumaIndex, p);
+    p = applyApexEdgeCoherenceLuma(lumaIndex, p);
+    p = applyApexTonalDensityLuma(lumaIndex, p);
+    p = applyApexLongDistanceDetailLuma(lumaIndex, p);
+    return p;
+}
+
+void main() {
+    // This call contains a workgroup barrier and therefore must execute before edge invocations return.
+    loadRivenLumaTiles();
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pushData.width || y >= pushData.height) return;
+
+    uint lumaIndex = y * pushData.width + x;
+    uint yValue = unpackP010(readCurrentP010Sample(lumaIndex));
+    bool neoAcesColorSpace = int(uniforms.colorSpace + 0.5) == COLOR_SPACE_NEO_ACES_AP1 ||
+        int(uniforms.colorSpace + 0.5) == COLOR_SPACE_NEO_ACES_AP0;
+
+    // ── Genuine NDR10+/NIVUKX full-RGB → PQ delivery (Phase 2, active) ────────
+    // Reconstruct real RGB (luma + co-sited block chroma), run the canonical
+    // color engine, re-encode to PQ Y'CbCr. Replaces the gray-fed luma curve so
+    // the profile's OWN color science reaches recorded pixels. Active in Phase 2
+    // NEO_PQ_DELIVERY_ENABLED must remain zero: NDR/NIVUKX accepts RAW-derived ACEScg only.
+    int neoDeliveryCs = int(uniforms.colorScience + 0.5);
+    if (NEO_PQ_DELIVERY_ENABLED == 1 &&
+        int(uniforms.activeTransport + 0.5) == ACTIVE_TRANSPORT_BT2100_PQ &&
+        (neoDeliveryCs == COLOR_SCIENCE_NIVUKX_VISION ||
+            neoDeliveryCs == COLOR_SCIENCE_COSMIC_SINGULARITY)) {
+        int neoMode = (neoDeliveryCs == COLOR_SCIENCE_NIVUKX_VISION) ? 1 : 0;
+        uint neoChromaWidth = (pushData.width + 1u) / 2u;
+        uint neoChromaHeight = (pushData.height + 1u) / 2u;
+        uint neoBlockX = x / 2u;
+        uint neoBlockY = y / 2u;
+        uint neoChromaPair =
+            pushData.width * pushData.height + (neoBlockY * neoChromaWidth + neoBlockX) * 2u;
+        uint neoU = unpackP010(readCurrentP010Sample(neoChromaPair));
+        uint neoV = unpackP010(readCurrentP010Sample(neoChromaPair + 1u));
+
+        // Per-pixel luma: detail-enhance, reconstruct RGB with the block chroma,
+        // deliver PQ, take its luma back to a limited-range code.
+        uint neoDetailY = neoPqDetailLuma(lumaIndex, yValue);
+        vec3 neoSignalRgb = neoPqYcbcrCodeToRgb(float(neoDetailY), float(neoU), float(neoV));
+        vec3 neoLinear = neoPqHlgSignalToEngineLinear(neoSignalRgb);
+        vec3 neoPqRgb = neoDeliverPq(neoLinear, neoMode);
+        uint neoOutY = uint(clamp(neoPqRgbToYCode(neoPqRgb) + 0.5, 0.0, 1023.0));
+        neoOutY = rivenP010LumaDeblur(lumaIndex, neoOutY);
+        writePackedP010Sample(lumaIndex, neoOutY);
+
+        // Per-block chroma: derive new Cb/Cr from the block-average RGB (top-left
+        // invocation only, matching the 4:2:0 write pattern).
+        if ((x & 1u) == 0u && (y & 1u) == 0u &&
+            neoBlockX < neoChromaWidth && neoBlockY < neoChromaHeight) {
+            uint neoY00 = unpackP010(readCurrentP010Sample(lumaIndex));
+            uint neoY01 = (x + 1u < pushData.width)
+                ? unpackP010(readCurrentP010Sample(lumaIndex + 1u)) : neoY00;
+            uint neoY10 = (y + 1u < pushData.height)
+                ? unpackP010(readCurrentP010Sample(lumaIndex + pushData.width)) : neoY00;
+            uint neoY11 = (x + 1u < pushData.width && y + 1u < pushData.height)
+                ? unpackP010(readCurrentP010Sample(lumaIndex + pushData.width + 1u)) : neoY00;
+            float neoYAvg = 0.25 * (float(neoY00) + float(neoY01) + float(neoY10) + float(neoY11));
+            uint neoNeighborU = chromaNeighborAverage(neoChromaWidth, neoChromaHeight, neoBlockY, neoBlockX, 0u);
+            uint neoNeighborV = chromaNeighborAverage(neoChromaWidth, neoChromaHeight, neoBlockY, neoBlockX, 1u);
+            uint neoDenoisedU = applyLocalChromaSpikeSmoothing(applyChromaDeadband(neoU, neoNeighborU), neoNeighborU);
+            uint neoDenoisedV = applyLocalChromaSpikeSmoothing(applyChromaDeadband(neoV, neoNeighborV), neoNeighborV);
+            vec3 neoBlockSignal = neoPqYcbcrCodeToRgb(neoYAvg, float(neoDenoisedU), float(neoDenoisedV));
+            vec3 neoBlockLinear = neoPqHlgSignalToEngineLinear(neoBlockSignal);
+            vec3 neoBlockPq = neoDeliverPq(neoBlockLinear, neoMode);
+            vec2 neoChromaCodes = neoPqRgbToChromaCodes(neoBlockPq);
+            writePackedP010Sample(neoChromaPair, uint(clamp(neoChromaCodes.x + 0.5, 0.0, 1023.0)));
+            writePackedP010Sample(neoChromaPair + 1u, uint(clamp(neoChromaCodes.y + 0.5, 0.0, 1023.0)));
+        }
+        return;
+    }
+
+    if (int(uniforms.colorScience + 0.5) == COLOR_SCIENCE_NIVUKX_VISION) {
+        yValue = processNivukxApexPipeline(lumaIndex, yValue);
+    } else if (neoAcesColorSpace || int(uniforms.colorScience + 0.5) == COLOR_SCIENCE_NEO_ACES_HIGH_END) {
+        yValue = processNeoAcesHighEndPipeline(lumaIndex, yValue);
+    } else if (int(uniforms.colorScience + 0.5) == COLOR_SCIENCE_COSMIC_SINGULARITY) {
+        yValue = processCosmicSingularityPipeline(lumaIndex, yValue);
+    } else {
+        yValue = processStandardCinemaPipeline(lumaIndex, yValue);
+    }
+    // OmniClarity Riven directional motion-deblur (NPV10 export). No-op without measurable motion.
+    yValue = rivenP010LumaDeblur(lumaIndex, yValue);
+    writePackedP010Sample(lumaIndex, yValue);
+
+    uint chromaWidth = (pushData.width + 1u) / 2u;
+    uint chromaHeight = (pushData.height + 1u) / 2u;
+    if ((x & 1u) == 0u && (y & 1u) == 0u && x / 2u < chromaWidth && y / 2u < chromaHeight) {
+        uint chromaRow = y / 2u;
+        uint chromaColumn = x / 2u;
+        uint chromaPairIndex = pushData.width * pushData.height + (chromaRow * chromaWidth + chromaColumn) * 2u;
+        uint uValue = unpackP010(readCurrentP010Sample(chromaPairIndex));
+        uint vValue = unpackP010(readCurrentP010Sample(chromaPairIndex + 1u));
+        uint neighborU = chromaNeighborAverage(chromaWidth, chromaHeight, chromaRow, chromaColumn, 0u);
+        uint neighborV = chromaNeighborAverage(chromaWidth, chromaHeight, chromaRow, chromaColumn, 1u);
+        uValue = motionCompensatedBilateralTemporalBlend(chromaPairIndex, uValue, true);
+        vValue = motionCompensatedBilateralTemporalBlend(chromaPairIndex + 1u, vValue, true);
+        uValue = applyChromaDeadband(uValue, neighborU);
+        vValue = applyChromaDeadband(vValue, neighborV);
+        uValue = applyLocalChromaSpikeSmoothing(uValue, neighborU);
+        vValue = applyLocalChromaSpikeSmoothing(vValue, neighborV);
+        // SNCE v2.0 HVC perceptual chroma nudge (reaches recorded + NPV10-exported pixels).
+        // saturation (slot 11) scales chroma about neutral 512 — Hunt low-light colourfulness;
+        // warmth (slot 9) biases U/V to approximate the SNCE residual-WB correction. Both are
+        // NO-OP at saturation==1, warmth==0, and hard-clamped so a bad value cannot corrupt chroma.
+        float snceSat = clamp(uniforms.saturation, 0.5, 2.0);
+        float snceWarmth = clamp(uniforms.warmth, -0.2, 0.2);
+        float snceU = (float(uValue) - 512.0) * snceSat - snceWarmth * 220.0;
+        float snceV = (float(vValue) - 512.0) * snceSat + snceWarmth * 220.0;
+        uValue = uint(clamp(512.0 + snceU + 0.5, 0.0, 1023.0));
+        vValue = uint(clamp(512.0 + snceV + 0.5, 0.0, 1023.0));
+        writePackedP010Sample(chromaPairIndex, uValue);
+        writePackedP010Sample(chromaPairIndex + 1u, vValue);
+    }
+}

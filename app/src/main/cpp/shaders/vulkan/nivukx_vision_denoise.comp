@@ -1,0 +1,78 @@
+#version 450
+// NIVUKX_VISION_ELITE
+// Linear AP1 denoise before JzAzBz Vision solve.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(binding = 0, rgba16f) readonly uniform image2D uCurrentAp1;
+layout(binding = 1, rgba16f) readonly uniform image2D uPreviousAp1;
+layout(binding = 2, rgba16f) writeonly uniform image2D uDenoisedAp1;
+
+layout(push_constant) uniform DenoiseParams {
+    float snrThresholdDb;
+    float biweightC;
+    float microTextureGain;
+    float frameBlend;
+} uDenoise;
+
+float localSnrDb(vec3 center, vec3 neighbor) {
+    float signal = max(dot(center, vec3(0.2722287, 0.6740818, 0.0536895)), 1e-5);
+    float noise = length(center - neighbor) / 1.7320508;
+    return 20.0 * log2(signal / max(noise, 1e-6)) / log2(10.0);
+}
+
+float tukeyBiweightBurstMerge(float residual, float c) {
+    float x = abs(residual) / max(c, 1e-5);
+    if (x >= 1.0) return 0.0;
+    float k = 1.0 - x * x;
+    return k * k;
+}
+
+vec3 jzazbzEdgeAwareDenoise7x7(ivec2 p, vec3 center) {
+    ivec2 size = imageSize(uCurrentAp1);
+    vec3 sum = center * 2.0;
+    float weightSum = 2.0;
+    // HIGH-END: 7x7 edge-aware bilateral (was 5x5) with wider spatial sigma — stronger flat-area
+    // denoise; the SNR range weight still preserves edges and texture.
+    for (int y = -3; y <= 3; ++y) {
+        for (int x = -3; x <= 3; ++x) {
+            if (x == 0 && y == 0) continue;
+            ivec2 coord = clamp(p + ivec2(x, y), ivec2(0), size - ivec2(1));
+            vec3 s = imageLoad(uCurrentAp1, coord).rgb;
+            float snr = localSnrDb(center, s);
+            float rangeWeight = smoothstep(0.0, uDenoise.snrThresholdDb, snr);
+            float spatialWeight = exp(-float(x*x + y*y) / 8.0); // sigma = 2.0 => 2 * sigma^2 = 8.0
+            float w = rangeWeight * spatialWeight;
+            sum += s * w;
+            weightSum += w;
+        }
+    }
+    return sum / max(weightSum, 1e-5);
+}
+
+vec3 microTextureReinject(vec3 original, vec3 denoised) {
+    vec3 detail = original - denoised;
+    float keep = smoothstep(uDenoise.snrThresholdDb, uDenoise.snrThresholdDb + 6.0, localSnrDb(original, denoised));
+    return denoised + detail * keep * clamp(uDenoise.microTextureGain, 0.0, 1.0);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uCurrentAp1);
+    if (p.x >= size.x || p.y >= size.y) return;
+    vec3 center = imageLoad(uCurrentAp1, p).rgb;
+    vec3 prev = imageLoad(uPreviousAp1, p).rgb;
+    float residual = length(center - prev);
+    
+    // Perceptual luma-based motion estimation for real-time suppression of motion blur
+    float currentLuma = dot(center, vec3(0.2722287, 0.6740818, 0.0536895));
+    float prevLuma = dot(prev, vec3(0.2722287, 0.6740818, 0.0536895));
+    float lumaDelta = abs(currentLuma - prevLuma);
+    
+    // Smooth motion gating: if luma delta exceeds 0.002, exponentially drop temporal blending to ensure maximum sharpness with zero blur
+    float motionSuppress = exp(-max(lumaDelta - 0.002, 0.0) * 150.0);
+    
+    float temporalWeight = tukeyBiweightBurstMerge(residual, uDenoise.biweightC) * clamp(uDenoise.frameBlend, 0.0, 1.0) * motionSuppress;
+    vec3 burst = mix(center, prev, temporalWeight);
+    vec3 spatial = jzazbzEdgeAwareDenoise7x7(p, burst);
+    imageStore(uDenoisedAp1, p, vec4(microTextureReinject(center, spatial), 1.0));
+}

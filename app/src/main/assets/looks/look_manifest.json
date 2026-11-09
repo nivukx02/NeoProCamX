@@ -1,0 +1,16 @@
+{
+  "formatVersion": "SINGULARITY_ASSET_MANIFEST_1",
+  "kind": "LOOK",
+  "entries": [
+    {
+      "assetId": "clean_extreme_detail",
+      "file": "looks/clean_extreme_detail.json",
+      "fileHashSha256": "73b304edeae6e0a34ec7fa06c3f571b210c5af1a713d1da1deb73699bf03dd98",
+      "stageIds": [217, 218, 219, 220, 221, 222],
+      "minimumReleaseClass": "SINGULARITY-50",
+      "creativeEffectsOptIn": true,
+      "identityAtZeroStrength": true,
+      "available": true
+    }
+  ]
+}

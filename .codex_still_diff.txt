@@ -1,0 +1,649 @@
+﻿diff --git a/app/src/main/java/com/neoproc/neoproccamx/capture/StillCaptureImagePipeline.kt b/app/src/main/java/com/neoproc/neoproccamx/capture/StillCaptureImagePipeline.kt
+index f9cf050..61cb812 100644
+--- a/app/src/main/java/com/neoproc/neoproccamx/capture/StillCaptureImagePipeline.kt
++++ b/app/src/main/java/com/neoproc/neoproccamx/capture/StillCaptureImagePipeline.kt
+@@ -2,6 +2,8 @@ package com.neoproc.neoproccamx.capture
+ 
+ import android.graphics.Bitmap
+ import android.graphics.BitmapFactory
++import android.os.SystemClock
++import android.os.Trace
+ import android.util.Log
+ import androidx.exifinterface.media.ExifInterface
+ import com.neoproc.neoproccamx.ai.AIProcessor
+@@ -16,6 +18,20 @@ import java.io.ByteArrayInputStream
+ import kotlin.math.abs
+ import kotlin.math.pow
+ 
++internal object StillSingleEnhancementPolicy {
++    /**
++     * A neutral HAL JPEG is already spatially denoised and sharpened by the ISP. Re-running the
++     * heavyweight JVM refinement solely because strict mode is active adds heat, latency, and
++     * generational loss after an aspect crop. Explicit AI still enhancement remains honored, while
++     * strict non-neutral NDR/LOG/creative looks keep their existing refinement path.
++     */
++    fun shouldEnhance(
++        aiEnhancementEnabled: Boolean,
++        strictHighEndEnabled: Boolean,
++        neutralLook: Boolean
++    ): Boolean = aiEnhancementEnabled || (strictHighEndEnabled && !neutralLook)
++}
++
+ internal class StillCaptureImagePipeline(
+     private val cameraController: CameraController,
+     private val colorScience: ColorScience,
+@@ -57,7 +73,7 @@ internal class StillCaptureImagePipeline(
+         // 8-bit Bitmap and recompressing merely because strict mode is enabled adds generational
+         // loss and memory pressure. Aspect crops are still detected independently, and an active
+         // color-science look still takes the full processing route.
+-        strictHighEndEnabled() || !colorScience.isNeutralLook() || aiEnhancementEnabledProvider()
++        !colorScience.isNeutralLook() || aiEnhancementEnabledProvider()
+ 
+     fun requiresAspectCrop(): Boolean =
+         StillCaptureImageMath.requiresAspectCrop(
+@@ -77,7 +93,7 @@ internal class StillCaptureImagePipeline(
+         if (!capture.debugLabel.isNullOrBlank()) {
+             return saveFallbackJpeg(capture, jpegFrames.firstOrNull())
+         }
+-        if (jpegFrames.size < 2) return saveFallbackJpeg(capture, jpegFrames.firstOrNull())
++        if (jpegFrames.size < 2) return handleHdrProcessingFailure(capture, jpegFrames.firstOrNull())
+         val decoded = jpegFrames.mapNotNull(::decodeOrientedBitmap)
+         val frames = decoded.map(::cropBitmapToSelectedAspect)
+         // Recycle the pre-crop originals that a DISTINCT cropped bitmap replaced. When a non-native
+@@ -91,7 +107,7 @@ internal class StillCaptureImagePipeline(
+         }
+         if (frames.size < 2) {
+             recycleBitmaps(frames)
+-            return saveFallbackJpeg(capture, jpegFrames.firstOrNull())
++            return handleHdrProcessingFailure(capture, jpegFrames.firstOrNull())
+         }
+ 
+         var merged: Bitmap? = null
+@@ -101,7 +117,7 @@ internal class StillCaptureImagePipeline(
+                 frames = frames,
+                 requestedBracket = capture.hdrBracketEvs,
+                 hdrMode = capture.hdrMode
+-            ) ?: return saveFallbackJpeg(capture, jpegFrames.firstOrNull())
++            ) ?: return handleHdrProcessingFailure(capture, jpegFrames.firstOrNull())
+             merged = mergedBitmap
+             val processedBitmap = applyEnhancementAndColor(
+                 bitmap = mergedBitmap,
+@@ -115,15 +131,22 @@ internal class StillCaptureImagePipeline(
+                 debugLabel = capture.debugLabel
+             )
+         } catch (e: Exception) {
+-            Log.w(TAG, "processHdrCapture failed, falling back to source JPEG", e)
+-            saveFallbackJpeg(capture, jpegFrames.firstOrNull())
++            Log.e(TAG, "processHdrCapture failed; requested HDR output rejected", e)
++            handleHdrProcessingFailure(capture, jpegFrames.firstOrNull())
+         } finally {
+             recycleBitmaps(frames.map { it as Bitmap? } + listOf(merged, processed))
+         }
+     }
+ 
+     private suspend fun applyColorPipeline(bitmap: Bitmap): Bitmap {
+-        return applyEnhancementAndColor(bitmap, stillEnhancementRequested())
++        return applyEnhancementAndColor(
++            bitmap = bitmap,
++            enhancementRequested = StillSingleEnhancementPolicy.shouldEnhance(
++                aiEnhancementEnabled = aiEnhancementEnabledProvider(),
++                strictHighEndEnabled = strictHighEndEnabled(),
++                neutralLook = colorScience.isNeutralLook()
++            )
++        )
+     }
+ 
+     private suspend fun applyEnhancementAndColor(
+@@ -132,24 +155,50 @@ internal class StillCaptureImagePipeline(
+     ): Bitmap {
+         val enhanced = if (enhancementRequested) {
+             val detailTuning = EliteDetailProfilePolicy.resolve(videoDetailProfileProvider())
+-            enhancementEngine.enhance(
+-                bitmap = bitmap,
+-                sceneType = aiSceneTypeProvider(),
+-                config = EnhancementEngine.EnhancementConfig(
+-                    // Profile intent is adapted from measured image noise and scene type. Native-size
+-                    // tiles preserve source resolution and the enhancer's luma halo guard remains final.
+-                    denoiseStrength = detailTuning.stillDenoise,
+-                    sharpenStrength = detailTuning.stillSharpen,
+-                    microContrastStrength = detailTuning.stillMicroContrast,
+-                    adaptiveByScene = true,
+-                    temporalDenoiseWeight = 0f
++            val enhancementStartedNs = SystemClock.elapsedRealtimeNanos()
++            Trace.beginSection("NeoStill.enhancement")
++            val enhancement = try {
++                enhancementEngine.enhance(
++                    bitmap = bitmap,
++                    sceneType = aiSceneTypeProvider(),
++                    config = EnhancementEngine.EnhancementConfig(
++                        // Profile intent is adapted from measured image noise and scene type. Native-size
++                        // tiles preserve source resolution and the enhancer's luma halo guard remains final.
++                        denoiseStrength = detailTuning.stillDenoise,
++                        sharpenStrength = detailTuning.stillSharpen,
++                        microContrastStrength = detailTuning.stillMicroContrast,
++                        adaptiveByScene = true,
++                        temporalDenoiseWeight = 0f
++                    )
+                 )
+-            ).first
++            } finally {
++                Trace.endSection()
++            }
++            Log.i(
++                TAG,
++                "Still enhancement ${bitmap.width}x${bitmap.height} " +
++                    "wallMs=${(SystemClock.elapsedRealtimeNanos() - enhancementStartedNs) / 1_000_000.0} " +
++                    "engineMs=${enhancement.second.processingTimeMs} path=${enhancement.second.denoisePath} " +
++                    "denoise=${enhancement.second.denoisingApplied} " +
++                    "sharpen=${enhancement.second.sharpeningApplied} " +
++                    "microContrast=${enhancement.second.microContrastApplied}"
++            )
++            enhancement.first.also { result ->
++                check(result.width == bitmap.width && result.height == bitmap.height) {
++                    "Still enhancement changed source resolution " +
++                        "${bitmap.width}x${bitmap.height} -> ${result.width}x${result.height}"
++                }
++            }
+         } else {
+             bitmap
+         }
+         if (colorScience.isNeutralLook()) return enhanced
+         val colorProcessed = colorScience.applyToBitmap(enhanced)
++        check(colorProcessed.width == bitmap.width && colorProcessed.height == bitmap.height) {
++            "Still color pipeline changed source resolution " +
++                "${bitmap.width}x${bitmap.height} -> " +
++                "${colorProcessed.width}x${colorProcessed.height}"
++        }
+         if (colorProcessed !== enhanced && enhanced !== bitmap && !enhanced.isRecycled) enhanced.recycle()
+         return colorProcessed
+     }
+@@ -269,6 +318,19 @@ internal class StillCaptureImagePipeline(
+         )
+     }
+ 
++    private fun handleHdrProcessingFailure(
++        capture: ActiveStillCapture,
++        sourceJpegBytes: ByteArray?
++    ): String? {
++        // Debug automation deliberately requests source artifacts to inspect capture transport.
++        // Production strict mode must never label a single source exposure as a completed HDR photo.
++        return if (!capture.debugLabel.isNullOrBlank() || !strictHighEndEnabled()) {
++            saveFallbackJpeg(capture, sourceJpegBytes)
++        } else {
++            null
++        }
++    }
++
+     private fun recycleBitmaps(bitmaps: Collection<Bitmap?>) {
+         val seen = HashSet<Int>(bitmaps.size)
+         bitmaps.forEach { bitmap ->
+diff --git a/app/src/main/java/com/neoproc/neoproccamx/capture/StillCaptureOutputStore.kt b/app/src/main/java/com/neoproc/neoproccamx/capture/StillCaptureOutputStore.kt
+index e6cf0f4..cc1575b 100644
+--- a/app/src/main/java/com/neoproc/neoproccamx/capture/StillCaptureOutputStore.kt
++++ b/app/src/main/java/com/neoproc/neoproccamx/capture/StillCaptureOutputStore.kt
+@@ -7,6 +7,8 @@ import android.media.MediaScannerConnection
+ import android.net.Uri
+ import android.os.Build
+ import android.os.Environment
++import android.os.SystemClock
++import android.os.Trace
+ import android.provider.MediaStore
+ import android.util.Log
+ import androidx.exifinterface.media.ExifInterface
+@@ -205,6 +207,7 @@ internal class StillCaptureOutputStore(
+         writer: (OutputStream) -> Unit,
+         afterWrite: ((SavedOutputHandle) -> Unit)? = null
+     ): String? {
++        val totalStartedNs = SystemClock.elapsedRealtimeNanos()
+         val values = ContentValues().apply {
+             put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+             put(MediaStore.MediaColumns.MIME_TYPE, spec.mimeType)
+@@ -216,17 +219,63 @@ internal class StillCaptureOutputStore(
+                 put(MediaStore.Images.Media.DATE_TAKEN, nowMs)
+             }
+         }
++        var stageStartedNs = SystemClock.elapsedRealtimeNanos()
+         val uri = context.contentResolver.insert(resolveCollectionUri(spec), values)
+-            ?: return null
++        val insertMs = elapsedMs(stageStartedNs)
++        if (uri == null) {
++            Log.e(TAG, "MediaStore insert returned null name=$displayName insertMs=$insertMs")
++            return null
++        }
+ 
+         return runCatching {
+-            context.contentResolver.openOutputStream(uri)?.use(writer)
+-                ?: error("Unable to open output stream")
+-            afterWrite?.invoke(SavedOutputHandle(uri = uri))
++            stageStartedNs = SystemClock.elapsedRealtimeNanos()
++            Trace.beginSection("NeoStill.mediaWrite")
++            try {
++                context.contentResolver.openOutputStream(uri)?.use(writer)
++                    ?: error("Unable to open output stream")
++            } finally {
++                Trace.endSection()
++            }
++            val writeMs = elapsedMs(stageStartedNs)
++            stageStartedNs = SystemClock.elapsedRealtimeNanos()
++            Trace.beginSection("NeoStill.exif")
++            try {
++                afterWrite?.invoke(SavedOutputHandle(uri = uri))
++            } finally {
++                Trace.endSection()
++            }
++            val metadataMs = elapsedMs(stageStartedNs)
++            stageStartedNs = SystemClock.elapsedRealtimeNanos()
++            val prePublicationEvidence = inspectUriOutput(uri, spec)
++            check(prePublicationEvidence.passed) {
++                "Still output failed integrity validation before publication"
++            }
++            val verifyBeforePublishMs = elapsedMs(stageStartedNs)
+             val publish = ContentValues().apply {
+                 put(MediaStore.MediaColumns.IS_PENDING, 0)
+             }
+-            context.contentResolver.update(uri, publish, null, null)
++            stageStartedNs = SystemClock.elapsedRealtimeNanos()
++            val updatedRows = context.contentResolver.update(uri, publish, null, null)
++            check(updatedRows == 1) {
++                "MediaStore publication updated $updatedRows rows instead of exactly one"
++            }
++            val publishMs = elapsedMs(stageStartedNs)
++            stageStartedNs = SystemClock.elapsedRealtimeNanos()
++            val postPublicationEvidence = inspectUriOutput(uri, spec)
++            StillOutputIntegrityPolicy.requireMatching(
++                beforePublication = prePublicationEvidence,
++                afterPublication = postPublicationEvidence
++            )
++            val verifyAfterPublishMs = elapsedMs(stageStartedNs)
++            Log.i(
++                TAG,
++                "Still output timing name=$displayName insertMs=$insertMs writeMs=$writeMs " +
++                    "metadataMs=$metadataMs verifyPreMs=$verifyBeforePublishMs " +
++                    "publishMs=$publishMs verifyPostMs=$verifyAfterPublishMs " +
++                    "bytes=${postPublicationEvidence.byteCount} " +
++                    "sha256=${postPublicationEvidence.sha256.take(16)}â€¦ " +
++                    "totalMs=${elapsedMs(totalStartedNs)}"
++            )
+             uri.toString()
+         }.getOrElse { error ->
+             Log.e(TAG, "savePendingMediaStoreBinary failed", error)
+@@ -250,12 +299,27 @@ internal class StillCaptureOutputStore(
+         return runCatching {
+             FileOutputStream(file).use(writer)
+             afterWrite?.invoke(SavedOutputHandle(file = file))
++            val prePublicationEvidence = inspectFileOutput(file, spec)
++            check(prePublicationEvidence.passed) {
++                "Legacy still output failed integrity validation before publication"
++            }
+             MediaScannerConnection.scanFile(
+                 context,
+                 arrayOf(file.absolutePath),
+                 arrayOf(spec.mimeType),
+                 null
+             )
++            val postPublicationEvidence = inspectFileOutput(file, spec)
++            StillOutputIntegrityPolicy.requireMatching(
++                beforePublication = prePublicationEvidence,
++                afterPublication = postPublicationEvidence
++            )
++            Log.i(
++                TAG,
++                "Legacy still output verified name=$displayName " +
++                    "bytes=${postPublicationEvidence.byteCount} " +
++                    "sha256=${postPublicationEvidence.sha256.take(16)}â€¦"
++            )
+             file.absolutePath
+         }.getOrElse { error ->
+             Log.e(TAG, "saveLegacyBinary failed", error)
+@@ -272,27 +336,24 @@ internal class StillCaptureOutputStore(
+         val sourceExif = sourceExifBytes?.let { bytes ->
+             runCatching { ExifInterface(ByteArrayInputStream(bytes)) }.getOrNull()
+         }
+-        runCatching {
+-            when {
+-                handle.uri != null -> {
+-                    context.contentResolver.openFileDescriptor(handle.uri, "rw")?.use { pfd ->
+-                        applyExifAttributes(
+-                            source = sourceExif,
+-                            target = ExifInterface(pfd.fileDescriptor),
+-                            forceNormalizedOrientation = forceNormalizedOrientation
+-                        )
+-                    } ?: error("Unable to open destination file descriptor")
+-                }
+-                handle.file != null -> {
++        when {
++            handle.uri != null -> {
++                context.contentResolver.openFileDescriptor(handle.uri, "rw")?.use { pfd ->
+                     applyExifAttributes(
+                         source = sourceExif,
+-                        target = ExifInterface(handle.file.absolutePath),
++                        target = ExifInterface(pfd.fileDescriptor),
+                         forceNormalizedOrientation = forceNormalizedOrientation
+                     )
+-                }
++                } ?: error("Unable to open destination file descriptor")
++            }
++            handle.file != null -> {
++                applyExifAttributes(
++                    source = sourceExif,
++                    target = ExifInterface(handle.file.absolutePath),
++                    forceNormalizedOrientation = forceNormalizedOrientation
++                )
+             }
+-        }.onFailure { error ->
+-            Log.w(TAG, "normalizeExifAttributes failed", error)
++            else -> error("Still output has no writable metadata handle")
+         }
+     }
+ 
+@@ -343,4 +404,23 @@ internal class StillCaptureOutputStore(
+             StillCaptureMediaCollection.IMAGES -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+             StillCaptureMediaCollection.FILES -> MediaStore.Files.getContentUri("external")
+         }
++
++    private fun inspectUriOutput(
++        uri: Uri,
++        spec: StillCaptureOutputSpec
++    ): StillOutputIntegrityEvidence =
++        context.contentResolver.openInputStream(uri)?.use { input ->
++            StillOutputIntegrityPolicy.inspect(input, spec.extension)
++        } ?: error("Unable to read back still output")
++
++    private fun inspectFileOutput(
++        file: File,
++        spec: StillCaptureOutputSpec
++    ): StillOutputIntegrityEvidence =
++        file.inputStream().buffered().use { input ->
++            StillOutputIntegrityPolicy.inspect(input, spec.extension)
++        }
++
++    private fun elapsedMs(startedNs: Long): Double =
++        (SystemClock.elapsedRealtimeNanos() - startedNs) / 1_000_000.0
+ }
+diff --git a/app/src/main/java/com/neoproc/neoproccamx/capture/StillRawCaptureProcessor.kt b/app/src/main/java/com/neoproc/neoproccamx/capture/StillRawCaptureProcessor.kt
+index 6383dee..d6deb0f 100644
+--- a/app/src/main/java/com/neoproc/neoproccamx/capture/StillRawCaptureProcessor.kt
++++ b/app/src/main/java/com/neoproc/neoproccamx/capture/StillRawCaptureProcessor.kt
+@@ -37,11 +37,9 @@ internal class StillRawCaptureProcessor(
+         // Forward/Color matrices, NoiseProfile and illuminants automatically, but only from
+         // what the characteristics/result actually carry. A missing tag means a third party
+         // will not render our neutral — surface it instead of shipping it silently.
+-        runCatching {
+-            val completeness = RawDngMetadataContract.fromCameraMetadata(chars, result)
+-            if (!completeness.isComplete) {
+-                android.util.Log.w("StillRawCapture", completeness.summary)
+-            }
++        val completeness = RawDngMetadataContract.fromCameraMetadata(chars, result)
++        check(completeness.isComplete) {
++            "Native DNG publication rejected: ${completeness.summary}"
+         }
+         return outputStore.saveDng(tag, debugLabel = debugLabel) { out ->
+             DngCreator(chars, result).use { dng ->
+@@ -105,7 +103,7 @@ internal class StillRawCaptureProcessor(
+         }
+     }
+ 
+-    fun saveSoftwareRawFallbackPackage(
++    fun saveProcessedSourceFallbackPackage(
+         tag: String,
+         sourceJpegBytes: ByteArray,
+         renderedReference: Bitmap?,
+@@ -120,22 +118,22 @@ internal class StillRawCaptureProcessor(
+         val dynamicRange = resolveDynamicRangeLabel(profileName, logEnabled, hdrSuggested)
+         val processingPipeline = when {
+             strictHighEndEnabled() && aiEnhancementEnabledProvider() && hdrSuggested ->
+-                "STRICT_HIGH_END_AI_HDR_SOFTWARE_RAW"
++                "STRICT_HIGH_END_AI_HDR_PROCESSED_SOURCE"
+             strictHighEndEnabled() && aiEnhancementEnabledProvider() ->
+-                "STRICT_HIGH_END_AI_ENHANCED_SOFTWARE_RAW"
++                "STRICT_HIGH_END_AI_ENHANCED_PROCESSED_SOURCE"
+             strictHighEndEnabled() && hdrSuggested ->
+-                "STRICT_HIGH_END_HDR_AWARE_SOFTWARE_RAW"
++                "STRICT_HIGH_END_HDR_AWARE_PROCESSED_SOURCE"
+             strictHighEndEnabled() ->
+-                "STRICT_HIGH_END_SOFTWARE_RAW_FALLBACK"
+-            aiEnhancementEnabledProvider() && hdrSuggested -> "AI_HDR_SOFTWARE_RAW"
+-            aiEnhancementEnabledProvider() -> "AI_ENHANCED_SOFTWARE_RAW"
+-            hdrSuggested -> "HDR_AWARE_SOFTWARE_RAW"
+-            else -> "SOFTWARE_RAW_FALLBACK"
++                "STRICT_HIGH_END_PROCESSED_SOURCE_FALLBACK"
++            aiEnhancementEnabledProvider() && hdrSuggested -> "AI_HDR_PROCESSED_SOURCE"
++            aiEnhancementEnabledProvider() -> "AI_ENHANCED_PROCESSED_SOURCE"
++            hdrSuggested -> "HDR_AWARE_PROCESSED_SOURCE"
++            else -> "PROCESSED_SOURCE_FALLBACK"
+         }
+         val metadata = RawOutputPackaging.buildMetadata(
+             RawPackageMetadata(
+-                sourceType = "single_jpeg_fallback",
+-                workflow = "SOFTWARE_RAW_FALLBACK",
++                sourceType = "processed_jpeg_source",
++                workflow = "PROCESSED_SOURCE_FALLBACK",
+                 captureTag = tag,
+                 nativeRawSupported = cameraController.supportsRaw,
+                 nativeDngEmbedded = false,
+@@ -191,7 +189,7 @@ internal class StillRawCaptureProcessor(
+             enhancementEnabled: Boolean,
+             hdrSuggested: Boolean
+         ): String = buildString {
+-            append("CamX mode=RAW_SOFTWARE")
++            append("CamX mode=PROCESSED_SOURCE_PACKAGE")
+             append(" scene=").append(sceneType.name)
+             append(" aiEnhance=").append(enhancementEnabled)
+             append(" hdrSuggested=").append(hdrSuggested)
+@@ -215,9 +213,8 @@ internal class StillRawCaptureProcessor(
+         internal fun resolveTransferFunctionLabel(profileName: String, logEnabled: Boolean): String {
+             if (logEnabled) return "LOG"
+             val key = profileName.lowercase()
+-            val legacyVendorKey = "do" + "lby"
+             return when {
+-                key.contains("hdr10") || key.contains(legacyVendorKey) -> "PQ"
++                key.contains("ndr10") || key.contains("nivukx") || key.contains("hdr10") -> "PQ"
+                 key.contains("hlg") -> "HLG"
+                 key.contains("log") -> "LOG"
+                 else -> "sRGB"
+@@ -230,10 +227,9 @@ internal class StillRawCaptureProcessor(
+             hdrSuggested: Boolean
+         ): String {
+             val key = profileName.lowercase()
+-            val legacyVendorKey = "do" + "lby"
+             return when {
+-                key.contains("hdr10") || key.contains("hlg") -> "NDR10+"
+-                key.contains(legacyVendorKey) -> "NIVUKX Vision"
++                key.contains("nivukx") -> "NIVUKX Vision"
++                key.contains("ndr10") || key.contains("hdr10") || key.contains("hlg") -> "NDR10+"
+                 logEnabled -> "LOG"
+                 hdrSuggested -> "NDR"
+                 else -> "SDR"
+diff --git a/app/src/main/java/com/neoproc/neoproccamx/capture/StillSingleCaptureProcessor.kt b/app/src/main/java/com/neoproc/neoproccamx/capture/StillSingleCaptureProcessor.kt
+index 4d1f472..d570f8a 100644
+--- a/app/src/main/java/com/neoproc/neoproccamx/capture/StillSingleCaptureProcessor.kt
++++ b/app/src/main/java/com/neoproc/neoproccamx/capture/StillSingleCaptureProcessor.kt
+@@ -1,6 +1,9 @@
+ package com.neoproc.neoproccamx.capture
+ 
+ import android.graphics.Bitmap
++import android.os.SystemClock
++import android.os.Trace
++import android.util.Log
+ import com.neoproc.neoproccamx.core.HighEndQualityPolicy
+ 
+ internal data class StillSingleCaptureResult(
+@@ -36,6 +39,7 @@ internal class StillSingleCaptureProcessor(
+     private val applyColorPipeline: suspend (Bitmap) -> Bitmap
+ ) {
+     companion object {
++        private const val TAG = "StillSingleProcessor"
+         private const val FAST_SAVE_JPEG_THRESHOLD_BYTES = 12 * 1024 * 1024
+     }
+ 
+@@ -47,6 +51,7 @@ internal class StillSingleCaptureProcessor(
+         jpegBytes: ByteArray?
+     ): StillSingleCaptureResult {
+         jpegBytes ?: return StillSingleCaptureResult(primarySavedPath = null, rawCompanionPath = null)
++        val totalStartedNs = SystemClock.elapsedRealtimeNanos()
+         val preserveExifMetadata = !isHighThroughputDebugCapture(capture.debugLabel)
+         val requiresCrop = requiresAspectCrop()
+         val plan = StillSingleCapturePolicy.resolvePlan(
+@@ -60,15 +65,22 @@ internal class StillSingleCaptureProcessor(
+                 allowFastSave &&
+                 jpegBytes.size >= FAST_SAVE_JPEG_THRESHOLD_BYTES
+         if (plan.canFastSaveJpeg || forceFastSave) {
+-            val primarySavedPath = outputStore.saveJpegBytes(
+-                jpegBytes = jpegBytes,
+-                tag = plan.outputTag,
+-                debugLabel = capture.debugLabel,
+-                preserveExifMetadata = preserveExifMetadata
++            val primarySavedPath = traceSection("NeoStill.fastSave") {
++                outputStore.saveJpegBytes(
++                    jpegBytes = jpegBytes,
++                    tag = plan.outputTag,
++                    debugLabel = capture.debugLabel,
++                    preserveExifMetadata = preserveExifMetadata
++                )
++            }
++            Log.i(
++                TAG,
++                "Still timing captureId=${capture.id} route=fast inputBytes=${jpegBytes.size} " +
++                    "totalMs=${elapsedMs(totalStartedNs)} saved=${!primarySavedPath.isNullOrEmpty()}"
+             )
+             return StillSingleCaptureResult(
+                 primarySavedPath = primarySavedPath,
+-                rawCompanionPath = buildSoftwareRawFallbackPathIfNeeded(
++                rawCompanionPath = buildProcessedSourceFallbackPathIfNeeded(
+                     capture = capture,
+                     sourceJpegBytes = jpegBytes,
+                     renderedReference = null
+@@ -79,65 +91,88 @@ internal class StillSingleCaptureProcessor(
+         var decoded: Bitmap? = null
+         var cropped: Bitmap? = null
+         var processed: Bitmap? = null
++        var decodeMs = 0.0
++        var cropMs = 0.0
++        var colorMs = 0.0
++        var saveMs = 0.0
++        var fallback = false
+         return try {
+-            decoded = decodeOrientedBitmap(jpegBytes)
++            var stageStartedNs = SystemClock.elapsedRealtimeNanos()
++            decoded = traceSection("NeoStill.decodeRotate") { decodeOrientedBitmap(jpegBytes) }
++            decodeMs = elapsedMs(stageStartedNs)
++            stageStartedNs = SystemClock.elapsedRealtimeNanos()
++            if (decoded == null) fallback = true
++            decoded
+                 ?: return StillSingleCaptureResult(
+-                    primarySavedPath = outputStore.saveJpegBytes(
+-                        jpegBytes = jpegBytes,
+-                        tag = plan.outputTag,
+-                        debugLabel = capture.debugLabel,
+-                        preserveExifMetadata = preserveExifMetadata
+-                    ),
+-                    rawCompanionPath = buildSoftwareRawFallbackPathIfNeeded(
++                    // Bitmap processing was explicitly required (look, enhancement, or crop).
++                    // Publishing the untouched source would silently misrepresent the requested
++                    // result, so strict processing failures remain visible and fail closed.
++                    primarySavedPath = null,
++                    rawCompanionPath = buildProcessedSourceFallbackPathIfNeeded(
+                         capture = capture,
+                         sourceJpegBytes = jpegBytes,
+                         renderedReference = null
+                     )
+                 )
+-            cropped = cropBitmapToSelectedAspect(decoded)
+-            processed = applyColorPipeline(cropped)
+-            val primarySavedPath = outputStore.saveBitmapAsJpeg(
+-                bitmap = processed,
+-                tag = plan.outputTag,
+-                sourceExifBytes = jpegBytes,
+-                debugLabel = capture.debugLabel
+-            )
++            cropped = traceSection("NeoStill.aspectCrop") { cropBitmapToSelectedAspect(decoded) }
++            cropMs = elapsedMs(stageStartedNs)
++            stageStartedNs = SystemClock.elapsedRealtimeNanos()
++            Trace.beginSection("NeoStill.colorPipeline")
++            try {
++                processed = applyColorPipeline(cropped)
++            } finally {
++                Trace.endSection()
++            }
++            colorMs = elapsedMs(stageStartedNs)
++            stageStartedNs = SystemClock.elapsedRealtimeNanos()
++            val primarySavedPath = traceSection("NeoStill.bitmapSave") {
++                outputStore.saveBitmapAsJpeg(
++                    bitmap = processed,
++                    tag = plan.outputTag,
++                    sourceExifBytes = jpegBytes,
++                    debugLabel = capture.debugLabel
++                )
++            }
++            saveMs = elapsedMs(stageStartedNs)
+             StillSingleCaptureResult(
+                 primarySavedPath = primarySavedPath,
+-                rawCompanionPath = buildSoftwareRawFallbackPathIfNeeded(
++                rawCompanionPath = buildProcessedSourceFallbackPathIfNeeded(
+                     capture = capture,
+                     sourceJpegBytes = jpegBytes,
+                     renderedReference = processed
+                 )
+             )
+-        } catch (_: Exception) {
++        } catch (error: Exception) {
++            fallback = true
++            Log.e(TAG, "Still bitmap processing failed captureId=${capture.id}; output rejected", error)
+             StillSingleCaptureResult(
+-                primarySavedPath = outputStore.saveJpegBytes(
+-                    jpegBytes = jpegBytes,
+-                    tag = plan.outputTag,
+-                    debugLabel = capture.debugLabel,
+-                    preserveExifMetadata = preserveExifMetadata
+-                ),
+-                rawCompanionPath = buildSoftwareRawFallbackPathIfNeeded(
++                primarySavedPath = null,
++                rawCompanionPath = buildProcessedSourceFallbackPathIfNeeded(
+                     capture = capture,
+                     sourceJpegBytes = jpegBytes,
+                     renderedReference = null
+                 )
+             )
+         } finally {
++            Log.i(
++                TAG,
++                "Still timing captureId=${capture.id} route=bitmap inputBytes=${jpegBytes.size} " +
++                    "decodeMs=$decodeMs cropMs=$cropMs colorMs=$colorMs saveMs=$saveMs " +
++                    "totalMs=${elapsedMs(totalStartedNs)} fallback=$fallback"
++            )
+             recycleDistinctBitmaps(decoded, cropped, processed)
+         }
+     }
+ 
+-    private fun buildSoftwareRawFallbackPathIfNeeded(
++    private fun buildProcessedSourceFallbackPathIfNeeded(
+         capture: ActiveStillCapture,
+         sourceJpegBytes: ByteArray,
+         renderedReference: Bitmap?
+     ): String? {
+-        if (capture.singleCaptureRawMode != StillCaptureCapturePolicy.SingleCaptureRawMode.SOFTWARE_RAW_FALLBACK) {
++        if (capture.singleCaptureRawMode != StillCaptureCapturePolicy.SingleCaptureRawMode.PROCESSED_SOURCE_FALLBACK) {
+             return null
+         }
+-        return rawCaptureProcessor.saveSoftwareRawFallbackPackage(
++        return rawCaptureProcessor.saveProcessedSourceFallbackPackage(
+             tag = capture.rawCompanionTag ?: capture.primaryTag,
+             sourceJpegBytes = sourceJpegBytes,
+             renderedReference = renderedReference,
+@@ -158,4 +193,16 @@ internal class StillSingleCaptureProcessor(
+         val normalizedLabel = debugLabel?.trim()?.lowercase() ?: return false
+         return normalizedLabel.startsWith("qa_stress_") || normalizedLabel.startsWith("qa_longrun_")
+     }
++
++    private inline fun <T> traceSection(name: String, block: () -> T): T {
++        Trace.beginSection(name)
++        return try {
++            block()
++        } finally {
++            Trace.endSection()
++        }
++    }
++
++    private fun elapsedMs(startedNs: Long): Double =
++        (SystemClock.elapsedRealtimeNanos() - startedNs) / 1_000_000.0
+ }

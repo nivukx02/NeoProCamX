@@ -1,0 +1,334 @@
+#version 450
+
+// GPU presentation operator for the genuine sensor-linear RAW monitor.
+// Input remains FP16 ACEScg. Output is display-ready, true-SDR sRGB RGBA8.
+// This is a scheduling/transport upgrade of the project-owned CPU operator in vulkan_bridge.cpp;
+// it does not modify the full-resolution ACEScg image used by capture or recording.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) uniform readonly image2D uAcesCgInput;
+layout(binding = 1, rgba8) uniform writeonly image2D uSrgbOutput;
+
+layout(push_constant) uniform RawMonitorParams {
+    ivec4 extents;       // inputWidth, inputHeight, outputWidth, outputHeight
+    ivec4 modeFlags;     // mode: 0=RAW, 1=NDR10+, 2=NIVUKX; correctionActive; reserved; reserved
+    vec4 channelScales;  // red, green, blue, saturation
+    vec4 corrections;    // skinHueDeg, skyHueDeg, shadowLift, highlightRolloff
+    vec4 toneProfile;    // sensorDiffuseScene, signalGamma, toeWidth, toeAmount
+    vec4 character;      // highlightDesat, shadowMidtoneLift, midtoneContrast, chromaBoost
+    vec4 detailProfile;  // skyChromaBonus, detailStrength, detailLowerStops, detailUpperStops
+} params;
+
+const vec3 ACESCG_LUMA = vec3(0.2722287, 0.6740818, 0.0536895);
+const vec3 BT2020_LUMA = vec3(0.2627, 0.6780, 0.0593);
+const vec3 REC709_LUMA = vec3(0.2126, 0.7152, 0.0722);
+const float INV_SQRT3 = 0.5773502691896258;
+
+float finiteOrZero(float value) {
+    return (isnan(value) || isinf(value)) ? 0.0 : value;
+}
+
+float acesCgLuma(vec3 color) {
+    return dot(color, ACESCG_LUMA);
+}
+
+float rec709Luma(vec3 color) {
+    return dot(color, REC709_LUMA);
+}
+
+float bt2020Luma(vec3 color) {
+    return dot(color, BT2020_LUMA);
+}
+
+float neutralShoulder(float linearValue) {
+    float x = max(finiteOrZero(linearValue), 0.0);
+    const float knee = 0.82;
+    if (x <= knee) return x;
+    const float headroom = 1.0 - knee;
+    const float excess = x - knee;
+    return clamp(knee + headroom * (excess / (excess + headroom)), 0.0, 1.0);
+}
+
+float ndrSdrMonitorLuminance(float shapedSignal) {
+    float x = max(finiteOrZero(shapedSignal), 0.0);
+    // Project NDR-NIVUKX-PY-CAL-v4: presentation-only linear value for sRGB 0.80.
+    const float diffuseWhiteLinear = 0.60382734;
+    if (x <= 1.0) return x * diffuseWhiteLinear;
+    const float headroom = 1.0 - diffuseWhiteLinear;
+    const float shoulderLength = headroom / diffuseWhiteLinear;
+    const float excess = x - 1.0;
+    return clamp(
+        diffuseWhiteLinear + headroom * (excess / (excess + shoulderLength)),
+        0.0,
+        1.0
+    );
+}
+
+float linearToSrgb8Grid(float linearValue) {
+    float sampleValue = clamp(finiteOrZero(linearValue), 0.0, 1.0);
+    float encoded = sampleValue <= 0.0031308
+        ? 12.92 * sampleValue
+        : 1.055 * pow(sampleValue, 1.0 / 2.4) - 0.055;
+    // Match the CPU path's explicit nearest-integer RGBA8 quantization.
+    return floor(clamp(encoded, 0.0, 1.0) * 255.0 + 0.5) / 255.0;
+}
+
+vec3 rotateHueNeutralAxis(vec3 color, float degreesValue) {
+    float angle = radians(degreesValue);
+    float cs = cos(angle);
+    float sn = sin(angle);
+    vec3 axis = vec3(INV_SQRT3);
+    return color * cs + cross(axis, color) * sn + axis * dot(axis, color) * (1.0 - cs);
+}
+
+vec3 applyMeasuredNdrCorrection(vec3 source) {
+    source = max(source, vec3(0.0));
+    int mode = params.modeFlags.x;
+    bool correctionEnabled = params.modeFlags.y != 0;
+    if (!correctionEnabled || mode < 1 || mode > 2) return source;
+
+    float originalY = max(acesCgLuma(source), 1.0e-7);
+    source *= params.channelScales.rgb;
+    float scaledY = max(acesCgLuma(source), 1.0e-7);
+    source *= clamp(originalY / scaledY, 0.85, 1.15);
+
+    float rg = source.r / max(source.g, 1.0e-7);
+    float rb = source.r / max(source.b, 1.0e-7);
+    float bg = source.b / max(source.g, 1.0e-7);
+    float skin = smoothstep(1.04, 1.24, rg) *
+        (1.0 - smoothstep(1.70, 2.25, rg)) *
+        smoothstep(1.02, 1.32, rb) *
+        smoothstep(0.035, 0.16, originalY) *
+        (1.0 - smoothstep(0.75, 1.10, originalY));
+    float sky = smoothstep(1.02, 1.24, bg) *
+        (1.0 - smoothstep(1.00, 1.28, rg)) *
+        smoothstep(0.045, 0.20, originalY) *
+        (1.0 - smoothstep(1.00, 1.45, originalY));
+    float hueDegrees = params.corrections.x * skin + params.corrections.y * sky;
+    if (abs(hueDegrees) > 1.0e-5) {
+        source = rotateHueNeutralAxis(source, hueDegrees);
+        float rotatedY = max(acesCgLuma(source), 1.0e-7);
+        source *= clamp(originalY / rotatedY, 0.85, 1.15);
+    }
+
+    float y = acesCgLuma(source);
+    source = vec3(y) + (source - vec3(y)) * params.channelScales.a;
+    float shadowWindow = 1.0 - smoothstep(0.035, 0.22, originalY);
+    source = max(source + vec3(params.corrections.z * shadowWindow), vec3(0.0));
+    return source;
+}
+
+float ndrSignalShape(float value, float gammaValue, float toeWidth, float toeAmount) {
+    if (value <= 0.0) return 0.0;
+    if (value <= 1.0) {
+        return pow(value, gammaValue) +
+            smoothstep(0.0, toeWidth, value) * toeAmount * (1.0 - value);
+    }
+    return 1.0 + (gammaValue - toeAmount) * (value - 1.0);
+}
+
+float ndrBlackPreservingMidtoneLift(float shapedSignal, float strength) {
+    float x = max(finiteOrZero(shapedSignal), 0.0);
+    if (x <= 0.0 || x >= 1.0) return x;
+    float window = smoothstep(0.025, 0.20, x) *
+        (1.0 - smoothstep(0.78, 1.20, x));
+    return x + strength * sqrt(x) * (1.0 - x) * window;
+}
+
+float ndrProfileMidtoneContrast(float signalValue, float strength) {
+    float x = max(finiteOrZero(signalValue), 0.0);
+    if (x <= 0.0 || x >= 1.0) return x;
+    float window = smoothstep(0.055, 0.24, x) *
+        (1.0 - smoothstep(0.76, 1.0, x));
+    float signedContrast = (x - 0.50) * 4.0 * x * (1.0 - x);
+    return max(x + strength * signedContrast * window, 0.0);
+}
+
+vec3 ndrProfileChromaCharacter(vec3 color, float baseBoost, float skyBonusStrength) {
+    float y = max(bt2020Luma(color), 1.0e-7);
+    float peak = max(color.r, max(color.g, color.b));
+    float floorValue = min(color.r, min(color.g, color.b));
+    float relativeChroma = (peak - floorValue) / max(y, 0.04);
+    float colorConfidence = smoothstep(0.035, 0.22, relativeChroma);
+
+    float rg = color.r / max(color.g, 1.0e-6);
+    float bg = color.b / max(color.g, 1.0e-6);
+    float skin = smoothstep(1.02, 1.16, rg) *
+        (1.0 - smoothstep(1.58, 2.10, rg)) *
+        (1.0 - smoothstep(0.98, 1.18, bg));
+    float sky = smoothstep(1.03, 1.22, bg) *
+        (1.0 - smoothstep(1.00, 1.22, rg));
+    float tonalWindow = smoothstep(0.035, 0.16, y) *
+        (1.0 - smoothstep(0.88, 1.65, y));
+    float skyBonus = sky * skyBonusStrength;
+    float skinProtection = mix(1.0, 0.45, skin);
+    float gain = 1.0 + (baseBoost + skyBonus) * colorConfidence * tonalWindow * skinProtection;
+    return vec3(y) + (color - vec3(y)) * gain;
+}
+
+float applyHighlightRolloff(float signalValue, float bias) {
+    float x = max(signalValue, 0.0);
+    if (x <= 1.0 || bias <= 0.0) return x;
+    float excess = x - 1.0;
+    return 1.0 + excess / (1.0 + 4.0 * bias * excess);
+}
+
+vec3 compressRec709GamutPreserveLuma(vec3 color) {
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak <= 1.0) return color;
+    float y = clamp(rec709Luma(color), 0.0, 1.0);
+    float chromaSpan = peak - y;
+    if (chromaSpan <= 1.0e-7) return vec3(y);
+    float chromaScale = clamp((1.0 - y) / chromaSpan, 0.0, 1.0);
+    return vec3(y) + (color - vec3(y)) * chromaScale;
+}
+
+vec3 acesCgToRec709(vec3 acesCg) {
+    return max(vec3(
+        1.7050 * acesCg.r - 0.6217 * acesCg.g - 0.0832 * acesCg.b,
+       -0.1302 * acesCg.r + 1.1408 * acesCg.g - 0.0106 * acesCg.b,
+       -0.0240 * acesCg.r - 0.1290 * acesCg.g + 1.1530 * acesCg.b
+    ), vec3(0.0));
+}
+
+vec3 acesCgToRec2020(vec3 acesCg) {
+    return max(vec3(
+        dot(acesCg, vec3( 1.02582, -0.02005, -0.00577)),
+        dot(acesCg, vec3(-0.00386,  1.01040, -0.00654)),
+        dot(acesCg, vec3(-0.01784, -0.07404,  1.09188))
+    ), vec3(0.0));
+}
+
+vec3 rec2020ToRec709(vec3 rec2020) {
+    return vec3(
+        dot(rec2020, vec3( 1.6605, -0.5876, -0.0728)),
+        dot(rec2020, vec3(-0.1246,  1.1329, -0.0083)),
+        dot(rec2020, vec3(-0.0182, -0.1006,  1.1187))
+    );
+}
+
+vec3 ndrSdrMonitor(vec3 acesCg, float localDetailStops) {
+    // Presentation-only adaptation uses the exact same scene reference and canonical tone packet as
+    // recording. This leaves exact black at zero and keeps the FP16 RAW master untouched.
+    float sensorDiffuseScene = clamp(params.toneProfile.x, 0.02, 0.30);
+    vec3 rec2020 = acesCgToRec2020(applyMeasuredNdrCorrection(acesCg)) / sensorDiffuseScene;
+    float y = max(bt2020Luma(rec2020), 1.0e-7);
+    float gammaValue = clamp(params.toneProfile.y, 0.10, 1.0);
+    float toeWidth = clamp(params.toneProfile.z, 0.001, 0.90);
+    float toeAmount = clamp(params.toneProfile.w, 0.0, 0.20);
+    float mappedY = ndrSignalShape(y, gammaValue, toeWidth, toeAmount);
+    mappedY = ndrBlackPreservingMidtoneLift(
+        mappedY,
+        clamp(params.character.y, 0.0, 0.35)
+    );
+    mappedY = ndrProfileMidtoneContrast(
+        mappedY,
+        clamp(params.character.z, 0.0, 0.30)
+    );
+    float detailStrength = clamp(params.detailProfile.y, 0.0, 0.75);
+    float detailGainStops = clamp(
+        localDetailStops * detailStrength,
+        clamp(params.detailProfile.z, -0.20, 0.0),
+        clamp(params.detailProfile.w, 0.0, 0.20)
+    );
+    mappedY *= exp2(detailGainStops);
+    rec2020 *= mappedY / y;
+    rec2020 = ndrProfileChromaCharacter(
+        rec2020,
+        clamp(params.character.w, 0.0, 0.25),
+        clamp(params.detailProfile.x, 0.0, 0.08)
+    );
+
+    // Preserve the project-owned rich midtone colour. Chroma protection starts only above diffuse
+    // white and remains luminance-preserving; it exists solely to roll extreme highlights into SDR.
+    float desatCap = clamp(params.character.x, 0.0, 0.50);
+    float desat = clamp(desatCap * smoothstep(0.55, 1.0, mappedY), 0.0, desatCap);
+    rec2020 += (vec3(mappedY) - rec2020) * desat;
+
+    float preRolloffY = max(bt2020Luma(rec2020), 1.0e-7);
+    float rolledY = applyHighlightRolloff(preRolloffY, params.corrections.w);
+    rec2020 *= rolledY / preRolloffY;
+
+    float monitorY = max(bt2020Luma(rec2020), 1.0e-7);
+    rec2020 *= ndrSdrMonitorLuminance(monitorY) / monitorY;
+    return compressRec709GamutPreserveLuma(max(rec2020ToRec709(rec2020), vec3(0.0)));
+}
+
+vec3 sampleInput(ivec2 destinationPixel) {
+    ivec2 inputSize = params.extents.xy;
+    ivec2 outputSize = params.extents.zw;
+    if (all(equal(inputSize, outputSize))) {
+        return imageLoad(uAcesCgInput, destinationPixel).rgb;
+    }
+
+    // Pixel-center bilinear mapping, matching the prior VK_FILTER_LINEAR monitor downscale.
+    vec2 sourcePosition = (vec2(destinationPixel) + vec2(0.5)) *
+        vec2(inputSize) / vec2(outputSize) - vec2(0.5);
+    ivec2 p0 = ivec2(floor(sourcePosition));
+    vec2 fractionValue = fract(sourcePosition);
+    p0 = clamp(p0, ivec2(0), inputSize - ivec2(1));
+    ivec2 p1 = min(p0 + ivec2(1), inputSize - ivec2(1));
+    vec3 top = mix(
+        imageLoad(uAcesCgInput, ivec2(p0.x, p0.y)).rgb,
+        imageLoad(uAcesCgInput, ivec2(p1.x, p0.y)).rgb,
+        fractionValue.x
+    );
+    vec3 bottom = mix(
+        imageLoad(uAcesCgInput, ivec2(p0.x, p1.y)).rgb,
+        imageLoad(uAcesCgInput, ivec2(p1.x, p1.y)).rgb,
+        fractionValue.x
+    );
+    return mix(top, bottom, fractionValue.y);
+}
+
+float ndrLocalDetailStops(ivec2 pixel, vec3 centerAcesCg) {
+    ivec2 outputSize = params.extents.zw;
+    ivec2 leftPixel = ivec2(max(pixel.x - 1, 0), pixel.y);
+    ivec2 rightPixel = ivec2(min(pixel.x + 1, outputSize.x - 1), pixel.y);
+    ivec2 upPixel = ivec2(pixel.x, max(pixel.y - 1, 0));
+    ivec2 downPixel = ivec2(pixel.x, min(pixel.y + 1, outputSize.y - 1));
+    float centerY = max(acesCgLuma(max(centerAcesCg, vec3(0.0))), 0.0);
+    float localBase = 0.25 * (
+        max(acesCgLuma(max(sampleInput(leftPixel), vec3(0.0))), 0.0) +
+        max(acesCgLuma(max(sampleInput(rightPixel), vec3(0.0))), 0.0) +
+        max(acesCgLuma(max(sampleInput(upPixel), vec3(0.0))), 0.0) +
+        max(acesCgLuma(max(sampleInput(downPixel), vec3(0.0))), 0.0)
+    );
+    float detail = log2((centerY + 0.0020) / (localBase + 0.0020));
+    float edgeConfidence = smoothstep(0.006, 0.040, abs(centerY - localBase));
+    float shadowNoiseGuard = smoothstep(0.018, 0.075, centerY);
+    float highlightGuard = 1.0 - smoothstep(1.30, 3.20, centerY);
+    return clamp(detail, -0.22, 0.22) * edgeConfidence * shadowNoiseGuard * highlightGuard;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 outputSize = params.extents.zw;
+    if (any(greaterThanEqual(pixel, outputSize))) return;
+
+    vec3 acesCg = sampleInput(pixel);
+    vec3 linearDisplay;
+    // Profile selection and measured-calibration confidence are independent.  A low-confidence
+    // calibration keeps identity coefficients but must never disable the selected NDR monitor look.
+    bool ndrActive = params.modeFlags.x >= 1 && params.modeFlags.x <= 2;
+    if (ndrActive) {
+        linearDisplay = ndrSdrMonitor(acesCg, ndrLocalDetailStops(pixel, acesCg));
+    } else {
+        vec3 rec709 = acesCgToRec709(acesCg);
+        float luminanceValue = rec709Luma(rec709);
+        float scale = luminanceValue > 1.0e-6
+            ? neutralShoulder(luminanceValue) / luminanceValue
+            : 0.0;
+        linearDisplay = rec709 * scale;
+        float peak = max(linearDisplay.r, max(linearDisplay.g, linearDisplay.b));
+        if (peak > 1.0) linearDisplay /= peak;
+    }
+
+    vec3 srgb = vec3(
+        linearToSrgb8Grid(linearDisplay.r),
+        linearToSrgb8Grid(linearDisplay.g),
+        linearToSrgb8Grid(linearDisplay.b)
+    );
+    imageStore(uSrgbOutput, pixel, vec4(srgb, 1.0));
+}

@@ -1,0 +1,112 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define NEOPROCAMX_KNEE_CURVE_COMPUTE 1
+#define NDR10_NIVUKX_PROJECT_OWNED_TONEMAP 1
+
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D uInputLinearRgba16f;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D uOutputToneMappedRgba16f;
+
+layout(push_constant) uniform KneeCurveParams {
+    float maxCLL;
+    float kneePoint;
+    float kneeHardness;
+    float targetPeakNits; // s4-f03/CP30: explicit display peak (nits) for the BT.2390 EETF path
+    // CP30 no-downgrade gate, now per-dispatch (default 0.0 → today's SDR-referred modified-Reinhard
+    // knee bit-for-bit). When >0.5, highlights above diffuse white are ROLLED to an explicit peak-nits
+    // ceiling (BT.2390 EETF) instead of compressed into the normalized SDR range.
+    float peakNitsGate;
+} params;
+
+const float DEFAULT_MAX_CLL = 1000.0;
+const float DEFAULT_KNEE_POINT = 0.65;
+const float DEFAULT_KNEE_HARDNESS = 2.0;
+const float REFERENCE_WHITE_NITS = 203.0;
+const float DEFAULT_TARGET_PEAK_NITS = 1000.0;
+
+// ── CP30 BT.2390-style EETF (Hermite shoulder) ───────────────────────────────────
+// Diffuse white (203 nits) anchors at 1.0 in REFERENCE_WHITE_NITS-normalized units; below the knee
+// start the curve is identity (the diffuse range is preserved). Above it, a C1-continuous Hermite
+// shoulder rolls the source highlight range [ks, maxIn] onto [ks, maxOut] — carrying highlight
+// detail up to the explicit display peak instead of clamping it to the SDR ceiling. Monotonic for
+// maxOut ≤ maxIn (compressing), which the caller guarantees.
+float bt2390Eetf(float x, float ks, float maxIn, float maxOut) {
+    if (x <= ks) return max(x, 0.0);
+    float t = clamp((x - ks) / max(maxIn - ks, 0.00001), 0.0, 1.0);
+    float t2 = t * t;
+    float t3 = t2 * t;
+    return (2.0 * t3 - 3.0 * t2 + 1.0) * ks
+         + (t3 - 2.0 * t2 + t) * (maxIn - ks)
+         + (-2.0 * t3 + 3.0 * t2) * maxOut;
+}
+
+float adaptiveSigmoidKneeWeight(float value, float kneePoint, float kneeHardness) {
+    float safeKnee = clamp(kneePoint, 0.55, 0.75);
+    float safeHardness = clamp(kneeHardness, 1.0, 3.0);
+    float t = clamp((value - safeKnee) / max(1.0 - safeKnee, 0.00001), 0.0, 1.0);
+    float centered = (t - 0.5) * safeHardness * 4.0;
+    float sigmoid = 1.0 / (1.0 + exp(-centered));
+    float minSigmoid = 1.0 / (1.0 + exp(0.5 * safeHardness * 4.0));
+    float maxSigmoid = 1.0 / (1.0 + exp(-0.5 * safeHardness * 4.0));
+    return clamp((sigmoid - minSigmoid) / max(maxSigmoid - minSigmoid, 0.00001), 0.0, 1.0);
+}
+
+float modifiedReinhardKnee(float channel, float kneePoint, float kneeHardness, float maxCLL) {
+    float x = max(channel, 0.0);
+    float safeKnee = clamp(kneePoint, 0.55, 0.75);
+    float safeHardness = clamp(kneeHardness, 1.0, 3.0);
+    float safeMaxCLL = max(maxCLL, REFERENCE_WHITE_NITS);
+    float peakScale = clamp(safeMaxCLL / DEFAULT_MAX_CLL, 0.25, 4.0);
+    float headroom = max(peakScale - safeKnee, 0.00001);
+    float over = max(x - safeKnee, 0.0);
+    float reinhard = safeKnee + (over * headroom) / (over + headroom / safeHardness);
+    float weight = adaptiveSigmoidKneeWeight(x, safeKnee, safeHardness);
+    return mix(x, reinhard, weight);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = imageSize(uOutputToneMappedRgba16f);
+    if (coord.x >= extent.x || coord.y >= extent.y) {
+        return;
+    }
+
+    vec4 source = imageLoad(uInputLinearRgba16f, coord);
+    float maxCLL = params.maxCLL > 0.0 ? params.maxCLL : DEFAULT_MAX_CLL;
+    float kneePoint = clamp(params.kneePoint, 0.55, 0.75);
+    float kneeHardness = clamp(params.kneeHardness, 1.0, 3.0);
+    if (params.kneePoint <= 0.0) {
+        kneePoint = DEFAULT_KNEE_POINT;
+    }
+    if (params.kneeHardness <= 0.0) {
+        kneeHardness = DEFAULT_KNEE_HARDNESS;
+    }
+
+    // Hue-preserving highlight knee: drive the knee from the max RGB channel and
+    // scale all channels equally, so a channel crossing the knee is compressed
+    // WITHOUT desaturating or twisting hue. Applying the knee per-channel
+    // (previously) pulled a clipping channel down alone, shifting hue/saturation
+    // on saturated highlights (audit rank 7). The modifiedReinhardKnee /
+    // bt2390Eetf curve functions are unchanged (parity with ndr10_knee_curve.comp).
+    vec3 rgb = max(source.rgb, vec3(0.0));
+    float drive = max(max(rgb.r, rgb.g), rgb.b);
+    vec3 mapped;
+    if (params.peakNitsGate > 0.5) {
+        // Peak-nits ApexToneMapper path: roll highlights to an explicit display peak (BT.2390 EETF).
+        float ks = 1.0; // diffuse-white anchor (203 nits = 1.0 in REFERENCE_WHITE_NITS units)
+        float safeMaxCLL = max(maxCLL, REFERENCE_WHITE_NITS);
+        float maxInN = max(safeMaxCLL / REFERENCE_WHITE_NITS, ks + 0.5);
+        float targetN = params.targetPeakNits > 0.0 ? params.targetPeakNits : DEFAULT_TARGET_PEAK_NITS;
+        float maxOutN = clamp(targetN / REFERENCE_WHITE_NITS, ks + 0.25, maxInN);
+        float mappedDrive = bt2390Eetf(drive, ks, maxInN, maxOutN);
+        float scale = drive > 1e-6 ? mappedDrive / drive : 1.0;
+        mapped = rgb * scale;
+    } else {
+        // Default SDR-referred modified-Reinhard knee (hue-preserving via max-RGB drive).
+        float mappedDrive = modifiedReinhardKnee(drive, kneePoint, kneeHardness, maxCLL);
+        float scale = drive > 1e-6 ? mappedDrive / drive : 1.0;
+        mapped = rgb * scale;
+    }
+    imageStore(uOutputToneMappedRgba16f, coord, vec4(mapped, source.a));
+}

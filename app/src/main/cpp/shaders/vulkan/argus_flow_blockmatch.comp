@@ -1,0 +1,147 @@
+#version 450
+
+// OmniClarity Engine — §2 Argus Hybrid Optical Flow, Stage A (classical block matching).
+//
+// 100% classical, zero learned weights. Emits a forward motion field f(p) in pixels such that
+//   previous(p - f(p)) ~= current(p)
+// which is exactly the convention warp_reconstruct.comp consumes (binding 2, rg16f,
+// sourceCoord = coord - flow). Stage B (smoothness-regularized variational refinement) runs in a
+// separate pass and is the first thing dropped under thermal/time pressure — see ArgusFlowStagePolicy.
+//
+// Pipeline: coarse strided search -> fine local search -> 3-point parabola sub-pixel refine,
+// gated by a distinctiveness (best vs second-best SAD) and local-texture confidence so flat or
+// ambiguous regions fall back to zero (static) flow rather than guessing — "doing less is correct".
+// Intended to run on a reduced-resolution luma pair; cost scales with search window x patch area.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly uniform highp image2D uCurrentFrame;
+layout(binding = 1, rgba16f) readonly uniform highp image2D uPreviousFrame;
+layout(binding = 2, rg16f) writeonly uniform highp image2D uMotionField;
+
+layout(push_constant) uniform ArgusBlockMatchParams {
+    int searchRadius;    // max integer displacement searched, px (e.g. 12)
+    int coarseStep;      // coarse search stride, px >= 1 (e.g. 3)
+    int patchRadius;     // SAD match patch half-size, px (e.g. 3 -> 7x7)
+    float maxFlow;       // clamp on |flow|, px
+    float previousValid; // 0 => no valid previous frame (emit zero flow)
+    float minTexture;    // local gradient floor below which flow is suppressed
+} uParams;
+
+ivec2 clampCoord(ivec2 c, ivec2 size) {
+    return clamp(c, ivec2(0), size - ivec2(1));
+}
+
+float currentLuma(ivec2 c, ivec2 size) {
+    vec3 rgb = imageLoad(uCurrentFrame, clampCoord(c, size)).rgb;
+    return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+float previousLuma(ivec2 c, ivec2 size) {
+    vec3 rgb = imageLoad(uPreviousFrame, clampCoord(c, size)).rgb;
+    return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// Sum of absolute luma differences between the current patch at p and the previous patch at (p - d).
+float patchSad(ivec2 p, ivec2 d, int r, ivec2 size) {
+    float s = 0.0;
+    for (int y = -r; y <= r; ++y) {
+        for (int x = -r; x <= r; ++x) {
+            ivec2 o = ivec2(x, y);
+            s += abs(currentLuma(p + o, size) - previousLuma(p - d + o, size));
+        }
+    }
+    return s;
+}
+
+void main() {
+    ivec2 size = imageSize(uMotionField);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= size.x || p.y >= size.y) {
+        return;
+    }
+
+    // No prior frame -> no motion estimate possible; emit static flow.
+    if (uParams.previousValid < 0.5) {
+        imageStore(uMotionField, p, vec4(0.0));
+        return;
+    }
+
+    int r = max(uParams.patchRadius, 1);
+    int R = max(uParams.searchRadius, 1);
+    int step = max(uParams.coarseStep, 1);
+
+    // Local texture (central-difference gradient) — matches are unreliable without structure.
+    float gx = abs(currentLuma(p + ivec2(1, 0), size) - currentLuma(p - ivec2(1, 0), size));
+    float gy = abs(currentLuma(p + ivec2(0, 1), size) - currentLuma(p - ivec2(0, 1), size));
+    float texture = gx + gy;
+
+    // Coarse strided search over the full window, tracking best and second-best for distinctiveness.
+    float best = patchSad(p, ivec2(0), r, size);
+    float secondBest = best;
+    ivec2 bestD = ivec2(0);
+    for (int dy = -R; dy <= R; dy += step) {
+        for (int dx = -R; dx <= R; dx += step) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
+            float sad = patchSad(p, ivec2(dx, dy), r, size);
+            if (sad < best) {
+                secondBest = best;
+                best = sad;
+                bestD = ivec2(dx, dy);
+            } else if (sad < secondBest) {
+                secondBest = sad;
+            }
+        }
+    }
+
+    // Fine local search around the coarse winner.
+    for (int dy = -step + 1; dy <= step - 1; ++dy) {
+        for (int dx = -step + 1; dx <= step - 1; ++dx) {
+            ivec2 d = bestD + ivec2(dx, dy);
+            if (abs(d.x) > R || abs(d.y) > R) {
+                continue;
+            }
+            float sad = patchSad(p, d, r, size);
+            if (sad < best) {
+                secondBest = best;
+                best = sad;
+                bestD = d;
+            }
+        }
+    }
+
+    vec2 flow = vec2(bestD);
+
+    // 3-point parabola sub-pixel refinement along each axis around the integer minimum.
+    float centerSad = best;
+    float leftSad = patchSad(p, bestD - ivec2(1, 0), r, size);
+    float rightSad = patchSad(p, bestD + ivec2(1, 0), r, size);
+    float denomX = leftSad - 2.0 * centerSad + rightSad;
+    if (abs(denomX) > 1e-5) {
+        flow.x += clamp(0.5 * (leftSad - rightSad) / denomX, -0.5, 0.5);
+    }
+    float upSad = patchSad(p, bestD - ivec2(0, 1), r, size);
+    float downSad = patchSad(p, bestD + ivec2(0, 1), r, size);
+    float denomY = upSad - 2.0 * centerSad + downSad;
+    if (abs(denomY) > 1e-5) {
+        flow.y += clamp(0.5 * (upSad - downSad) / denomY, -0.5, 0.5);
+    }
+
+    // Distinctiveness (Lowe-style best/second ratio) x texture gate => hybrid reliability.
+    float distinct = secondBest > 1e-5 ? clamp(1.0 - best / secondBest, 0.0, 1.0) : 0.0;
+    float textureGate = smoothstep(uParams.minTexture, uParams.minTexture * 4.0 + 1e-4, texture);
+    float reliability = distinct * textureGate;
+
+    // Low-confidence regions fall back to static flow rather than hallucinating motion.
+    flow *= reliability;
+
+    // Clamp magnitude to the configured maximum displacement.
+    float mag = length(flow);
+    if (mag > uParams.maxFlow && mag > 1e-5) {
+        flow *= uParams.maxFlow / mag;
+    }
+
+    imageStore(uMotionField, p, vec4(flow, 0.0, 0.0));
+}

@@ -1,0 +1,37 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define NEOPROCAMX_PROJECT_OWNED_HDR_METADATA 1
+
+const uint HISTOGRAM_BINS = 256u;
+const float MAX_METADATA_NITS = 10000.0;
+const vec3 BRIGHTNESS_WEIGHTS = vec3(0.2627, 0.6780, 0.0593);
+
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D uLinearLightImage;
+
+layout(std430, set = 0, binding = 1) buffer HdrHistogramBuffer {
+    uint bins[256];
+    uint sumBins;
+    uint pixelCount;
+} histogram;
+
+uint brightnessBin(vec3 color) {
+    float luma = dot(max(color, vec3(0.0)), BRIGHTNESS_WEIGHTS);
+    float normalized = clamp(luma, 0.0, 1.0);
+    return uint(clamp(round(normalized * float(HISTOGRAM_BINS - 1u)), 0.0, float(HISTOGRAM_BINS - 1u)));
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = imageSize(uLinearLightImage);
+    if (coord.x >= extent.x || coord.y >= extent.y) {
+        return;
+    }
+
+    vec4 sampleColor = imageLoad(uLinearLightImage, coord);
+    uint bin = brightnessBin(sampleColor.rgb);
+    atomicAdd(histogram.bins[bin], 1u);
+    atomicAdd(histogram.sumBins, bin);
+    atomicAdd(histogram.pixelCount, 1u);
+}

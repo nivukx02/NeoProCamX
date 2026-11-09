@@ -1,0 +1,76 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define NEOPROCAMX_PROJECT_OWNED_HDR_METADATA_REDUCE 1
+
+const uint HISTOGRAM_BINS = 256u;
+const float MAX_METADATA_NITS = 10000.0;
+const uint MIN_MAXCLL_NITS = 100u;
+const uint MAX_MAXCLL_NITS = 10000u;
+
+layout(std430, set = 0, binding = 0) buffer HdrHistogramBuffer {
+    uint bins[256];
+    uint sumBins;
+    uint pixelCount;
+} histogram;
+
+layout(std430, set = 0, binding = 1) buffer HdrMetadataBuffer {
+    uint maxCLL;
+    uint maxFALL;
+    uint minLuminance;
+    uint validFrame;
+} metadata;
+
+shared uint sharedCounts[256];
+shared uint sharedWeightedBins[256];
+
+uint nitsFromBin(uint bin) {
+    float nits = (float(min(bin, HISTOGRAM_BINS - 1u)) / float(HISTOGRAM_BINS - 1u)) * MAX_METADATA_NITS;
+    return uint(clamp(round(nits), 0.0, MAX_METADATA_NITS));
+}
+
+void main() {
+    uint index = gl_LocalInvocationID.x;
+    sharedCounts[index] = histogram.bins[index];
+    sharedWeightedBins[index] = histogram.bins[index] * index;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (index < stride) {
+            sharedCounts[index] += sharedCounts[index + stride];
+            sharedWeightedBins[index] += sharedWeightedBins[index + stride];
+        }
+        barrier();
+    }
+
+    if (index != 0u) {
+        return;
+    }
+
+    uint totalPixels = max(histogram.pixelCount, sharedCounts[0]);
+    if (totalPixels == 0u) {
+        metadata.maxCLL = MIN_MAXCLL_NITS;
+        metadata.maxFALL = MIN_MAXCLL_NITS;
+        metadata.minLuminance = 0u;
+        metadata.validFrame = 0u;
+        return;
+    }
+
+    uint percentileTarget = max(1u, (totalPixels * 99u + 99u) / 100u);
+    uint cumulative = 0u;
+    uint percentileBin = 0u;
+    for (uint bin = 0u; bin < HISTOGRAM_BINS; ++bin) {
+        cumulative += histogram.bins[bin];
+        if (cumulative >= percentileTarget) {
+            percentileBin = bin;
+            break;
+        }
+    }
+
+    metadata.maxCLL = clamp(nitsFromBin(percentileBin), MIN_MAXCLL_NITS, MAX_MAXCLL_NITS);
+    uint meanNits = nitsFromBin(uint(round(float(histogram.sumBins) / float(totalPixels))));
+    metadata.maxFALL = min(meanNits, metadata.maxCLL);
+    metadata.minLuminance = 0u;
+    metadata.validFrame = 1u;
+}

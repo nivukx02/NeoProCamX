@@ -1,0 +1,40 @@
+plugins {
+    id 'org.jetbrains.kotlin.jvm' version '2.3.21'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+kotlin {
+    jvmToolchain(21)
+    compilerOptions {
+        allWarningsAsErrors = true
+    }
+}
+
+def sdkRoot = System.getenv('ANDROID_HOME') ?: System.getenv('ANDROID_SDK_ROOT')
+if (sdkRoot == null || sdkRoot.trim().isEmpty()) {
+    sdkRoot = new File(System.getenv('LOCALAPPDATA'), 'Android/Sdk').absolutePath
+}
+def androidPlatform = file("${sdkRoot}/platforms/android-36.1/android.jar")
+if (!androidPlatform.exists()) {
+    throw new GradleException("Android 36.1 platform jar is required at ${androidPlatform}")
+}
+
+sourceSets {
+    main {
+        kotlin {
+            srcDir '../../app/src/main/java'
+            include 'com/neoproc/neoproccamx/niv99/**/*.kt'
+            include 'com/neoproc/neoproccamx/camera/CameraSensorNoiseModelPolicy.kt'
+        }
+    }
+}
+
+dependencies {
+    compileOnly files(androidPlatform)
+    compileOnly 'androidx.annotation:annotation:1.9.1'
+    implementation files('../../core-math/build/libs/core-math.jar')
+}

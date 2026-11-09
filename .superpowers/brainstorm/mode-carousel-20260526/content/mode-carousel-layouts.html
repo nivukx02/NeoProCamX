@@ -1,0 +1,62 @@
+<h2>How should the repeating mode rail feel?</h2>
+<p class="subtitle">Swipe horizontally. The label aligned over the shutter becomes active. The order loops continuously: VIDEO - PRO - NDR - LOG - RAW - VIDEO.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image" style="background:#030303;padding:18px 10px 16px;min-height:270px;">
+      <div style="height:138px;border:1px solid #151515;background:#000;"></div>
+      <div style="display:flex;align-items:center;justify-content:center;gap:23px;margin-top:22px;font:600 12px Arial;color:#6e6e72;white-space:nowrap;overflow:hidden;">
+        <span>RAW</span><span style="color:#8a8a8e">VIDEO</span>
+        <span style="background:#fff;color:#080808;border-radius:18px;padding:9px 14px;font-weight:700;">PRO</span>
+        <span style="color:#8a8a8e">NDR</span><span>LOG</span>
+      </div>
+      <div style="height:1px;width:42px;background:#747474;margin:12px auto 0;"></div>
+      <div style="width:58px;height:58px;border:4px solid #eceef0;border-radius:50%;margin:12px auto 0;box-shadow:inset 0 0 0 4px #1d1d1f;"></div>
+    </div>
+    <div class="card-body">
+      <h3>A. Five-label cinema rail</h3>
+      <p>Recommended. The user can see the sequence and the next choices while the centered active label stays aligned to the shutter.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image" style="background:#030303;padding:18px 10px 16px;min-height:270px;">
+      <div style="height:138px;border:1px solid #151515;background:#000;"></div>
+      <div style="display:flex;align-items:center;justify-content:center;gap:40px;margin-top:22px;font:600 12px Arial;color:#777;white-space:nowrap;overflow:hidden;">
+        <span>VIDEO</span>
+        <span style="background:#fff;color:#080808;border-radius:18px;padding:9px 17px;font-weight:700;">PRO</span>
+        <span>NDR</span>
+      </div>
+      <div style="height:1px;width:42px;background:#747474;margin:12px auto 0;"></div>
+      <div style="width:58px;height:58px;border:4px solid #eceef0;border-radius:50%;margin:12px auto 0;box-shadow:inset 0 0 0 4px #1d1d1f;"></div>
+    </div>
+    <div class="card-body">
+      <h3>B. Focused three-label rail</h3>
+      <p>Larger spacing and less clutter, but the cyclic context is less visible because only adjacent modes appear.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image" style="background:#030303;padding:18px 10px 16px;min-height:270px;">
+      <div style="height:138px;border:1px solid #151515;background:#000;"></div>
+      <div style="position:relative;height:42px;margin-top:20px;display:flex;align-items:center;justify-content:center;font:600 12px Arial;overflow:hidden;">
+        <span style="position:absolute;left:14px;color:#39393c;">RAW</span>
+        <span style="position:absolute;left:75px;color:#656568;">VIDEO</span>
+        <span style="background:#fff;color:#080808;border-radius:18px;padding:10px 20px;font-weight:700;font-size:13px;">PRO</span>
+        <span style="position:absolute;right:76px;color:#656568;">NDR</span>
+        <span style="position:absolute;right:18px;color:#39393c;">LOG</span>
+      </div>
+      <div style="height:1px;width:42px;background:#747474;margin:10px auto 0;"></div>
+      <div style="width:58px;height:58px;border:4px solid #eceef0;border-radius:50%;margin:12px auto 0;box-shadow:inset 0 0 0 4px #1d1d1f;"></div>
+    </div>
+    <div class="card-body">
+      <h3>C. Faded-edge cinema rail</h3>
+      <p>Shows five cyclic modes with quieter far neighbors. More refined visually, but has reduced peripheral readability.</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Resolution menu rule</h3>
+  <p>The recording resolution selector will contain only <strong>1K</strong>, <strong>2K</strong>, <strong>4K</strong>, and <strong>8K</strong>; unsupported tiers are omitted rather than replaced by device-specific extra dimensions.</p>
+</div>

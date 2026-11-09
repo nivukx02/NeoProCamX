@@ -1,0 +1,687 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer CurrentP010 {
+    uint currentData[];
+};
+
+layout(std430, set = 0, binding = 2) buffer OutputRgb10 {
+    // Two words per pixel: word0 = R | (G << 16), word1 = B.
+    uint outputData[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer DevelopParams {
+    float p[];
+};
+
+layout(push_constant) uniform DevelopPushConstants {
+    uint width;
+    uint height;
+    uint unused;
+} pushData;
+
+const float PI = 3.14159265358979323846;
+const float EPS = 1.0e-6;
+const float MAX10 = 1023.0;
+const float REC709_LINEAR_BREAK = 0.018;
+const float REC709_SIGNAL_BREAK = 0.081;
+const float HLG_A = 0.17883277;
+const float HLG_B = 0.28466892;
+const float HLG_C = 0.55991073;
+const float HLG_DIFFUSE_SCENE = 0.26496256;
+const float PQ_M1 = 0.1593017578125;
+const float PQ_M2 = 78.84375;
+const float PQ_C1 = 0.8359375;
+const float PQ_C2 = 18.8515625;
+const float PQ_C3 = 18.6875;
+
+const uint DECODE_SPACE_REC709 = 0u;
+const uint TRANSFER_SDR = 0u;
+const uint TRANSFER_HLG = 1u;
+const uint TRANSFER_PQ = 2u;
+const uint OUTPUT_SDR = 0u;
+
+// Film-print show-LUT plumbing (p[] tail). p[PARAM_FILM_LUT_SIZE] carries the baked LUT edge size (33)
+// when the CPU golden film-print LUT is appended after the scalar params starting at FILM_LUT_OFFSET;
+// a value < 2 selects the analytic gradeFilmPrint() fallback. Sampling the SAME baked 33^3 LUT the CPU
+// path uses (SnceNrliAnalyticLut.buildFilmPrintLut) with the SAME tetrahedral interpolation is the only
+// way to reproduce the CPU's per-node [0,1] clamp + piecewise-linear near-black blue floor (the analytic
+// path clamps per pixel, so it drives shadow blue to 0 where the interpolated LUT holds a small positive
+// floor — the ~35-code channel-2 shadow divergence the record-develop parity gate flags).
+const int PARAM_FILM_LUT_SIZE = 42;
+const int PARAM_NDR_SIGNAL_GAMMA = 43;
+const int PARAM_NDR_TOE_WIDTH = 44;
+const int PARAM_NDR_TOE_AMOUNT = 45;
+const int PARAM_NDR_PEAK_NITS = 46;
+const int PARAM_NDR_HIGHLIGHT_DESAT = 47;
+const int PARAM_NDR_SHADOW_MIDTONE_LIFT = 48;
+const int PARAM_NDR_MIDTONE_CONTRAST = 49;
+const int PARAM_NDR_CHROMA_BOOST = 50;
+const int PARAM_NDR_SKY_CHROMA_BONUS = 51;
+const int PARAM_NDR_WARM_SKIN_RED_TAME = 52;
+const int PARAM_SDR_WARM_SKIN_RED_TAME = 53;
+const int FILM_LUT_OFFSET = 64;
+
+float clamp01(float v) {
+    return clamp(v, 0.0, 1.0);
+}
+
+uint readPackedP010(uint sampleIndex) {
+    uint word = currentData[sampleIndex >> 1u];
+    uint raw = ((sampleIndex & 1u) == 0u) ? (word & 0xFFFFu) : ((word >> 16u) & 0xFFFFu);
+    return clamp(raw >> 6u, 0u, 1023u);
+}
+
+uint lumaIndex(uint x, uint y) {
+    return y * pushData.width + x;
+}
+
+uint chromaIndex(uint x, uint y, uint component) {
+    uint cw = (pushData.width + 1u) >> 1u;
+    uint cx = min(x >> 1u, cw - 1u);
+    uint cy = min(y >> 1u, ((pushData.height + 1u) >> 1u) - 1u);
+    return pushData.width * pushData.height + (cy * cw + cx) * 2u + min(component, 1u);
+}
+
+float rec709ToLinear(float signal) {
+    return signal < REC709_SIGNAL_BREAK
+        ? signal / 4.5
+        : pow((signal + 0.099) / 1.099, 1.0 / 0.45);
+}
+
+float linearToRec709(float linearValue) {
+    float l = clamp01(linearValue);
+    return l < REC709_LINEAR_BREAK
+        ? 4.5 * l
+        : 1.099 * pow(l, 0.45) - 0.099;
+}
+
+float hlgSignalToScene(float signal) {
+    float e = clamp01(signal);
+    return e <= 0.5 ? (e * e) / 3.0 : (exp((e - HLG_C) / HLG_A) + HLG_B) / 12.0;
+}
+
+float pqToLinear(float signal) {
+    float e = clamp01(signal);
+    float ePow = pow(e, 1.0 / PQ_M2);
+    float num = max(ePow - PQ_C1, 0.0);
+    float den = PQ_C2 - PQ_C3 * ePow;
+    if (den <= 0.0) return 1.0;
+    return pow(num / den, 1.0 / PQ_M1);
+}
+
+float pqOetf(float linear01) {
+    float y = clamp01(linear01);
+    float yPow = pow(y, PQ_M1);
+    return pow((PQ_C1 + PQ_C2 * yPow) / (1.0 + PQ_C3 * yPow), PQ_M2);
+}
+
+float eotf(float signal, uint transfer) {
+    if (transfer == TRANSFER_HLG) return hlgSignalToScene(signal);
+    if (transfer == TRANSFER_PQ) return pqToLinear(signal);
+    return rec709ToLinear(signal);
+}
+
+vec3 decodeP010(uint x, uint y, uint decodeSpace, uint decodeTransfer) {
+    float yCode = float(readPackedP010(lumaIndex(x, y)));
+    float cbCode = float(readPackedP010(chromaIndex(x, y, 0u)));
+    float crCode = float(readPackedP010(chromaIndex(x, y, 1u)));
+    float yn = (yCode - 64.0) / 876.0;
+    float cb = (cbCode - 512.0) / 896.0;
+    float cr = (crCode - 512.0) / 896.0;
+
+    vec3 rgbp;
+    if (decodeSpace == DECODE_SPACE_REC709) {
+        rgbp = vec3(
+            yn + 1.5748 * cr,
+            yn - 0.1873 * cb - 0.4681 * cr,
+            yn + 1.8556 * cb
+        );
+    } else {
+        rgbp = vec3(
+            yn + 1.4746 * cr,
+            yn - 0.16455 * cb - 0.57135 * cr,
+            yn + 1.8814 * cb
+        );
+    }
+    rgbp = clamp(rgbp, vec3(0.0), vec3(1.0));
+    return vec3(
+        eotf(rgbp.r, decodeTransfer),
+        eotf(rgbp.g, decodeTransfer),
+        eotf(rgbp.b, decodeTransfer)
+    );
+}
+
+float wrapDegrees(float deg) {
+    float h = mod(deg, 360.0);
+    return h < 0.0 ? h + 360.0 : h;
+}
+
+vec3 mulRowMajor(uint base, vec3 v) {
+    return vec3(
+        p[base + 0u] * v.x + p[base + 1u] * v.y + p[base + 2u] * v.z,
+        p[base + 3u] * v.x + p[base + 4u] * v.y + p[base + 5u] * v.z,
+        p[base + 6u] * v.x + p[base + 7u] * v.y + p[base + 8u] * v.z
+    );
+}
+
+vec3 mulM16(vec3 v) {
+    return vec3(
+         0.401288 * v.x + 0.650173 * v.y - 0.051461 * v.z,
+        -0.250268 * v.x + 1.204414 * v.y + 0.045854 * v.z,
+        -0.002079 * v.x + 0.048952 * v.y + 0.953127 * v.z
+    );
+}
+
+vec3 mulM16Inv(vec3 v) {
+    return vec3(
+         1.86206786 * v.x - 1.01125463 * v.y + 0.14918677 * v.z,
+         0.38752654 * v.x + 0.62144744 * v.y - 0.00897398 * v.z,
+        -0.01584150 * v.x - 0.03412294 * v.y + 1.04996444 * v.z
+    );
+}
+
+float postAdapt(float value, float fl) {
+    float mag = pow(fl * abs(value) / 100.0, 0.42);
+    float signedValue = value >= 0.0 ? 1.0 : -1.0;
+    return signedValue * (400.0 * mag) / (mag + 27.13) + 0.1;
+}
+
+float inversePostAdapt(float value, float fl) {
+    float x = value - 0.1;
+    float mag = abs(x);
+    float denom = 400.0 - mag;
+    if (denom <= 0.0) return x >= 0.0 ? 10000.0 : -10000.0;
+    float base = pow(max(27.13 * mag / denom, 0.0), 1.0 / 0.42);
+    return (x >= 0.0 ? 1.0 : -1.0) * (100.0 / fl) * base;
+}
+
+float computeFL(float adaptingLuminance) {
+    float la = max(adaptingLuminance, 0.0);
+    float k = 1.0 / (5.0 * la + 1.0);
+    float k4 = k * k * k * k;
+    return 0.2 * k4 * (5.0 * la) + 0.1 * (1.0 - k4) * (1.0 - k4) * pow(5.0 * la, 1.0 / 3.0);
+}
+
+float stevensLightness(float j, float sceneLa) {
+    float gammaEff = clamp(0.42 + 0.06 * (log(max(sceneLa / 64.0, EPS)) / log(10.0)), 0.28, 0.56);
+    return 100.0 * pow(max(j / 100.0, 0.0), 0.42 / gammaEff);
+}
+
+float bezoldBruckeHue(float hueDeg, float sceneLa) {
+    float d = log(max(sceneLa / 64.0, EPS)) / log(10.0);
+    float h = wrapDegrees(hueDeg);
+    float shift = 0.0;
+    if (h >= 50.0 && h <= 80.0) shift = 6.0 * d;
+    else if (h >= 215.0 && h <= 265.0) shift = -8.0 * d;
+    return wrapDegrees(h - shift);
+}
+
+float abneyShiftAtZeroSaturation(float hueDeg) {
+    float h = wrapDegrees(hueDeg);
+    if (h <= 60.0) return mix(0.0, 5.0, h / 60.0);
+    if (h <= 180.0) return mix(5.0, 8.0, (h - 60.0) / 120.0);
+    if (h <= 270.0) return mix(8.0, -6.0, (h - 180.0) / 90.0);
+    if (h <= 290.0) return mix(-6.0, -10.0, (h - 270.0) / 20.0);
+    return mix(-10.0, 0.0, (h - 290.0) / 70.0);
+}
+
+float abneyHue(float hueDeg, float saturationNorm) {
+    float s = clamp(saturationNorm, 0.0, 1.0);
+    float shift = abneyShiftAtZeroSaturation(hueDeg) * pow(1.0 - s, 1.5);
+    return wrapDegrees(hueDeg + shift);
+}
+
+vec3 snceProcess(vec3 rgb, float strength) {
+    if (strength <= 0.0) return rgb;
+
+    float sceneLa = p[7];
+    float fl = p[26];
+    float nbb = p[29];
+    float ncb = p[30];
+    float aw = p[31];
+    vec3 dRgb = vec3(p[32], p[33], p[34]);
+    float c = p[35];
+    float nc = p[36];
+    // Hoisted CAM16 viewing-condition constants uploaded from the CPU SnceViewingConditions so the
+    // forward/inverse use the SAME IEEE bits as SnceCam16 rather than re-deriving them per pixel in
+    // fp32 (which drifted from the CPU's double-backed pow()). p[27]=n and p[28]=z are still uploaded
+    // but no longer read here — cz/tExponentBase fold them in bit-for-bit.
+    float flRoot = p[39];        // == vc.flRoot        (fl^0.25)
+    float tExponentBase = p[40]; // == vc.tExponentBase ((1.64 - 0.29^n)^0.73)
+    float cz = p[41];            // == vc.cz            (c * z)
+
+    vec3 xyz = mulRowMajor(8u, rgb);
+    vec3 xyz100 = xyz * 100.0;
+    vec3 cone = mulM16(xyz100);
+    vec3 coneC = dRgb * cone;
+    vec3 coneA = vec3(
+        postAdapt(coneC.r, fl),
+        postAdapt(coneC.g, fl),
+        postAdapt(coneC.b, fl)
+    );
+
+    float a = coneA.r - 12.0 * coneA.g / 11.0 + coneA.b / 11.0;
+    float b = (coneA.r + coneA.g - 2.0 * coneA.b) / 9.0;
+    float hRad = atan(b, a);
+    float hDeg = wrapDegrees(degrees(hRad));
+    float et = 0.25 * (cos(hRad + 2.0) + 3.8);
+    float achromatic = (2.0 * coneA.r + coneA.g + 0.05 * coneA.b - 0.305) * nbb;
+    float jRatio = max(achromatic / max(aw, EPS), 0.0);
+    float j = 100.0 * pow(jRatio, cz);
+    float tDenom = coneA.r + coneA.g + 1.05 * coneA.b + 0.305;
+    float t = tDenom <= 0.0 ? 0.0 : (50000.0 / 13.0 * nc * ncb) * et * sqrt(a * a + b * b) / tDenom;
+    float sqrtJ = sqrt(max(j / 100.0, 0.0));
+    float chroma = pow(max(t, 0.0), 0.9) * sqrtJ * tExponentBase;
+    float q = (4.0 / c) * sqrtJ * (aw + 4.0) * flRoot;
+    float m = chroma * flRoot;
+    float s = q <= 0.0 ? 0.0 : 100.0 * sqrt(max(m / q, 0.0));
+
+    float huntK = pow(computeFL(64.0) / max(computeFL(sceneLa), EPS), 0.25);
+    float j2 = stevensLightness(j, sceneLa);
+    float c2 = chroma * huntK;
+    float h2 = abneyHue(bezoldBruckeHue(hDeg, sceneLa), s / 100.0);
+
+    float h2Rad = radians(wrapDegrees(h2));
+    float sqrtJ2 = sqrt(max(j2 / 100.0, 0.0));
+    float tInner = tExponentBase;
+    float t2 = (sqrtJ2 < EPS || tInner < EPS) ? 0.0 : pow(max(c2 / (sqrtJ2 * tInner), 0.0), 1.0 / 0.9);
+    float et2 = 0.25 * (cos(h2Rad + 2.0) + 3.8);
+    float achromatic2 = aw * pow(max(j2 / 100.0, 0.0), 1.0 / cz);
+    float p2 = achromatic2 / nbb + 0.305;
+
+    float ai = 0.0;
+    float bi = 0.0;
+    if (t2 >= EPS) {
+        float p1 = (50000.0 / 13.0 * nc * ncb) * et2 / t2;
+        float sinH = sin(h2Rad);
+        float cosH = cos(h2Rad);
+        float p3 = 21.0 / 20.0;
+        if (abs(sinH) >= abs(cosH)) {
+            float p4 = p1 / sinH;
+            bi = (p2 * (2.0 + p3) * (460.0 / 1403.0)) /
+                (p4 + (2.0 + p3) * (220.0 / 1403.0) * (cosH / sinH) -
+                    (27.0 / 1403.0) + p3 * (6300.0 / 1403.0));
+            ai = bi * (cosH / sinH);
+        } else {
+            float p5 = p1 / cosH;
+            ai = (p2 * (2.0 + p3) * (460.0 / 1403.0)) /
+                (p5 + (2.0 + p3) * (220.0 / 1403.0) -
+                    ((27.0 / 1403.0) - p3 * (6300.0 / 1403.0)) * (sinH / cosH));
+            bi = ai * (sinH / cosH);
+        }
+    }
+
+    vec3 rgbA = vec3(
+        (460.0 * p2 + 451.0 * ai + 288.0 * bi) / 1403.0,
+        (460.0 * p2 - 891.0 * ai - 261.0 * bi) / 1403.0,
+        (460.0 * p2 - 220.0 * ai - 6300.0 * bi) / 1403.0
+    );
+    vec3 rgbC = vec3(
+        inversePostAdapt(rgbA.r, fl),
+        inversePostAdapt(rgbA.g, fl),
+        inversePostAdapt(rgbA.b, fl)
+    );
+    vec3 coneOut = rgbC / dRgb;
+    vec3 xyzOut = mulM16Inv(coneOut) / 100.0;
+    vec3 processed = mulRowMajor(17u, xyzOut);
+    return mix(rgb, processed, clamp(strength, 0.0, 1.0));
+}
+
+vec3 rec709LinearToRec2020(vec3 rgb) {
+    return vec3(
+        0.6274039 * rgb.r + 0.3292830 * rgb.g + 0.0433131 * rgb.b,
+        0.0690973 * rgb.r + 0.9195404 * rgb.g + 0.0113623 * rgb.b,
+        0.0163914 * rgb.r + 0.0880132 * rgb.g + 0.8955953 * rgb.b
+    );
+}
+
+float neoSmoothstep(float e0, float e1, float x);
+
+// Exact Vulkan port of VideoDevelopColorPipeline.tameWarmSkinRed. It intentionally runs in the
+// SDR working space after the film-print LUT and before output clamp/widening, matching CPU stage order.
+// The gates leave neutrals, shadows and saturated red objects untouched while radially reducing only
+// warm, skin-like midtones toward their own Rec.709 luminance; no resolution or bit-depth is changed.
+vec3 tameWarmSkinRedSdr(vec3 rgb, float strength) {
+    vec3 source = max(rgb, vec3(0.0));
+    float y = max(dot(source, vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
+    float warm = neoSmoothstep(0.02, 0.14, source.r - source.g) *
+        neoSmoothstep(0.02, 0.20, source.r - source.b);
+    float midHigh = neoSmoothstep(0.05, 0.18, y);
+    float skinNotObject = neoSmoothstep(0.10, 0.26, min(source.r, min(source.g, source.b)));
+    float amount = clamp(strength * warm * midHigh * skinNotObject, 0.0, strength);
+    return vec3(y) + (source - vec3(y)) * (1.0 - amount);
+}
+
+float neoLuma(vec3 c) {
+    return dot(c, vec3(0.2627, 0.6780, 0.0593));
+}
+
+float neoSmoothstep(float e0, float e1, float x) {
+    if (e0 == e1) return x >= e1 ? 1.0 : 0.0;
+    float t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+float filmicContrast(float x) {
+    const float contrastPivot = 0.435;
+    const float contrastStrength = 0.16;
+    const float contrastSteepness = 3.0;
+    float g0 = 1.0 / (1.0 + exp(-contrastSteepness * (0.0 - contrastPivot)));
+    float g1 = 1.0 / (1.0 + exp(-contrastSteepness * (1.0 - contrastPivot)));
+    float gx = 1.0 / (1.0 + exp(-contrastSteepness * (x - contrastPivot)));
+    float norm = (gx - g0) / max(g1 - g0, EPS);
+    return x + (norm - x) * contrastStrength;
+}
+
+float hueDeg(vec3 c) {
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    float d = mx - mn;
+    if (d < EPS) return 0.0;
+    float h;
+    if (mx == c.r) h = 60.0 * mod((c.g - c.b) / d, 6.0);
+    else if (mx == c.g) h = 60.0 * (((c.b - c.r) / d) + 2.0);
+    else h = 60.0 * (((c.r - c.g) / d) + 4.0);
+    return wrapDegrees(h);
+}
+
+float angularDistanceDeg(float a, float b) {
+    return abs(mod(b - a + 540.0, 360.0) - 180.0);
+}
+
+float lerpHueDeg(float a, float b, float t) {
+    float d = mod(b - a + 540.0, 360.0) - 180.0;
+    return wrapDegrees(a + d * t);
+}
+
+vec3 setHueKeepSV(vec3 c, float hueDegrees) {
+    float v = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    float s = v < EPS ? 0.0 : (v - mn) / v;
+    float chroma = v * s;
+    float hp = wrapDegrees(hueDegrees) / 60.0;
+    float x = chroma * (1.0 - abs(mod(hp, 2.0) - 1.0));
+    vec3 rgb1;
+    if (hp < 1.0) rgb1 = vec3(chroma, x, 0.0);
+    else if (hp < 2.0) rgb1 = vec3(x, chroma, 0.0);
+    else if (hp < 3.0) rgb1 = vec3(0.0, chroma, x);
+    else if (hp < 4.0) rgb1 = vec3(0.0, x, chroma);
+    else if (hp < 5.0) rgb1 = vec3(x, 0.0, chroma);
+    else rgb1 = vec3(chroma, 0.0, x);
+    return rgb1 + vec3(v - chroma);
+}
+
+vec3 gradeFilmPrint(vec3 inputRgb) {
+    const vec3 lumaWeights = vec3(0.2126, 0.7152, 0.0722);
+    const float shadowWarm = 0.016;
+    const float highlightCool = 0.013;
+    const float midSat = 1.10;
+    const float skinHueDeg = 51.0;
+    const float skinHueHalfWidth = 22.0;
+    const float filmMaxDeviation = 0.14;
+
+    vec3 rgb = vec3(
+        filmicContrast(inputRgb.r),
+        filmicContrast(inputRgb.g),
+        filmicContrast(inputRgb.b)
+    );
+
+    float luma1 = dot(lumaWeights, rgb);
+    float shadowW = neoSmoothstep(0.55, 0.0, luma1);
+    float highW = neoSmoothstep(0.55, 1.0, luma1);
+    float tone = shadowWarm * shadowW - highlightCool * highW;
+    rgb.r += tone;
+    rgb.b -= tone;
+
+    float luma2 = dot(lumaWeights, rgb);
+    float s = 1.0 + (midSat - 1.0) * clamp(4.0 * luma2 * (1.0 - luma2), 0.0, 1.0);
+    rgb = vec3(luma2) + (rgb - vec3(luma2)) * s;
+
+    float inChroma = max(inputRgb.r, max(inputRgb.g, inputRgb.b)) - min(inputRgb.r, min(inputRgb.g, inputRgb.b));
+    float inputHue = hueDeg(inputRgb);
+    float hueDist = angularDistanceDeg(inputHue, skinHueDeg);
+    float bandW = clamp(1.0 - hueDist / skinHueHalfWidth, 0.0, 1.0);
+    float skinW = bandW * neoSmoothstep(0.05, 0.22, inChroma);
+    if (skinW > 0.0) {
+        float restoredHue = lerpHueDeg(hueDeg(rgb), inputHue, skinW);
+        rgb = setHueKeepSV(rgb, restoredHue);
+    }
+
+    return clamp(rgb, inputRgb - vec3(filmMaxDeviation), inputRgb + vec3(filmMaxDeviation));
+}
+
+// One baked film-print LUT node (r-fastest, 3 floats/node) from the p[] tail: node = FILM_LUT_OFFSET +
+// ((bi*size + gi)*size + ri)*3 + channel. Matches SnceNrliAnalyticLut.buildFilmPrintLut()'s layout.
+vec3 filmLutNode(int ri, int gi, int bi, int size) {
+    int base = FILM_LUT_OFFSET + ((bi * size + gi) * size + ri) * 3;
+    return vec3(p[base], p[base + 1], p[base + 2]);
+}
+
+// Broadcast/DI-grade tetrahedral 3D-LUT sample — branch-for-branch identical to the CPU golden
+// SnceNeuralEnhancement.tetrahedralSampleLut (and the live nrli_lut_apply.comp). Reproduces the CPU
+// film-print output (including its near-black blue floor) rather than re-deriving the grade analytically.
+vec3 sampleFilmPrintLut(vec3 rgb, int size) {
+    float maxIdx = float(size - 1);
+    vec3 c = clamp(rgb, vec3(0.0), vec3(1.0)) * maxIdx;
+    ivec3 i0 = clamp(ivec3(floor(c)), ivec3(0), ivec3(size - 1));
+    ivec3 i1 = min(i0 + 1, ivec3(size - 1));
+    vec3 f = c - vec3(i0);
+    vec3 c000 = filmLutNode(i0.x, i0.y, i0.z, size);
+    vec3 c111 = filmLutNode(i1.x, i1.y, i1.z, size);
+    vec3 c100 = filmLutNode(i1.x, i0.y, i0.z, size);
+    vec3 c010 = filmLutNode(i0.x, i1.y, i0.z, size);
+    vec3 c001 = filmLutNode(i0.x, i0.y, i1.z, size);
+    vec3 c110 = filmLutNode(i1.x, i1.y, i0.z, size);
+    vec3 c101 = filmLutNode(i1.x, i0.y, i1.z, size);
+    vec3 c011 = filmLutNode(i0.x, i1.y, i1.z, size);
+    if (f.r >= f.g) {
+        if (f.g >= f.b)      return c000 + f.r * (c100 - c000) + f.g * (c110 - c100) + f.b * (c111 - c110);
+        else if (f.r >= f.b) return c000 + f.r * (c100 - c000) + f.b * (c101 - c100) + f.g * (c111 - c101);
+        else                 return c000 + f.b * (c001 - c000) + f.r * (c101 - c001) + f.g * (c111 - c101);
+    } else {
+        if (f.b >= f.g)      return c000 + f.b * (c001 - c000) + f.g * (c011 - c001) + f.r * (c111 - c011);
+        else if (f.b >= f.r) return c000 + f.g * (c010 - c000) + f.b * (c011 - c010) + f.r * (c111 - c011);
+        else                 return c000 + f.g * (c010 - c000) + f.r * (c110 - c010) + f.b * (c111 - c110);
+    }
+}
+
+vec3 applyFilmPrint(vec3 rgb, float strength) {
+    float t = clamp(strength, 0.0, 1.0);
+    if (t <= 0.0) return rgb;
+    vec3 clamped = clamp(rgb, vec3(0.0), vec3(1.0));
+    int lutSize = int(p[PARAM_FILM_LUT_SIZE] + 0.5);
+    // Prefer the baked CPU LUT (true parity); fall back to the analytic grade when no LUT is uploaded.
+    vec3 graded = lutSize >= 2 ? sampleFilmPrintLut(clamped, lutSize) : gradeFilmPrint(clamped);
+    // Mirror VideoDevelopColorPipeline.blend EXACTLY: t>=1 -> graded, else rgb + (graded-rgb)*t.
+    if (t >= 1.0) return graded;
+    return rgb + (graded - rgb) * t;
+}
+
+float neoSignalShape(float x) {
+    float g = p[PARAM_NDR_SIGNAL_GAMMA];
+    float toeW = p[PARAM_NDR_TOE_WIDTH];
+    float toeA = p[PARAM_NDR_TOE_AMOUNT];
+    if (x <= 0.0) return 0.0;
+    if (x <= 1.0) return pow(x, g) + neoSmoothstep(0.0, toeW, x) * toeA * (1.0 - x);
+    return 1.0 + (g - toeA) * (x - 1.0);
+}
+
+float neoBlackPreservingMidtoneLift(float signal) {
+    float x = max(signal, 0.0);
+    if (x <= 0.0 || x >= 1.0) return x;
+    float window = neoSmoothstep(0.025, 0.20, x) * (1.0 - neoSmoothstep(0.78, 1.20, x));
+    return x + p[PARAM_NDR_SHADOW_MIDTONE_LIFT] * sqrt(x) * (1.0 - x) * window;
+}
+
+float neoProfileMidtoneContrast(float signal) {
+    float x = max(signal, 0.0);
+    if (x <= 0.0 || x >= 1.0) return x;
+    float window = neoSmoothstep(0.055, 0.24, x) * (1.0 - neoSmoothstep(0.76, 1.0, x));
+    float signedContrast = (x - 0.50) * 4.0 * x * (1.0 - x);
+    return max(x + p[PARAM_NDR_MIDTONE_CONTRAST] * signedContrast * window, 0.0);
+}
+
+float neoSignalToNits(float signal) {
+    float diffuse = p[5];
+    float peak = p[PARAM_NDR_PEAK_NITS];
+    float s = max(signal, 0.0);
+    float raw = s * diffuse;
+    if (raw <= diffuse) return raw;
+    float range = peak - diffuse;
+    return min(diffuse + range * (1.0 - exp(-(raw - diffuse) / range)), peak);
+}
+
+float pqFromNits(float nits) {
+    return pqOetf(nits / 10000.0);
+}
+
+vec3 neoMapRgbHuePreserving(vec3 lin) {
+    vec3 source = max(lin, vec3(0.0));
+    float y = max(neoLuma(source), 1.0e-8);
+    float mappedY = neoProfileMidtoneContrast(neoBlackPreservingMidtoneLift(neoSignalShape(y)));
+    vec3 mapped = source * (mappedY / y);
+
+    // Canonical bounded NDR colour-volume character. Chroma scales radially around BT.2020 luma,
+    // preserving hue direction and luminance while reducing authority over skin and adding only the
+    // profile's explicit coherent-sky bonus.
+    float safeGreen = max(source.g, 1.0e-8);
+    float redGreenRatio = source.r / safeGreen;
+    float blueGreenRatio = source.b / safeGreen;
+    float relativeChroma = (max(mapped.r, max(mapped.g, mapped.b)) - min(mapped.r, min(mapped.g, mapped.b))) /
+        max(mappedY, 0.04);
+    float colorConfidence = neoSmoothstep(0.035, 0.22, relativeChroma);
+    float skin = neoSmoothstep(1.02, 1.16, redGreenRatio) *
+        (1.0 - neoSmoothstep(1.58, 2.10, redGreenRatio)) *
+        (1.0 - neoSmoothstep(0.98, 1.18, blueGreenRatio));
+    float sky = neoSmoothstep(1.03, 1.22, blueGreenRatio) *
+        (1.0 - neoSmoothstep(1.00, 1.22, redGreenRatio));
+    float tonalWindow = neoSmoothstep(0.035, 0.16, mappedY) *
+        (1.0 - neoSmoothstep(0.88, 1.65, mappedY));
+    float skinProtection = 1.0 + (0.45 - 1.0) * skin;
+    float chromaGain = 1.0 +
+        (p[PARAM_NDR_CHROMA_BOOST] + p[PARAM_NDR_SKY_CHROMA_BONUS] * sky) *
+        colorConfidence * tonalWindow * skinProtection;
+    mapped = vec3(mappedY) + (mapped - vec3(mappedY)) * chromaGain;
+
+    float highlightDesat = p[PARAM_NDR_HIGHLIGHT_DESAT];
+    float desat = clamp(
+        highlightDesat * neoSmoothstep(0.55, 1.0, mappedY),
+        0.0,
+        highlightDesat
+    );
+    mapped = vec3(mappedY) + (mapped - vec3(mappedY)) * (1.0 - desat);
+
+    // Canonical warm/skin red-overflow reconstruction. Classification uses the pre-tone source ratios;
+    // corrected RGB is re-scaled to its pre-correction BT.2020 luminance, so exposure is unchanged.
+    float warmSkinRedTame = p[PARAM_NDR_WARM_SKIN_RED_TAME];
+    if (warmSkinRedTame > 0.0) {
+        float originalY = max(neoLuma(mapped), 1.0e-8);
+        float moderateRed = neoSmoothstep(1.18, 1.55, redGreenRatio) *
+            (1.0 - neoSmoothstep(2.80, 4.00, redGreenRatio));
+        float bluePresent = neoSmoothstep(0.28, 0.55, blueGreenRatio) *
+            (1.0 - neoSmoothstep(1.08, 1.35, blueGreenRatio));
+        float exposureWindow = neoSmoothstep(0.04, 0.16, mappedY) *
+            (1.0 - neoSmoothstep(6.5, 8.0, mappedY));
+        float redOverflow = neoSmoothstep(1.30, 2.10, redGreenRatio);
+        float weight = clamp(
+            warmSkinRedTame * moderateRed * bluePresent * exposureWindow *
+                (0.45 + 0.55 * redOverflow),
+            0.0,
+            warmSkinRedTame
+        );
+        if (weight > 0.0) {
+            mapped.r += (min(mapped.r, mapped.g * 1.42) - mapped.r) * weight;
+            mapped.b += (max(mapped.b, mapped.g * 0.64) - mapped.b) * (weight * 0.68);
+            float correctedY = max(neoLuma(mapped), 1.0e-8);
+            mapped *= originalY / correctedY;
+        }
+    }
+    return max(mapped, vec3(0.0));
+}
+
+vec3 neoCompressToPeakColorVolume(vec3 rgbNits, float luminanceNits) {
+    float peak = clamp(p[PARAM_NDR_PEAK_NITS], 203.0, 10000.0);
+    float y = clamp(luminanceNits, 0.0, peak);
+    vec3 rgb = max(rgbNits, vec3(0.0));
+    float hi = max(rgb.r, max(rgb.g, rgb.b));
+    if (hi <= peak || hi <= y + 1.0e-8) return rgb;
+    float chromaScale = clamp((peak - y) / (hi - y), 0.0, 1.0);
+    return clamp(vec3(y) + (rgb - vec3(y)) * chromaScale, vec3(0.0), vec3(peak));
+}
+
+vec3 neoDeliverPq(vec3 lin) {
+    vec3 toneSignal = neoMapRgbHuePreserving(lin);
+    float sl = neoLuma(toneSignal);
+    if (sl <= 1.0e-8) return vec3(0.0);
+    float nits = neoSignalToNits(sl);
+    vec3 rgbNits = neoCompressToPeakColorVolume(toneSignal * (nits / sl), nits);
+    return vec3(pqFromNits(rgbNits.r), pqFromNits(rgbNits.g), pqFromNits(rgbNits.b));
+}
+
+uint toCode(float signal01) {
+    return uint(clamp(floor(clamp01(signal01) * MAX10 + 0.5), 0.0, MAX10));
+}
+
+// Genuine-HDR NDR quantiser: TRUNCATE toward zero (floor of a non-negative value), matching the CPU
+// reference HdrImagingMath.quantize = (signal.coerceIn(0,1) * maxCode).toInt(). The SDR/PQ paths use
+// round-half-up toCode() to match RecordDevelopP010ColorIngress.toCode()'s roundToInt(). Using round on
+// the NDR path added a systematic ~+0.5-code bias that the parity gate was silently absorbing.
+uint toCodeTruncate(float signal01) {
+    return uint(clamp(floor(clamp01(signal01) * MAX10), 0.0, MAX10));
+}
+
+uvec3 encodeCodes(vec3 rgb, uint outputTransfer, bool ndrGenuine, uint decodeTransfer) {
+    if (ndrGenuine) {
+        float diffuseScene = decodeTransfer == TRANSFER_HLG
+            ? HLG_DIFFUSE_SCENE
+            : (decodeTransfer == TRANSFER_PQ ? 203.0 / 10000.0 : 1.0);
+        vec3 pq = neoDeliverPq(rgb / max(diffuseScene, EPS));
+        return uvec3(toCodeTruncate(pq.r), toCodeTruncate(pq.g), toCodeTruncate(pq.b));
+    }
+    if (outputTransfer == OUTPUT_SDR) {
+        return uvec3(
+            toCode(linearToRec709(rgb.r)),
+            toCode(linearToRec709(rgb.g)),
+            toCode(linearToRec709(rgb.b))
+        );
+    }
+    float scale = p[5] / 10000.0;
+    return uvec3(
+        toCode(pqOetf(rgb.r * scale)),
+        toCode(pqOetf(rgb.g * scale)),
+        toCode(pqOetf(rgb.b * scale))
+    );
+}
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pushData.width || y >= pushData.height) return;
+
+    uint decodeSpace = uint(p[0] + 0.5);
+    uint decodeTransfer = uint(p[1] + 0.5);
+    uint outputTransfer = uint(p[2] + 0.5);
+    float snceStrength = p[3];
+    bool ndrGenuine = p[4] > 0.5;
+    bool widenToRec2020 = p[6] > 0.5;
+    bool clampOutput = p[37] > 0.5;
+
+    vec3 rgb = decodeP010(x, y, decodeSpace, decodeTransfer);
+    rgb = snceProcess(rgb, snceStrength);
+    if (!ndrGenuine) {
+        rgb = applyFilmPrint(rgb, p[38]);
+        float sdrWarmSkinRedTame = p[PARAM_SDR_WARM_SKIN_RED_TAME];
+        if (sdrWarmSkinRedTame > 0.0) {
+            rgb = tameWarmSkinRedSdr(rgb, sdrWarmSkinRedTame);
+        }
+    }
+    if (clampOutput) rgb = clamp(rgb, vec3(0.0), vec3(1.0));
+    if (widenToRec2020) rgb = rec709LinearToRec2020(rgb);
+
+    uvec3 codes = encodeCodes(rgb, outputTransfer, ndrGenuine, decodeTransfer);
+    uint pixel = y * pushData.width + x;
+    outputData[pixel * 2u] = (codes.r & 0xFFFFu) | ((codes.g & 0xFFFFu) << 16u);
+    outputData[pixel * 2u + 1u] = codes.b & 0xFFFFu;
+}

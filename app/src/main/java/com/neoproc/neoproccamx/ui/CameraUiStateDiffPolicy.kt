@@ -1,0 +1,56 @@
+package com.neoproc.neoproccamx.ui
+
+import android.view.View
+import kotlin.math.abs
+
+internal object CameraUiStateDiffPolicy {
+    fun textChanged(current: CharSequence?, next: String): Boolean =
+        current?.toString() != next
+
+    fun floatChanged(current: Float, next: Float, epsilon: Float = 0.001f): Boolean =
+        abs(current - next) > epsilon
+
+    fun intChanged(current: Int, next: Int): Boolean = current != next
+
+    fun booleanChanged(current: Boolean, next: Boolean): Boolean = current != next
+
+    /**
+     * First-render reconciliation for a boolean-driven view property.
+     *
+     * The activity seeds `lastState` from defaults while views begin from their XML layout state.
+     * Applying once on first render reconciles those sources before ordinary change-diff behavior.
+     */
+    fun shouldApplyBoolean(firstRender: Boolean, current: Boolean, next: Boolean): Boolean =
+        firstRender || booleanChanged(current, next)
+
+    fun visibilityChanged(currentVisibility: Int, desiredVisible: Boolean): Boolean {
+        val desiredVisibility = if (desiredVisible) View.VISIBLE else View.GONE
+        return currentVisibility != desiredVisibility
+    }
+
+    fun floatArrayChanged(current: FloatArray?, next: FloatArray?): Boolean {
+        if (current === next) return false
+        if (current == null || next == null) return true
+        if (current.size != next.size) return true
+        for (i in current.indices) {
+            if (abs(current[i] - next[i]) > 0.0001f) return true
+        }
+        return false
+    }
+
+    fun intArrayChanged(current: IntArray?, next: IntArray?): Boolean {
+        if (current === next) return false
+        if (current == null || next == null) return true
+        if (current.size != next.size) return true
+        for (i in current.indices) {
+            if (current[i] != next[i]) return true
+        }
+        return false
+    }
+
+    fun <T> listChanged(current: List<T>?, next: List<T>?): Boolean =
+        current != next
+
+    fun <T> objectChanged(current: T?, next: T?): Boolean =
+        current != next
+}

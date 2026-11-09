@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Variant 04: permanent launcher artwork selected from the approved ten-logo set. -->
+    <item
+        android:drawable="@drawable/launcher_logo_v04"
+        android:gravity="fill" />
+</layer-list>

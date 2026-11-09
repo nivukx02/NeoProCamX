@@ -1,0 +1,130 @@
+#version 450
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  record_parity_enhance_p010.comp — GPU port of the LIVE-CINEMA parity luma pass
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// This is a byte-CLOSE Vulkan-compute reproduction of
+//   com.neoproc.neoproccamx.recording.Npv10ExportEnhancementPolicy.enhanceLiveCinemaLumaP010
+// (Npv10MovConverter.kt) — the CPU port of the live offscreen-EGL record shader's edge-aware
+// 5-tap bilateral denoise + ONE halo-guarded unsharp, used by the SDR/NDR record-develop
+// converter for WYSIWYG parity with the cinema camera.
+//
+// It operates on the P010 LUMA (Y) plane ONLY. Chroma (CbCr) is left byte-untouched: the
+// native dispatch pre-seeds the output buffer with the input, and this pass overwrites only
+// luma words (a luma sample index is always < width*height, and P010 4:2:0 has even dimensions,
+// so luma words never alias chroma words). It does NOT run temporal blend / chroma-NR / grade /
+// LUT / dither — those stay in the CPU colour-lane enhanceP010 that runs after this pass.
+//
+// The math runs in the encoded (non-linear) signal domain, normalized [0,1] = code/1023, exactly
+// like the CPU reference. GPU is float32 while the CPU reference is float64, so 10-bit output can
+// differ by ~1 code on edges — the converter's first-frame CPU-vs-GPU parity gate accepts the GPU
+// path only within a tight code tolerance, else it falls back to the byte-exact CPU pass.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer CurrentP010 {
+    uint currentData[];
+};
+
+// Bound to satisfy the shared 4-SSBO engine layout; this luma parity pass has NO temporal lane
+// and never reads it.
+layout(std430, set = 0, binding = 1) readonly buffer PreviousP010 {
+    uint previousData[];
+};
+
+layout(std430, set = 0, binding = 2) buffer OutputP010 {
+    uint outputData[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer ParityUniforms {
+    float uSharpness;
+    float uDenoise;
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint hasPreviousFrame; // unused (no temporal lane)
+} pushData;
+
+// P010: two 16-bit samples per 32-bit word (little-endian lane order); the 10-bit code sits in the
+// high bits (value >> 6), matching readP010Sample / writeP010Sample.
+uint readLumaCode(uint sampleIndex) {
+    uint word = currentData[sampleIndex >> 1u];
+    uint lane = (sampleIndex & 1u) * 16u;
+    return ((word >> lane) & 0xFFFFu) >> 6u;
+}
+
+void writeLumaCode(uint sampleIndex, uint code) {
+    uint wordIndex = sampleIndex >> 1u;
+    uint lane = (sampleIndex & 1u) * 16u;
+    uint laneMask = 0xFFFFu << lane;
+    uint packed = ((clamp(code, 0u, 1023u) << 6u) & 0xFFFFu) << lane;
+    uint oldWord = outputData[wordIndex];
+    // Two adjacent luma samples share one word and are written by different invocations — CAS so
+    // neither clobbers the other lane (mirrors the export shader's writePackedP010Sample).
+    while (true) {
+        uint newWord = (oldWord & ~laneMask) | packed;
+        uint observed = atomicCompSwap(outputData[wordIndex], oldWord, newWord);
+        if (observed == oldWord) return;
+        oldWord = observed;
+    }
+}
+
+void main() {
+    uint width = pushData.width;
+    uint height = pushData.height;
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= width || y >= height) return;
+
+    uint sampleIndex = y * width + x;
+
+    float dn = clamp(uDenoise, 0.0, 1.0);
+    float amt = clamp(uSharpness, 0.0, 1.0) * 0.85; // matches CPU: uSharpness*0.85
+    // Identity early-out (output already pre-seeded with the input by the native dispatch, so a
+    // skipped write leaves the sample unchanged) — mirrors the CPU guards.
+    if (width < 3u || height < 3u || (dn <= 0.0 && amt <= 0.0)) return;
+
+    // CLAMP_TO_EDGE neighbour addressing (matches CPU coerceIn 0..dim-1).
+    uint xm = x > 0u ? x - 1u : 0u;
+    uint xp = (x + 1u < width) ? x + 1u : width - 1u;
+    uint ym = y > 0u ? y - 1u : 0u;
+    uint yp = (y + 1u < height) ? y + 1u : height - 1u;
+
+    float c = float(readLumaCode(sampleIndex)) / 1023.0;
+    float n = float(readLumaCode(ym * width + x)) / 1023.0;
+    float s = float(readLumaCode(yp * width + x)) / 1023.0;
+    float w = float(readLumaCode(y * width + xm)) / 1023.0;
+    float e = float(readLumaCode(y * width + xp)) / 1023.0;
+
+    float sw = 1.11;
+    float sigmaR = clamp(0.010 + 0.045 * dn, 0.010, 0.05);
+    float invR2 = 1.0 / (2.0 * sigmaR * sigmaR);
+    float cap = 0.05 + 0.05 * amt;
+    float gaussWeight = 1.0 + 4.0 * sw; // 5.44
+
+    // Edge-aware 5-tap bilateral (center + 4 axial), rational range weight (1/(1+x))^2.
+    // Accumulate taps in the SAME order as the CPU reference (n, s, w, e) to minimise float drift.
+    float accBil = c;
+    float wBil = 1.0;
+    float dl;
+    float rwBase;
+    float wb;
+    dl = n - c; rwBase = 1.0 / (1.0 + dl * dl * invR2); wb = sw * rwBase * rwBase; accBil += n * wb; wBil += wb;
+    dl = s - c; rwBase = 1.0 / (1.0 + dl * dl * invR2); wb = sw * rwBase * rwBase; accBil += s * wb; wBil += wb;
+    dl = w - c; rwBase = 1.0 / (1.0 + dl * dl * invR2); wb = sw * rwBase * rwBase; accBil += w * wb; wBil += wb;
+    dl = e - c; rwBase = 1.0 / (1.0 + dl * dl * invR2); wb = sw * rwBase * rwBase; accBil += e * wb; wBil += wb;
+
+    float denoised = c * (1.0 - dn) + (accBil / wBil) * dn;
+    // Fixed spatial-only gaussian reference from the ORIGINAL neighbours.
+    float gauss = (c + (n + s + w + e) * sw) / gaussWeight;
+    float detail = denoised - gauss;
+    float haloGuard = 1.0 - smoothstep(0.06, 0.20, abs(detail));
+    float boost = clamp(detail * amt * haloGuard, -cap, cap);
+    float sharpened = clamp(denoised + boost, 0.0, 1.0);
+
+    int code = clamp(int(sharpened * 1023.0 + 0.5), 0, 1023);
+    writeLumaCode(sampleIndex, uint(code));
+}

@@ -1,0 +1,16 @@
+{
+  "version": "NORMAL_SDR_CRORE_COLOR_CALIBRATION_V4",
+  "image_count": 100000000,
+  "image_width": 8,
+  "image_height": 8,
+  "pixels_per_image": 64,
+  "total_pixel_samples": 6400000000,
+  "materialization": "DETERMINISTIC_ON_DEMAND",
+  "target_pipeline": "NORMAL_SDR_VIDEO_PREVIEW_RECORDING_NPV10",
+  "correction": {
+    "red_scale": 0.800,
+    "green_scale": 1.000,
+    "blue_scale": 1.200,
+    "neutral_preservation": "CHROMA_GATED_LUMA_RESTORED"
+  }
+}

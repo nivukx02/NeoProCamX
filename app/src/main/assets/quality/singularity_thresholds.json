@@ -1,0 +1,177 @@
+{
+  "formatVersion": "SINGULARITY_THRESHOLDS_1",
+  "gatePolicyVersion": "QG_SINGULARITY_1",
+  "thresholdSetId": "device-mode-specific",
+  "thresholdSetHashPolicy": "sha256-of-calibrated-device-profile-at-release",
+  "thresholdSets": [
+    {
+      "thresholdSetId": "foundation-generic-1080p30",
+      "deviceClass": "GENERIC_ANDROID_CAPABILITY_PROVEN",
+      "outputMode": "ANY",
+      "resolution": "1920x1080",
+      "frameRate": 30,
+      "gates": [
+        {
+          "gateId": "QG01",
+          "title": "Edge Overshoot",
+          "mandatory": true,
+          "unit": "percent",
+          "passCondition": "measuredValue <= calibrated_edge_overshoot_limit",
+          "warnCondition": "measuredValue <= calibrated_edge_overshoot_warn_limit",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [172, 173, 247]
+        },
+        {
+          "gateId": "QG02",
+          "title": "Temporal Shimmer",
+          "mandatory": true,
+          "unit": "percent",
+          "passCondition": "measuredValue <= calibrated_temporal_shimmer_limit",
+          "warnCondition": "measuredValue <= calibrated_temporal_shimmer_warn_limit",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [126, 174, 247]
+        },
+        {
+          "gateId": "QG03",
+          "title": "Chroma Crawl",
+          "mandatory": true,
+          "unit": "normalized",
+          "passCondition": "measuredValue <= calibrated_chroma_crawl_limit",
+          "warnCondition": "measuredValue <= calibrated_chroma_crawl_warn_limit",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [101, 109, 247]
+        },
+        {
+          "gateId": "QG04",
+          "title": "Highlight Rolloff",
+          "mandatory": true,
+          "unit": "delta",
+          "passCondition": "measuredValue <= calibrated_highlight_rolloff_error",
+          "warnCondition": "measuredValue <= calibrated_highlight_rolloff_warn_error",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [87, 212, 247]
+        },
+        {
+          "gateId": "QG05",
+          "title": "Shadow Depth",
+          "mandatory": true,
+          "unit": "delta",
+          "passCondition": "measuredValue <= calibrated_shadow_depth_error",
+          "warnCondition": "measuredValue <= calibrated_shadow_depth_warn_error",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [88, 89, 248]
+        },
+        {
+          "gateId": "QG06",
+          "title": "Skin Integrity",
+          "mandatory": true,
+          "unit": "deltaE",
+          "passCondition": "measuredValue <= calibrated_skin_delta_e_limit",
+          "warnCondition": "measuredValue <= calibrated_skin_delta_e_warn_limit",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [146, 162, 198, 248]
+        },
+        {
+          "gateId": "QG07",
+          "title": "Hair And Fine Texture",
+          "mandatory": true,
+          "unit": "normalized",
+          "passCondition": "measuredValue >= calibrated_fine_texture_retention_min",
+          "warnCondition": "measuredValue >= calibrated_fine_texture_retention_warn_min",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [156, 163, 164, 248]
+        },
+        {
+          "gateId": "QG08",
+          "title": "Text Stability",
+          "mandatory": true,
+          "unit": "normalized",
+          "passCondition": "measuredValue >= calibrated_text_stability_min",
+          "warnCondition": "measuredValue >= calibrated_text_stability_warn_min",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [152, 166, 186, 248]
+        },
+        {
+          "gateId": "QG09",
+          "title": "Neural Resolution Honesty",
+          "mandatory": true,
+          "unit": "normalized",
+          "passCondition": "hallucinationRisk <= calibrated_hallucination_limit",
+          "warnCondition": "hallucinationRisk <= calibrated_hallucination_warn_limit",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [181, 184, 185, 249]
+        },
+        {
+          "gateId": "QG10",
+          "title": "Tone Stability",
+          "mandatory": true,
+          "unit": "percent",
+          "passCondition": "measuredValue <= calibrated_tone_flicker_limit",
+          "warnCondition": "measuredValue <= calibrated_tone_flicker_warn_limit",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [215, 216, 250]
+        },
+        {
+          "gateId": "QG11",
+          "title": "Color Neutrality",
+          "mandatory": true,
+          "unit": "deltaE",
+          "passCondition": "measuredValue <= calibrated_neutral_delta_e_limit",
+          "warnCondition": "measuredValue <= calibrated_neutral_delta_e_warn_limit",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [193, 194, 207, 250]
+        },
+        {
+          "gateId": "QG12",
+          "title": "Encode Survival",
+          "mandatory": true,
+          "unit": "normalized",
+          "passCondition": "encodedVsPreEncodeLoss <= calibrated_encode_loss_limit",
+          "warnCondition": "encodedVsPreEncodeLoss <= calibrated_encode_loss_warn_limit",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [231, 236, 239, 251]
+        },
+        {
+          "gateId": "QG13",
+          "title": "Preview Match",
+          "mandatory": true,
+          "unit": "delta",
+          "passCondition": "previewFileDelta <= calibrated_preview_match_limit",
+          "warnCondition": "previewFileDelta <= calibrated_preview_match_warn_limit",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [216, 230, 251]
+        },
+        {
+          "gateId": "QG14",
+          "title": "Thermal Endurance",
+          "mandatory": true,
+          "unit": "minutes",
+          "passCondition": "validatedEnduranceMinutes >= calibrated_mode_endurance_min",
+          "warnCondition": "validatedEnduranceMinutes >= calibrated_mode_endurance_warn_min",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [14, 246, 252]
+        },
+        {
+          "gateId": "QG15",
+          "title": "Dropped Frame Control",
+          "mandatory": true,
+          "unit": "count",
+          "passCondition": "droppedFrames <= calibrated_dropped_frame_limit",
+          "warnCondition": "droppedFrames <= calibrated_dropped_frame_warn_limit",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [235, 236, 252]
+        },
+        {
+          "gateId": "QG16",
+          "title": "Metadata Honesty",
+          "mandatory": true,
+          "unit": "boolean",
+          "passCondition": "all_runtime_claims_have_evidence == true",
+          "warnCondition": "not_applicable",
+          "minimumReleaseClass": "SINGULARITY-100",
+          "responsibleStages": [240, 241, 253, 254, 255]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/manualRootScroll"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@android:color/transparent"
+    android:fillViewport="false"
+    android:overScrollMode="never"
+    android:scrollbars="none"
+    tools:viewBindingIgnore="true">
+
+    <LinearLayout
+        android:id="@+id/manualRoot"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@android:color/transparent"
+        android:orientation="vertical"
+        android:paddingStart="8dp"
+        android:paddingTop="4dp"
+        android:paddingEnd="8dp"
+        android:paddingBottom="4dp">
+
+        <!-- Hidden until the user taps exactly one parameter in the row below. -->
+        <FrameLayout
+            android:id="@+id/controlStack"
+            android:layout_width="match_parent"
+            android:layout_height="108dp"
+            android:visibility="gone">
+
+            <FrameLayout
+                android:id="@+id/sectionISO"
+                style="@style/ManualReferenceSection"
+                android:visibility="gone">
+
+                <LinearLayout style="@style/ManualAutoColumn">
+                    <Button
+                        android:id="@+id/btnIsoAuto"
+                        style="@style/ManualAutoButton"
+                        android:text="@string/control_auto_short"
+                        tools:ignore="ButtonStyle" />
+                    <TextView
+                        android:id="@+id/tvIsoMode"
+                        style="@style/ManualAutoLabel"
+                        android:text="@string/control_auto" />
+                </LinearLayout>
+
+                <LinearLayout style="@style/ManualReferenceScaleColumn">
+                    <TextView
+                        android:id="@+id/tvISO"
+                        style="@style/ManualReferenceValue"
+                        android:text="@string/control_iso_auto" />
+                    <com.neoproc.neoproccamx.ui.controls.ReferenceAdjustSeekBar
+                        android:id="@+id/sbISO"
+                        style="@style/ManualReferenceSeekBar"
+                        android:max="23"
+                        android:progress="8" />
+                </LinearLayout>
+            </FrameLayout>
+
+            <FrameLayout
+                android:id="@+id/sectionSS"
+                style="@style/ManualReferenceSection"
+                android:visibility="gone">
+
+                <LinearLayout style="@style/ManualAutoColumn">
+                    <Button
+                        android:id="@+id/btnSsAuto"
+                        style="@style/ManualAutoButton"
+                        android:text="@string/control_auto_short"
+                        tools:ignore="ButtonStyle" />
+                    <TextView
+                        android:id="@+id/tvSsMode"
+                        style="@style/ManualAutoLabel"
+                        android:text="@string/control_auto" />
+                </LinearLayout>
+
+                <LinearLayout style="@style/ManualReferenceScaleColumn">
+                    <TextView
+                        android:id="@+id/tvSS"
+                        style="@style/ManualReferenceValue"
+                        android:text="@string/control_shutter_default" />
+                    <com.neoproc.neoproccamx.ui.controls.ReferenceAdjustSeekBar
+                        android:id="@+id/sbSS"
+                        style="@style/ManualReferenceSeekBar" />
+                </LinearLayout>
+            </FrameLayout>
+
+            <FrameLayout
+                android:id="@+id/sectionWB"
+                style="@style/ManualReferenceSection"
+                android:visibility="gone">
+
+                <LinearLayout style="@style/ManualAutoColumn">
+                    <Button
+                        android:id="@+id/btnWbAuto"
+                        style="@style/ManualAutoButton"
+                        android:text="@string/control_auto_short"
+                        tools:ignore="ButtonStyle" />
+                    <TextView
+                        android:id="@+id/tvWbMode"
+                        style="@style/ManualAutoLabel"
+                        android:text="@string/control_auto" />
+                </LinearLayout>
+
+                <LinearLayout style="@style/ManualReferenceScaleColumn">
+                    <TextView
+                        android:id="@+id/tvWB"
+                        style="@style/ManualReferenceValue"
+                        android:text="@string/control_wb_default" />
+                    <com.neoproc.neoproccamx.ui.controls.ReferenceAdjustSeekBar
+                        android:id="@+id/sbWB"
+                        style="@style/ManualReferenceSeekBar"
+                        android:max="60" />
+                </LinearLayout>
+            </FrameLayout>
+
+            <FrameLayout
+                android:id="@+id/sectionMF"
+                style="@style/ManualReferenceSection"
+                android:visibility="gone">
+
+                <LinearLayout style="@style/ManualAutoColumn">
+                    <Button
+                        android:id="@+id/btnMfAuto"
+                        style="@style/ManualAutoButton"
+                        android:text="@string/control_auto_short"
+                        tools:ignore="ButtonStyle" />
+                    <TextView
+                        android:id="@+id/tvMfMode"
+                        style="@style/ManualAutoLabel"
+                        android:text="@string/control_auto" />
+                </LinearLayout>
+
+                <LinearLayout style="@style/ManualReferenceScaleColumn">
+                    <TextView
+                        android:id="@+id/tvMF"
+                        style="@style/ManualReferenceValue"
+                        android:text="@string/control_focus_infinity" />
+                    <com.neoproc.neoproccamx.ui.controls.ReferenceAdjustSeekBar
+                        android:id="@+id/sbMF"
+                        style="@style/ManualReferenceSeekBar" />
+                </LinearLayout>
+            </FrameLayout>
+
+            <FrameLayout
+                android:id="@+id/sectionEV"
+                style="@style/ManualReferenceSection"
+                android:visibility="gone">
+
+                <LinearLayout style="@style/ManualAutoColumn">
+                    <Button
+                        android:id="@+id/btnEvAuto"
+                        style="@style/ManualAutoButton"
+                        android:text="@string/control_auto_short"
+                        tools:ignore="ButtonStyle" />
+                    <TextView
+                        android:id="@+id/tvEvMode"
+                        style="@style/ManualAutoLabel"
+                        android:text="@string/control_auto" />
+                </LinearLayout>
+
+                <LinearLayout style="@style/ManualReferenceScaleColumn">
+                    <TextView
+                        android:id="@+id/tvEV"
+                        style="@style/ManualReferenceValue"
+                        android:text="@string/control_ev_zero" />
+                    <com.neoproc.neoproccamx.ui.controls.ReferenceAdjustSeekBar
+                        android:id="@+id/sbEV"
+                        style="@style/ManualReferenceSeekBar"
+                        android:max="8" />
+                </LinearLayout>
+            </FrameLayout>
+        </FrameLayout>
+
+        <HorizontalScrollView
+            android:id="@+id/tabScroll"
+            android:layout_width="match_parent"
+            android:layout_height="68dp"
+            android:clipToPadding="false"
+            android:fillViewport="true"
+            android:overScrollMode="never"
+            android:scrollbars="none">
+
+            <LinearLayout
+                android:id="@+id/tabRow"
+                android:layout_width="wrap_content"
+                android:layout_height="68dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <com.neoproc.neoproccamx.ui.controls.ProParameterButton android:id="@+id/tabEV" style="@style/ManualParameterTab" android:text="@string/control_ev_zero" tools:ignore="ButtonStyle" />
+                <com.neoproc.neoproccamx.ui.controls.ProParameterButton android:id="@+id/tabISO" style="@style/ManualParameterTab" android:text="@string/control_auto" tools:ignore="ButtonStyle" />
+                <com.neoproc.neoproccamx.ui.controls.ProParameterButton android:id="@+id/tabSS" style="@style/ManualParameterTab" android:text="@string/control_auto" tools:ignore="ButtonStyle" />
+                <com.neoproc.neoproccamx.ui.controls.ProParameterButton android:id="@+id/tabWB" style="@style/ManualParameterTab" android:text="@string/control_auto" tools:ignore="ButtonStyle" />
+                <com.neoproc.neoproccamx.ui.controls.ProParameterButton android:id="@+id/tabMF" style="@style/ManualParameterTab" android:text="@string/control_auto" tools:ignore="ButtonStyle" />
+                <com.neoproc.neoproccamx.ui.controls.ProParameterButton
+                    android:id="@+id/tabMeteringMode"
+                    style="@style/ManualParameterTab"
+                    android:text="@string/metering_matrix"
+                    tools:ignore="ButtonStyle" />
+            </LinearLayout>
+        </HorizontalScrollView>
+
+        <Button android:id="@+id/tabAFMode" android:layout_width="1dp" android:layout_height="1dp" android:text="@string/af_mode_continuous_video" android:visibility="gone" />
+        <Button android:id="@+id/tabRawToggle" android:layout_width="1dp" android:layout_height="1dp" android:text="@string/control_raw" android:visibility="gone" />
+        <TextView android:id="@+id/tvMetricProfile" android:layout_width="1dp" android:layout_height="1dp" android:visibility="gone" />
+        <TextView android:id="@+id/tvMetricFocus" android:layout_width="1dp" android:layout_height="1dp" android:visibility="gone" />
+    </LinearLayout>
+</ScrollView>

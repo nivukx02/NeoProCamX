@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Reference-style cog with dial ring, hub, and diagonal setting needle. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="38dp"
+    android:height="38dp"
+    android:viewportWidth="64"
+    android:viewportHeight="64">
+
+    <path
+        android:fillColor="#52000000"
+        android:pathData="M39.9,9.2 L42.2,15.4 C43.2,15.8 44.1,16.4 45,17 L51.5,15.9 L56,23.7 L51.8,28.8 C51.9,29.8 52,30.9 52,32 C52,33.1 51.9,34.2 51.8,35.2 L56,40.3 L51.5,48.1 L45,47 C44.1,47.6 43.2,48.2 42.2,48.6 L39.9,54.8 L30.9,54.8 L28.6,48.6 C27.6,48.2 26.7,47.6 25.8,47 L19.3,48.1 L14.8,40.3 L19,35.2 C18.9,34.2 18.8,33.1 18.8,32 C18.8,30.9 18.9,29.8 19,28.8 L14.8,23.7 L19.3,15.9 L25.8,17 C26.7,16.4 27.6,15.8 28.6,15.4 L30.9,9.2 Z" />
+
+    <path
+        android:fillColor="#F1F3F1"
+        android:fillType="evenOdd"
+        android:pathData="M37.9,7.2 L40.2,13.4 C41.2,13.8 42.1,14.4 43,15 L49.5,13.9 L54,21.7 L49.8,26.8 C49.9,27.8 50,28.9 50,30 C50,31.1 49.9,32.2 49.8,33.2 L54,38.3 L49.5,46.1 L43,45 C42.1,45.6 41.2,46.2 40.2,46.6 L37.9,52.8 L28.9,52.8 L26.6,46.6 C25.6,46.2 24.7,45.6 23.8,45 L17.3,46.1 L12.8,38.3 L17,33.2 C16.9,32.2 16.8,31.1 16.8,30 C16.8,28.9 16.9,27.8 17,26.8 L12.8,21.7 L17.3,13.9 L23.8,15 C24.7,14.4 25.6,13.8 26.6,13.4 L28.9,7.2 Z M33.4,21.2 C28.5,21.2 24.6,25.1 24.6,30 C24.6,34.9 28.5,38.8 33.4,38.8 C38.3,38.8 42.2,34.9 42.2,30 C42.2,25.1 38.3,21.2 33.4,21.2 Z" />
+
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#777E78"
+        android:strokeWidth="3"
+        android:pathData="M33.4,16.7 C40.7,16.7 46.7,22.7 46.7,30 C46.7,37.3 40.7,43.3 33.4,43.3 C26.1,43.3 20.1,37.3 20.1,30 C20.1,22.7 26.1,16.7 33.4,16.7 Z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#777E78"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round"
+        android:pathData="M25.5,39.2 L43.2,21.5" />
+    <path
+        android:fillColor="#777E78"
+        android:pathData="M33.4,26.3 C35.5,26.3 37.1,27.9 37.1,30 C37.1,32.1 35.5,33.7 33.4,33.7 C31.3,33.7 29.7,32.1 29.7,30 C29.7,27.9 31.3,26.3 33.4,26.3 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.7"
+        android:pathData="M23.5,17.6 L18.8,18.4 L16.6,22.1 L19.6,25.7 C20.4,22.4 22.2,19.6 24.7,17.5 Z" />
+</vector>

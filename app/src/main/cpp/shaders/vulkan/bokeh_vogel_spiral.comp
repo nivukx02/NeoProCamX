@@ -1,0 +1,106 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly uniform image2D uInputColor;
+layout(binding = 1, r32f) readonly uniform image2D uDepth;
+layout(binding = 2, r32f) readonly uniform image2D uCircleOfConfusionRadius;
+layout(binding = 3, rgba16f) writeonly uniform image2D uOutputColor;
+
+layout(push_constant) uniform BokehUniforms {
+    int width;
+    int height;
+    int sampleCount;
+    float chromaticAberration;
+    float apertureBladeCount;
+    float apertureBladeStrength;
+    float foregroundGuardStrength;
+    float focusDepth;       // s5-f06/CP-F7: focus-plane depth (normalized inverse depth) the CoC is built around
+    float blendStrength;    // s5-f06/CP-F7: blend of bokeh over input; 0 == EXACT passthrough (no-downgrade default)
+} uniforms;
+
+const float PI = 3.14159265358979323846;
+const float GOLDEN_ANGLE = 2.39996322972865332;
+
+float apertureBlade(float theta, float bladeCount, float strength) {
+    if (bladeCount < 3.0 || strength <= 0.0001) {
+        return 1.0;
+    }
+    float blade = cos(theta * bladeCount);
+    return mix(1.0, 0.82 + 0.18 * blade * blade, clamp(strength, 0.0, 1.0));
+}
+
+vec4 sampleColorChannelSplit(vec2 coord, vec2 radialDirection) {
+    vec2 aberration = radialDirection * uniforms.chromaticAberration;
+    ivec2 rCoord = ivec2(clamp(coord + aberration, vec2(0.0), vec2(uniforms.width - 1, uniforms.height - 1)));
+    ivec2 gCoord = ivec2(clamp(coord, vec2(0.0), vec2(uniforms.width - 1, uniforms.height - 1)));
+    ivec2 bCoord = ivec2(clamp(coord - aberration, vec2(0.0), vec2(uniforms.width - 1, uniforms.height - 1)));
+    float r = imageLoad(uInputColor, rCoord).r;
+    float g = imageLoad(uInputColor, gCoord).g;
+    float b = imageLoad(uInputColor, bCoord).b;
+    return vec4(r, g, b, 1.0);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= uniforms.width || pixel.y >= uniforms.height) {
+        return;
+    }
+
+    float centerDepth = imageLoad(uDepth, pixel).r;
+    float circleOfConfusionRadius = imageLoad(uCircleOfConfusionRadius, pixel).r;
+    if (circleOfConfusionRadius <= 0.75) {
+        imageStore(uOutputColor, pixel, imageLoad(uInputColor, pixel));
+        return;
+    }
+
+    int samples = clamp(uniforms.sampleCount, 8, 64);
+    vec4 sumColor = vec4(0.0);
+    float sumWeight = 0.0;
+    vec4 maxWeightedColor = vec4(0.0);
+    float maxWeightedLuma = -1.0;
+    vec2 pixelF = vec2(pixel);
+
+    for (int j = 0; j < samples; ++j) {
+        float jf = float(j) + 0.5;
+        float theta = jf * GOLDEN_ANGLE;
+        float vogel = sqrt(jf / float(samples));
+        float bladeShape = apertureBlade(theta, uniforms.apertureBladeCount, uniforms.apertureBladeStrength);
+        vec2 unitOffset = vec2(cos(theta), sin(theta));
+        vec2 sampleCoord = pixelF + unitOffset * circleOfConfusionRadius * vogel * bladeShape;
+        ivec2 depthCoord = ivec2(clamp(sampleCoord, vec2(0.0), vec2(uniforms.width - 1, uniforms.height - 1)));
+        float sampleDepth = imageLoad(uDepth, depthCoord).r;
+
+        float foregroundDelta = max(sampleDepth - centerDepth, 0.0);
+        float foregroundGuard = exp(-foregroundDelta * uniforms.foregroundGuardStrength);
+        float radialWeight = 1.0 - 0.35 * vogel;
+        float weight = foregroundGuard * radialWeight;
+
+        vec4 sampleColor = sampleColorChannelSplit(sampleCoord, unitOffset);
+        sumColor += sampleColor * weight;
+        sumWeight += weight;
+        float weightedLuma = dot(sampleColor.rgb, vec3(0.2126, 0.7152, 0.0722)) * weight;
+        if (weightedLuma > maxWeightedLuma) {
+            maxWeightedLuma = weightedLuma;
+            maxWeightedColor = sampleColor;
+        }
+    }
+
+    vec4 resolved = sumColor / max(sumWeight, 0.0001);
+    float resolvedLuma = dot(resolved.rgb, vec3(0.2126, 0.7152, 0.0722));
+    float maxLuma = dot(maxWeightedColor.rgb, vec3(0.2126, 0.7152, 0.0722));
+    float highlightBloom = smoothstep(0.62, 0.92, maxLuma) *
+        smoothstep(0.08, 0.32, maxLuma - resolvedLuma);
+    resolved.rgb = mix(resolved.rgb, maxWeightedColor.rgb, highlightBloom * 0.42);
+
+    // s5-f06/CP-F7 -- no-downgrade gate: blendStrength 0 emits the input color bit-for-bit (exact
+    // passthrough). focusDepth biases the occlusion reference toward the focus plane so foreground that
+    // is nearer than focus is rejected harder (occlusion-respecting); it only takes effect once the bokeh
+    // result is blended in (blendStrength > 0), so it cannot alter the passthrough output.
+    vec4 original = imageLoad(uInputColor, pixel);
+    float blend = clamp(uniforms.blendStrength, 0.0, 1.0);
+    float focusBias = clamp((uniforms.focusDepth - centerDepth) * uniforms.foregroundGuardStrength, 0.0, 1.0);
+    vec3 bokehRgb = mix(resolved.rgb, original.rgb, focusBias * (1.0 - blend));
+    vec3 outRgb = mix(original.rgb, bokehRgb, blend);
+    imageStore(uOutputColor, pixel, vec4(outRgb, 1.0));
+}

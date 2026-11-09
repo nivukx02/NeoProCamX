@@ -1,0 +1,275 @@
+#version 450
+
+// Offline RAW conversion stage 3. Completes the project detail/clarity pass,
+// applies either NeoLog v5 or the project-owned NDR10+/NIVUKX PQ delivery, and
+// writes encoder-ready little-endian P010 directly to persistently mapped Vulkan
+// storage. One invocation owns a complete 2x2 block, avoiding atomics and races.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba32f) uniform readonly image2D denoisedInput;
+layout(binding = 1, r32f) uniform readonly image2D lumaBlurInput;
+layout(std430, binding = 2) buffer P010Output {
+    uint words[];
+} outputBuffer;
+
+layout(push_constant) uniform RawDevelopP010PushConstants {
+    int width;
+    int height;
+    int deliveryMode; // 0=NeoLog, 1=NDR10+, 2=NIVUKX Vision
+    int detailEnabled;
+    float exposureScale;
+    float logToeCut;
+    float logToeHeight;
+    float logDensity;
+    float logScale;
+    float logC1;
+    float logC3;
+    float logC4;
+    float logC5;
+    float logXMax;
+    float signalGamma;
+    float toeWidth;
+    float toeAmount;
+    float peakNits;
+    float highlightDesat;
+    float shadowMidtoneLift;
+    float midtoneContrast;
+    float chromaBoost;
+    float skyChromaBonus;
+    float reserved;
+} p;
+
+const vec3 ACESCG_LUMA = vec3(0.2722287168, 0.6740817658, 0.0536895174);
+const vec3 BT2020_LUMA = vec3(0.2627, 0.6780, 0.0593);
+const float SHARPEN_AMOUNT = 0.30;
+const float CLARITY_AMOUNT = 0.18;
+const float EPSILON = 0.00000001;
+const float LUMA_MIN = 64.0;
+const float LUMA_MAX = 940.0;
+const float CHROMA_MAX = 960.0;
+const float CHROMA_ZERO = 512.0;
+const float DIFFUSE_WHITE_NITS = 203.0;
+
+float neoSmoothstep(float edge0, float edge1, float value) {
+    if (edge0 == edge1) return value >= edge1 ? 1.0 : 0.0;
+    float t = clamp((value - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+vec3 enhancedAcesCg(ivec2 pixel) {
+    vec3 rgb = imageLoad(denoisedInput, pixel).rgb;
+    if (p.detailEnabled == 0 || p.width < 3 || p.height < 3) return max(rgb, vec3(0.0));
+    float base = dot(rgb, ACESCG_LUMA);
+    if (base <= 0.00001) return max(rgb, vec3(0.0));
+    float blurSmall = imageLoad(lumaBlurInput, pixel).r;
+    float broadSum = 0.0;
+    int count = 0;
+    int x0 = max(pixel.x - 1, 0);
+    int x1 = min(pixel.x + 1, p.width - 1);
+    int y0 = max(pixel.y - 1, 0);
+    int y1 = min(pixel.y + 1, p.height - 1);
+    for (int y = y0; y <= y1; ++y) {
+        for (int x = x0; x <= x1; ++x) {
+            broadSum += imageLoad(lumaBlurInput, ivec2(x, y)).r;
+            count += 1;
+        }
+    }
+    float detailFine = base - blurSmall;
+    float detailBroad = blurSmall - broadSum / float(max(count, 1));
+    float newLuma = base + SHARPEN_AMOUNT * detailFine + CLARITY_AMOUNT * detailBroad;
+    float factor = clamp(newLuma / base, 0.5, 2.0);
+    return max(rgb * factor, vec3(0.0));
+}
+
+float encodeNeoLog(float linearValue) {
+    float x = clamp(linearValue * p.exposureScale, 0.0, p.logXMax);
+    if (x < p.logToeCut) {
+        float t = clamp(x / p.logToeCut, 0.0, 1.0);
+        float t2 = t * t;
+        float t3 = t2 * t;
+        float t4 = t3 * t;
+        float t5 = t4 * t;
+        return clamp(p.logC1 * t + p.logC3 * t3 + p.logC4 * t4 + p.logC5 * t5, 0.0, 1.0);
+    }
+    return clamp(p.logToeHeight + p.logScale * log(1.0 + p.logDensity * (x - p.logToeCut)), 0.0, 1.0);
+}
+
+vec3 acesCgToBt2020(vec3 aces) {
+    return vec3(
+        dot(aces, vec3( 1.02582, -0.02005, -0.00577)),
+        dot(aces, vec3(-0.00386,  1.01040, -0.00654)),
+        dot(aces, vec3(-0.01784, -0.07404,  1.09188))
+    );
+}
+
+float ndrSignalShape(float x) {
+    if (x <= 0.0) return 0.0;
+    if (x <= 1.0) {
+        return pow(x, p.signalGamma) +
+            neoSmoothstep(0.0, p.toeWidth, x) * p.toeAmount * (1.0 - x);
+    }
+    return 1.0 + (p.signalGamma - p.toeAmount) * (x - 1.0);
+}
+
+float ndrMidtoneLift(float signal) {
+    float x = max(signal, 0.0);
+    if (x <= 0.0 || x >= 1.0) return x;
+    float window = neoSmoothstep(0.025, 0.20, x) *
+        (1.0 - neoSmoothstep(0.78, 1.20, x));
+    return x + p.shadowMidtoneLift * sqrt(x) * (1.0 - x) * window;
+}
+
+float ndrMidtoneContrast(float signal) {
+    float x = max(signal, 0.0);
+    if (x <= 0.0 || x >= 1.0) return x;
+    float window = neoSmoothstep(0.055, 0.24, x) *
+        (1.0 - neoSmoothstep(0.76, 1.0, x));
+    float signedContrast = (x - 0.50) * 4.0 * x * (1.0 - x);
+    return max(x + p.midtoneContrast * signedContrast * window, 0.0);
+}
+
+float pqFromNits(float nits) {
+    float y = clamp(nits / 10000.0, 0.0, 1.0);
+    float ym = pow(y, 0.1593017578125);
+    return pow(
+        (0.8359375 + 18.8515625 * ym) / (1.0 + 18.6875 * ym),
+        78.84375
+    );
+}
+
+vec3 deliverNdrPq(vec3 acesCg) {
+    vec3 source = max(acesCgToBt2020(acesCg * p.exposureScale), vec3(0.0));
+    float sourceY = max(dot(source, BT2020_LUMA), EPSILON);
+    float mappedY = ndrMidtoneContrast(ndrMidtoneLift(ndrSignalShape(sourceY)));
+    vec3 mapped = source * (mappedY / sourceY);
+
+    float peakValue = max(mapped.r, max(mapped.g, mapped.b));
+    float floorValue = min(mapped.r, min(mapped.g, mapped.b));
+    float relativeChroma = (peakValue - floorValue) / max(mappedY, 0.04);
+    float colorConfidence = neoSmoothstep(0.035, 0.22, relativeChroma);
+    float safeGreen = max(source.g, EPSILON);
+    float redGreen = source.r / safeGreen;
+    float blueGreen = source.b / safeGreen;
+    float skin = neoSmoothstep(1.02, 1.16, redGreen) *
+        (1.0 - neoSmoothstep(1.58, 2.10, redGreen)) *
+        (1.0 - neoSmoothstep(0.98, 1.18, blueGreen));
+    float sky = neoSmoothstep(1.03, 1.22, blueGreen) *
+        (1.0 - neoSmoothstep(1.00, 1.22, redGreen));
+    float tonalWindow = neoSmoothstep(0.035, 0.16, mappedY) *
+        (1.0 - neoSmoothstep(0.88, 1.65, mappedY));
+    float gain = 1.0 + (p.chromaBoost + p.skyChromaBonus * sky) *
+        colorConfidence * tonalWindow * mix(1.0, 0.45, skin);
+    mapped = vec3(mappedY) + (mapped - vec3(mappedY)) * gain;
+    float desat = clamp(
+        p.highlightDesat * neoSmoothstep(0.55, 1.0, mappedY),
+        0.0,
+        p.highlightDesat
+    );
+    mapped = vec3(mappedY) + (mapped - vec3(mappedY)) * (1.0 - desat);
+
+    float rawNits = max(mappedY, 0.0) * DIFFUSE_WHITE_NITS;
+    float nits = rawNits <= DIFFUSE_WHITE_NITS
+        ? rawNits
+        : min(
+            DIFFUSE_WHITE_NITS + (p.peakNits - DIFFUSE_WHITE_NITS) *
+                (1.0 - exp(-(rawNits - DIFFUSE_WHITE_NITS) /
+                    (p.peakNits - DIFFUSE_WHITE_NITS))),
+            p.peakNits
+        );
+    float scale = nits / max(mappedY, EPSILON);
+    vec3 rgbNits = max(mapped * scale, vec3(0.0));
+    float hi = max(rgbNits.r, max(rgbNits.g, rgbNits.b));
+    if (hi > p.peakNits && hi > nits + EPSILON) {
+        float chromaScale = clamp((p.peakNits - nits) / (hi - nits), 0.0, 1.0);
+        rgbNits = clamp(vec3(nits) + (rgbNits - vec3(nits)) * chromaScale,
+            vec3(0.0), vec3(p.peakNits));
+    }
+    return vec3(pqFromNits(rgbNits.r), pqFromNits(rgbNits.g), pqFromNits(rgbNits.b));
+}
+
+vec3 deliveryRgb(ivec2 pixel) {
+    vec3 acesCg = enhancedAcesCg(pixel);
+    if (p.deliveryMode == 0) {
+        return vec3(
+            encodeNeoLog(acesCg.r),
+            encodeNeoLog(acesCg.g),
+            encodeNeoLog(acesCg.b)
+        );
+    }
+    return deliverNdrPq(acesCg);
+}
+
+uint hashBits(uint n) {
+    uint h = n * 0x9e3779b9u;
+    h ^= h >> 16u;
+    h *= 0x811c9dc5u;
+    h ^= h >> 13u;
+    h *= 0xcc9e2d51u;
+    h ^= h >> 16u;
+    return h;
+}
+
+float hashUnit(uint n) {
+    return float(hashBits(n) >> 8u) / 16777216.0;
+}
+
+float tpdfUnit(uint index) {
+    return hashUnit(index * 2u) - hashUnit(index * 2u + 1u);
+}
+
+uint quantizeCode(float code, uint index) {
+    float dither = p.deliveryMode == 0 ? 0.5 * tpdfUnit(index) : 0.0;
+    return uint(clamp(floor(code + dither + 0.5), 0.0, 1023.0));
+}
+
+uint p010Sample(float code, uint index) {
+    return quantizeCode(code, index) << 6u;
+}
+
+float encodedLuma(vec3 rgb) {
+    return dot(rgb, BT2020_LUMA);
+}
+
+void main() {
+    ivec2 block = ivec2(gl_GlobalInvocationID.xy);
+    int chromaWidth = p.width / 2;
+    int chromaHeight = p.height / 2;
+    if (block.x >= chromaWidth || block.y >= chromaHeight) return;
+
+    ivec2 c00 = block * 2;
+    ivec2 c10 = c00 + ivec2(1, 0);
+    ivec2 c01 = c00 + ivec2(0, 1);
+    ivec2 c11 = c00 + ivec2(1, 1);
+    vec3 e00 = deliveryRgb(c00);
+    vec3 e10 = deliveryRgb(c10);
+    vec3 e01 = deliveryRgb(c01);
+    vec3 e11 = deliveryRgb(c11);
+
+    uint pixel00 = uint(c00.y * p.width + c00.x);
+    uint pixel01 = uint(c01.y * p.width + c01.x);
+    float y00 = encodedLuma(e00);
+    float y10 = encodedLuma(e10);
+    float y01 = encodedLuma(e01);
+    float y11 = encodedLuma(e11);
+    uint yWord0 = p010Sample(y00 * (LUMA_MAX - LUMA_MIN) + LUMA_MIN, pixel00) |
+        (p010Sample(y10 * (LUMA_MAX - LUMA_MIN) + LUMA_MIN, pixel00 + 1u) << 16u);
+    uint yWord1 = p010Sample(y01 * (LUMA_MAX - LUMA_MIN) + LUMA_MIN, pixel01) |
+        (p010Sample(y11 * (LUMA_MAX - LUMA_MIN) + LUMA_MIN, pixel01 + 1u) << 16u);
+    uint wordsPerLumaRow = uint(p.width / 2);
+    outputBuffer.words[uint(c00.y) * wordsPerLumaRow + uint(block.x)] = yWord0;
+    outputBuffer.words[uint(c01.y) * wordsPerLumaRow + uint(block.x)] = yWord1;
+
+    float cb = 0.25 * (
+        (e00.b - y00) + (e10.b - y10) + (e01.b - y01) + (e11.b - y11)
+    ) / (2.0 * (1.0 - BT2020_LUMA.b));
+    float cr = 0.25 * (
+        (e00.r - y00) + (e10.r - y10) + (e01.r - y01) + (e11.r - y11)
+    ) / (2.0 * (1.0 - BT2020_LUMA.r));
+    uint pixelCount = uint(p.width * p.height);
+    uint chromaSample = uint(block.y * chromaWidth + block.x);
+    uint ditherIndex = pixelCount + chromaSample * 2u;
+    uint uvWord = p010Sample(cb * (CHROMA_MAX - LUMA_MIN) + CHROMA_ZERO, ditherIndex) |
+        (p010Sample(cr * (CHROMA_MAX - LUMA_MIN) + CHROMA_ZERO, ditherIndex + 1u) << 16u);
+    outputBuffer.words[pixelCount / 2u + chromaSample] = uvWord;
+}

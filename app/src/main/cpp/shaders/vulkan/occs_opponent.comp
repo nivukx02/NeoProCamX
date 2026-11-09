@@ -1,0 +1,76 @@
+#version 450
+// SNCE_V2_HVC Stage 04 (OCCS) — opponent-channel lateral inhibition.
+// Difference-of-Gaussians on an IPT field (directive 04.2 / Part II 2.2.2). Classical,
+// zero-ML. CPU reference: SnceOpponentChannels.lateralInhibition (Kotlin). The chromatic
+// channels (P, T) are sharpened strongly; the achromatic channel (I) gets a mild boost.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly uniform image2D uIptInput;
+layout(binding = 1, rgba16f) writeonly uniform image2D uIptOutput;
+
+layout(push_constant) uniform OccsParams {
+    float sigmaCenter;
+    float sigmaSurround;
+    float kWeight;
+    float iGain;
+    float chromaGain;
+} uOccs;
+
+const int OCCS_RADIUS = 5;
+
+// s2-f07 / CP46: mesopic awareness behind a spec constant. Default false ⇒ today's constant chroma
+// gain, bit-for-bit. When enabled (device-gated), the chromatic lateral-inhibition gain is reduced
+// in dim regions (low I/achromatic channel) so OCCS does not amplify chroma noise where rod-dominated
+// vision has poor chroma acuity. Monotone in luminance. Mirrors SnceOpponentChannels.mesopicChromaGainScale.
+layout(constant_id = 0) const bool MESOPIC_AWARE = true; // Default ON (user-directed 2026-07-04, device-verified); monotone in luminance, inert in well-lit scenes
+const float MESOPIC_GAIN_FLOOR = 0.25;
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uIptInput);
+    if (pos.x >= size.x || pos.y >= size.y) return;
+
+    vec3 centerVal = imageLoad(uIptInput, pos).rgb;
+
+    float invC = 1.0 / (2.0 * max(uOccs.sigmaCenter * uOccs.sigmaCenter, 1e-5));
+    float invS = 1.0 / (2.0 * max(uOccs.sigmaSurround * uOccs.sigmaSurround, 1e-5));
+
+    vec3 sumCenter = vec3(0.0);
+    vec3 sumSurround = vec3(0.0);
+    float weightCenter = 0.0;
+    float weightSurround = 0.0;
+
+    for (int y = -OCCS_RADIUS; y <= OCCS_RADIUS; ++y) {
+        for (int x = -OCCS_RADIUS; x <= OCCS_RADIUS; ++x) {
+            ivec2 coord = clamp(pos + ivec2(x, y), ivec2(0), size - ivec2(1));
+            vec3 tap = imageLoad(uIptInput, coord).rgb;
+            float d2 = float(x * x + y * y);
+            float wc = exp(-d2 * invC);
+            float ws = exp(-d2 * invS);
+            sumCenter += tap * wc;
+            sumSurround += tap * ws;
+            weightCenter += wc;
+            weightSurround += ws;
+        }
+    }
+
+    vec3 center = sumCenter / max(weightCenter, 1e-5);
+    vec3 surround = sumSurround / max(weightSurround, 1e-5);
+    vec3 dog = center - uOccs.kWeight * surround;
+
+    // CP46: optionally fade the chroma gain in dim regions (I = achromatic luminance proxy).
+    float chromaGain = uOccs.chromaGain;
+    if (MESOPIC_AWARE) {
+        float t = clamp(centerVal.r * 2.0, 0.0, 1.0);        // smoothstep(0, 0.5, I)
+        float lumScale = MESOPIC_GAIN_FLOOR + (1.0 - MESOPIC_GAIN_FLOOR) * (t * t * (3.0 - 2.0 * t));
+        chromaGain *= lumScale;
+    }
+
+    vec3 outVal;
+    outVal.r = centerVal.r + uOccs.iGain * dog.r;      // I (mild boost)
+    outVal.g = centerVal.g + chromaGain * dog.g;       // P (strong)
+    outVal.b = centerVal.b + chromaGain * dog.b;       // T (strong)
+
+    imageStore(uIptOutput, pos, vec4(outVal, 1.0));
+}

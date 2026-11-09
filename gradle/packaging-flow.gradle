@@ -1,0 +1,235 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import java.util.Locale
+import java.util.TimeZone
+
+def registerPackagingFlow = { String buildTypeName, boolean requireSigning ->
+    def capitalizedVariant = buildTypeName.substring(0, 1).toUpperCase(Locale.US) + buildTypeName.substring(1)
+    def assembleTaskName = "assemble${capitalizedVariant}"
+    def verifyTaskName = "verify${capitalizedVariant}Packaging"
+    def exportTaskName = "export${capitalizedVariant}Apk"
+    def checksumTaskName = "write${capitalizedVariant}ApkSha256"
+    def manifestTaskName = "write${capitalizedVariant}DistributionManifest"
+    def packageFlowTaskName = "packageFlow${capitalizedVariant}"
+
+    def androidExtension = project.extensions.getByName('android')
+    def versionName = androidExtension.defaultConfig.versionName ?: 'dev'
+    def versionCode = androidExtension.defaultConfig.versionCode ?: 0
+    def applicationId = androidExtension.defaultConfig.applicationId
+    def exportedApkName = "NeoProCamX-${versionName}-${buildTypeName}.apk"
+    def signingConfigured = !requireSigning || androidExtension.buildTypes.getByName(buildTypeName).signingConfig != null
+
+    def apkCandidates = [
+        layout.buildDirectory.file("outputs/apk/${buildTypeName}/app-${buildTypeName}.apk"),
+        layout.buildDirectory.file("intermediates/apk/${buildTypeName}/app-${buildTypeName}.apk")
+    ]
+    def metadataCandidates = [
+        layout.buildDirectory.file("outputs/apk/${buildTypeName}/output-metadata.json"),
+        layout.buildDirectory.file("intermediates/apk/${buildTypeName}/output-metadata.json")
+    ]
+    def nativeBridgeProvider = layout.buildDirectory.file(
+        "intermediates/stripped_native_libs/${buildTypeName}/strip${capitalizedVariant}DebugSymbols/out/lib/arm64-v8a/libneoproc_vulkan.so"
+    )
+    def exportedApkProvider = layout.buildDirectory.file("dist/${buildTypeName}/${exportedApkName}")
+    def checksumProvider = layout.buildDirectory.file("dist/${buildTypeName}/${exportedApkName}.sha256")
+    def manifestProvider = layout.buildDirectory.file("dist/${buildTypeName}/distribution-manifest.json")
+
+    tasks.register(verifyTaskName) {
+        group = 'verification'
+        description = "Verifies the ${buildTypeName} APK packaging output, metadata, and required arm64 native bridge."
+        dependsOn assembleTaskName
+
+        doLast {
+            if (!signingConfigured) {
+                throw new GradleException(
+                    "Release packaging requires an explicit signingConfig before ${verifyTaskName} can run."
+                )
+            }
+
+            def apkFiles = apkCandidates.collect { it.get().asFile }
+            def metadataFiles = metadataCandidates.collect { it.get().asFile }
+            def apk = apkFiles.find { it.exists() }
+            def metadata = metadataFiles.find { it.exists() }
+
+            if (apk == null) {
+                throw new GradleException("APK artifact is missing. Checked: ${apkFiles*.absolutePath.join(', ')}")
+            }
+            if (apk.length() <= 0L) {
+                throw new GradleException("APK is empty at ${apk.absolutePath}")
+            }
+            if (metadata == null) {
+                throw new GradleException("APK output metadata is missing. Checked: ${metadataFiles*.absolutePath.join(', ')}")
+            }
+
+            def parsedMetadata = new JsonSlurper().parse(metadata)
+            def outputFiles = (parsedMetadata?.elements ?: []).collect { it.outputFile }
+            if (!outputFiles.contains(apk.name)) {
+                throw new GradleException("APK metadata does not reference ${apk.name}. Found ${outputFiles}")
+            }
+
+            def arm64NativeBridge = nativeBridgeProvider.get().asFile
+            if (!arm64NativeBridge.exists()) {
+                throw new GradleException(
+                    "Required arm64 native bridge libneoproc_vulkan.so is missing at ${arm64NativeBridge.absolutePath}"
+                )
+            }
+        }
+    }
+
+    tasks.register(exportTaskName) {
+        group = 'distribution'
+        description = "Copies the verified ${buildTypeName} APK into a stable distribution folder with a versioned name."
+        dependsOn verifyTaskName
+        inputs.files(apkCandidates)
+        outputs.file(exportedApkProvider)
+
+        doLast {
+            def apkFiles = apkCandidates.collect { it.get().asFile }
+            def sourceApk = apkFiles.find { it.exists() }
+            if (sourceApk == null) {
+                throw new GradleException("APK artifact is missing. Checked: ${apkFiles*.absolutePath.join(', ')}")
+            }
+
+            def exportedApk = exportedApkProvider.get().asFile
+            exportedApk.parentFile.mkdirs()
+            Files.copy(sourceApk.toPath(), exportedApk.toPath(), StandardCopyOption.REPLACE_EXISTING)
+
+            if (!exportedApk.exists()) {
+                throw new GradleException("Failed to export APK to ${exportedApk.absolutePath}")
+            }
+        }
+    }
+
+    tasks.register(checksumTaskName) {
+        group = 'distribution'
+        description = "Writes a SHA-256 checksum for the exported ${buildTypeName} APK."
+        dependsOn exportTaskName
+        inputs.file(exportedApkProvider)
+        outputs.file(checksumProvider)
+
+        doLast {
+            def exportedApk = exportedApkProvider.get().asFile
+            def checksumFile = checksumProvider.get().asFile
+            checksumFile.parentFile.mkdirs()
+
+            def digest = MessageDigest.getInstance('SHA-256')
+            exportedApk.withInputStream { stream ->
+                byte[] buffer = new byte[8192]
+                int read
+                while ((read = stream.read(buffer)) != -1) {
+                    digest.update(buffer, 0, read)
+                }
+            }
+            def hash = digest.digest().collect { String.format('%02x', it) }.join()
+            checksumFile.text = "${hash}  ${exportedApk.name}${System.lineSeparator()}"
+        }
+    }
+
+    tasks.register(manifestTaskName) {
+        group = 'distribution'
+        description = "Writes a distribution manifest for the exported ${buildTypeName} APK."
+        dependsOn checksumTaskName
+        inputs.file(exportedApkProvider)
+        inputs.file(checksumProvider)
+        inputs.files(metadataCandidates)
+        inputs.property('applicationId', applicationId)
+        inputs.property('versionName', versionName)
+        inputs.property('versionCode', versionCode)
+        inputs.property('buildTypeName', buildTypeName)
+        outputs.file(manifestProvider)
+
+        doLast {
+            def exportedApk = exportedApkProvider.get().asFile
+            def checksumFile = checksumProvider.get().asFile
+            def metadataFiles = metadataCandidates.collect { it.get().asFile }
+            def metadataFile = metadataFiles.find { it.exists() }
+            if (metadataFile == null) {
+                throw new GradleException("APK output metadata is missing. Checked: ${metadataFiles*.absolutePath.join(', ')}")
+            }
+            def metadata = new JsonSlurper().parse(metadataFile)
+            def manifestFile = manifestProvider.get().asFile
+            manifestFile.parentFile.mkdirs()
+
+            def payload = [
+                applicationId : applicationId,
+                versionName   : versionName,
+                versionCode   : versionCode,
+                buildType     : buildTypeName,
+                fileName      : exportedApk.name,
+                fileSizeBytes : exportedApk.length(),
+                sha256        : checksumFile.text.trim().tokenize(' ')[0],
+                generatedAtUtc: new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone('UTC')),
+                metadata      : metadata
+            ]
+            manifestFile.text = JsonOutput.prettyPrint(JsonOutput.toJson(payload))
+        }
+    }
+
+    tasks.register(packageFlowTaskName) {
+        group = 'distribution'
+        description = "Runs the full ${buildTypeName} package flow: verification, export, checksum, and distribution manifest."
+        dependsOn manifestTaskName
+        if (buildTypeName == 'debug') {
+            dependsOn 'qualityGateDebug'
+        }
+    }
+}
+
+afterEvaluate {
+    registerPackagingFlow('debug', false)
+    registerPackagingFlow('release', true)
+
+    def instrumentationLinkageReport = layout.buildDirectory.file(
+            'reports/packaging/debug-instrumentation-runtime-linkage.json'
+    )
+    File repositoryRoot = rootProject.projectDir
+    def pythonExecutable = providers.gradleProperty('neoQaPythonExecutable')
+            .orElse(providers.environmentVariable('NEO_QA_PYTHON_EXECUTABLE'))
+            .orElse('python')
+    def defaultAppApk = layout.buildDirectory.file('outputs/apk/debug/app-debug.apk')
+    def defaultTestApk = layout.buildDirectory.file(
+            'outputs/apk/androidTest/debug/app-debug-androidTest.apk'
+    )
+    def selectedAppApk = providers.gradleProperty('runtimeLinkageAppApk')
+            .map { new File(repositoryRoot, it.trim()).absolutePath }
+            .orElse(defaultAppApk.map { it.asFile.absolutePath })
+    def selectedTestApk = providers.gradleProperty('runtimeLinkageTestApk')
+            .map { new File(repositoryRoot, it.trim()).absolutePath }
+            .orElse(defaultTestApk.map { it.asFile.absolutePath })
+    def instrumentationLinkageTask = tasks.register(
+            'verifyDebugInstrumentationRuntimeLinkage',
+            Exec
+    ) {
+        group = 'verification'
+        description = 'Fail-closed DEX linkage check for the debug app/instrumentation APK pair.'
+        dependsOn 'assembleDebug', 'assembleDebugAndroidTest'
+        workingDir repositoryRoot
+        environment 'PYTHONDONTWRITEBYTECODE', '1'
+        commandLine(
+                pythonExecutable.get(),
+                '-m',
+                'tools.neo_qa_hypergrid',
+                'verify-apk-startup',
+                '--app-apk',
+                selectedAppApk.get(),
+                '--test-apk',
+                selectedTestApk.get(),
+                '--output',
+                instrumentationLinkageReport.get().asFile.absolutePath
+        )
+        inputs.file(selectedAppApk.get())
+        inputs.file(selectedTestApk.get())
+        inputs.files(
+                rootProject.file('tools/neo_qa_hypergrid/package_oracle.py'),
+                rootProject.file('tools/neo_qa_hypergrid/cli.py')
+        )
+        outputs.file(instrumentationLinkageReport)
+        outputs.upToDateWhen { false }
+    }
+    tasks.named('qualityGateStrict').configure {
+        dependsOn instrumentationLinkageTask
+    }
+}

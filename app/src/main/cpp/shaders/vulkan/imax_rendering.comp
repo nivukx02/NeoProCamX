@@ -1,0 +1,101 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba16f) uniform readonly image2D inputImage;     // Scene-referred linear RGB
+layout(binding = 1, r32f) uniform readonly image2D focusMap;         // Cinematic Value Map V(x,y)
+layout(binding = 2, rgba16f) uniform writeonly image2D outputImage;   // IMAX contrast-enhanced output
+
+layout(push_constant) uniform PushConstants {
+    float csfStrength;       // Global CSF mid-frequency boost strength (default ~1.5)
+    float contrastExponent;  // Local S-curve contrast steepness (default ~3.5)
+    float midFreqPeak;       // Mid-frequency peak tuning
+} pcs;
+
+// Converts RGB to JzAzBz Luma for high-end perceptual accuracy
+float rgbToLuma(vec3 rgb) {
+    return dot(rgb, vec3(0.2627, 0.6780, 0.0593));
+}
+
+// Applies a soft S-curve contrast stretch centered around local mean luma
+float localSContrast(float luma, float meanLuma, float k) {
+    float x = luma - meanLuma;
+    // Sigmoid function: 1.0 / (1.0 + exp(-k * x))
+    float s = 1.0 / (1.0 + exp(-k * x));
+    // Re-normalize to preserve original black and white levels roughly
+    float sMin = 1.0 / (1.0 + exp(k * meanLuma));
+    float sMax = 1.0 / (1.0 + exp(-k * (1.0 - meanLuma)));
+    return clamp((s - sMin) / max(sMax - sMin, 0.0001), 0.0, 1.0);
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inputImage);
+    if (pos.x >= size.x || pos.y >= size.y) {
+        return;
+    }
+
+    // Ingest current pixel color and focus map value
+    vec3 centerColor = imageLoad(inputImage, pos).rgb;
+    float V = imageLoad(focusMap, pos).r; // V(x,y) in [0, 1]
+
+    // Compute small and large Gaussian blurs for bandpass CSF modeling
+    vec3 smallBlur = vec3(0.0);
+    vec3 largeBlur = vec3(0.0);
+    float smallSum = 0.0;
+    float largeSum = 0.0;
+
+    // We do a single integrated dual-radius spatial gather to optimize cache locality
+    for (int dy = -3; dy <= 3; ++dy) {
+        for (int dx = -3; dx <= 3; ++dx) {
+            ivec2 samplePos = clamp(pos + ivec2(dx, dy), ivec2(0), size - ivec2(1));
+            vec3 color = imageLoad(inputImage, samplePos).rgb;
+
+            float distSq = float(dx * dx + dy * dy);
+
+            // Small blur (radius sigma = 1.0)
+            float wSmall = exp(-distSq / 2.0);
+            smallBlur += color * wSmall;
+            smallSum += wSmall;
+
+            // Large blur (radius sigma = 2.8)
+            float wLarge = exp(-distSq / 15.68);
+            largeBlur += color * wLarge;
+            largeSum += wLarge;
+        }
+    }
+
+    smallBlur /= max(smallSum, 0.0001);
+    largeBlur /= max(largeSum, 0.0001);
+
+    // Extract perceptual luminances for all bands
+    float yCenter = rgbToLuma(centerColor);
+    float ySmall = rgbToLuma(smallBlur);
+    float yLarge = rgbToLuma(largeBlur);
+
+    // Mid-frequency band corresponds to Barten's CSF target (approx 4 cycles per degree)
+    float midFrequencyLuma = ySmall - yLarge;
+
+    // Apply foveated mid-frequency CSF boost based on Cinematic Value Map V
+    // Focus domains receive strong, pristine clarity; background bokeh is untouched
+    float focusCSFBoost = pcs.csfStrength * V * (1.0 + V * 0.5);
+    float enhancedLuma = yCenter + midFrequencyLuma * focusCSFBoost;
+
+    // Dynamic S-curve local tone mapping (PIRE - Layer 6)
+    // S-curve steepness k is dynamically scaled by focus field V to synthesize perceptual depth
+    float k = pcs.contrastExponent * (1.0 + V * 0.65);
+    float finalLuma = localSContrast(max(enhancedLuma, 0.0), yLarge, k);
+
+    // Re-project luminance to color preserving original chroma ratios
+    vec3 outputColor = vec3(0.0);
+    if (yCenter > 0.0001) {
+        outputColor = centerColor * (finalLuma / yCenter);
+    } else {
+        outputColor = vec3(finalLuma);
+    }
+
+    // Preserve original scene highlights above 0.95 to avoid grading clipping
+    float highlightGuard = smoothstep(0.92, 1.0, yCenter);
+    vec3 finalRGB = mix(outputColor, centerColor, highlightGuard);
+
+    imageStore(outputImage, pos, vec4(max(finalRGB, vec3(0.0)), 1.0));
+}

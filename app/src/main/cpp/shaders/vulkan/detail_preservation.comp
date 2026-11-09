@@ -1,0 +1,117 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Ingest the aligned and demosaiced linear RGB frame
+layout(binding = 0, rgba16f) uniform readonly image2D inputLinearRGB;
+
+// Output detail preservation mask (1.0 = fine texture to protect, 0.0 = flat/edge)
+layout(binding = 1, r32f) uniform writeonly image2D outputDetailMask;
+
+layout(push_constant) uniform PushConstants {
+    float textureThreshold; // Local variance threshold (default ~0.005)
+    float edgeTolerance;    // Ratio limit for separating linear edges from isotropic textures (default ~3.5)
+    // ── CP24 elite no-downgrade gates, now per-dispatch (default 0.0 → today's mask bit-for-bit) ──
+    float noiseAwareGate;   // >0.5 rolls the mask off toward the sensor noise floor (no grain amplification downstream)
+    float haloGuardGate;    // >0.5 rolls the mask off at very strong edges so detail re-injection cannot ring
+} pcs;
+
+// Measured sensor noise std (working [0,1] linear scale) — the rolloff reference for noise-aware.
+const float DETAIL_NOISE_SIGMA = 0.04;
+// Structure-tensor λ1 above which the halo guard begins suppressing the mask.
+const float DETAIL_EDGE_HI = 0.10;
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inputLinearRGB);
+    if (pos.x >= size.x || pos.y >= size.y) return;
+
+    // Calculate structure tensor in a 3x3 local neighborhood
+    float jXX = 0.0;
+    float jYY = 0.0;
+    float jXY = 0.0;
+    // Local luma mean/variance accumulators (for the noise-aware rolloff; cost-free in this loop).
+    float sumL = 0.0;
+    float sumL2 = 0.0;
+    // Proper DC-free Sobel gradient (for the halo guard; the structure-tensor λ above is DC-biased).
+    float gradX = 0.0;
+    float gradY = 0.0;
+
+    // Sobel filters for spatial gradients
+    float sobelX[3][3] = {
+        {-1.0, 0.0, 1.0},
+        {-2.0, 0.0, 2.0},
+        {-1.0, 0.0, 1.0}
+    };
+    float sobelY[3][3] = {
+        {-1.0, -2.0, -1.0},
+        { 0.0,  0.0,  0.0},
+        { 1.0,  2.0,  1.0}
+    };
+
+    // Calculate local gradients
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 samplePos = clamp(pos + ivec2(dx, dy), ivec2(0), size - ivec2(1));
+            vec3 rgb = imageLoad(inputLinearRGB, samplePos).rgb;
+            float luma = dot(rgb, vec3(0.299, 0.587, 0.114));
+
+            float wX = sobelX[dy + 1][dx + 1];
+            float wY = sobelY[dy + 1][dx + 1];
+
+            float gX = luma * wX;
+            float gY = luma * wY;
+
+            jXX += gX * gX;
+            jYY += gY * gY;
+            jXY += gX * gY;
+
+            sumL += luma;
+            sumL2 += luma * luma;
+            gradX += gX;
+            gradY += gY;
+        }
+    }
+
+    // Solve for eigenvalues of the local structure tensor
+    float trace = jXX + jYY;
+    float det = jXX * jYY - jXY * jXY;
+    float diff = sqrt(max(0.0, trace * trace - 4.0 * det));
+
+    float lambda1 = 0.5 * (trace + diff); // Dominant gradient magnitude
+    float lambda2 = 0.5 * (trace - diff); // Minor gradient magnitude (perpendicular)
+
+    float detailMaskValue = 0.0;
+
+    // Classification Rules:
+    // Isotropic textures (pores, hair, foliage) have high gradient variation in ALL directions,
+    // which means BOTH lambda1 and lambda2 are high (lambda1 / lambda2 is small/coherent, and lambda2 is significant).
+    // Flat regions have very small eigenvalues.
+    // Linear edges have a very high lambda1 but a very small lambda2.
+    if (lambda2 > pcs.textureThreshold) {
+        float anisotropyRatio = lambda1 / (lambda2 + 1e-6);
+        if (anisotropyRatio < pcs.edgeTolerance) {
+            // Isotropic high-frequency texture detected! Flag as protected.
+            // We smoothly scale the detail map strength based on texture energy.
+            detailMaskValue = smoothstep(pcs.textureThreshold, pcs.textureThreshold * 4.0, lambda2);
+        }
+    }
+
+    // CP24 noise-aware rolloff: grain has local variance ≈ the sensor noise floor, real texture has
+    // variance well above it. Require the measured variance to exceed the noise floor by a margin
+    // before protecting detail, so flat/noisy regions are not flagged (no grain amplification).
+    if (pcs.noiseAwareGate > 0.5) {
+        float localVar = max(sumL2 / 9.0 - (sumL / 9.0) * (sumL / 9.0), 0.0);
+        float noiseFloor = DETAIL_NOISE_SIGMA * DETAIL_NOISE_SIGMA;
+        detailMaskValue *= smoothstep(noiseFloor * 2.0, noiseFloor * 6.0, localVar);
+    }
+
+    // CP24 halo guard: roll the mask off at very strong edges so downstream re-injection cannot ring.
+    // Keyed off the true DC-free Sobel gradient magnitude (an edge-strength measure), not the
+    // DC-biased structure-tensor eigenvalue.
+    if (pcs.haloGuardGate > 0.5) {
+        float gradMag = sqrt(gradX * gradX + gradY * gradY);
+        detailMaskValue *= (1.0 - smoothstep(DETAIL_EDGE_HI, DETAIL_EDGE_HI * 3.0, gradMag));
+    }
+
+    imageStore(outputDetailMask, pos, vec4(detailMaskValue, 0.0, 0.0, 0.0));
+}

@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- A single platform-owned splash. All nine treatments animate inside this one icon view; the
+         activity never draws a second logo or a second splash layer. -->
+    <style name="Theme.NeoProCamX.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@android:color/black</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/splash_logo_sequence</item>
+        <item name="windowSplashScreenAnimationDuration">900</item>
+        <item name="postSplashScreenTheme">@style/Theme.NeoProCamX</item>
+    </style>
+
+    <!-- Section 18: Material 3 Dark Theme -->
+    <style name="Theme.NeoProCamX.Base" parent="Theme.Material3.Dark.NoActionBar">
+        <!-- Primary -->
+        <item name="colorPrimary">@color/accent_blue</item>
+        <item name="colorOnPrimary">#FF020405</item>
+        <item name="colorPrimaryContainer">#FF1A3A4A</item>
+        <item name="colorOnPrimaryContainer">#FFB3E5FC</item>
+        <!-- Secondary -->
+        <item name="colorSecondary">@color/accent_yellow</item>
+        <item name="colorOnSecondary">#FF090B0D</item>
+        <item name="colorSecondaryContainer">#FF3A3000</item>
+        <item name="colorOnSecondaryContainer">#FFFFF59D</item>
+        <!-- Tertiary -->
+        <item name="colorTertiary">#FF80CBC4</item>
+        <item name="colorOnTertiary">#FF00251A</item>
+        <item name="colorTertiaryContainer">#FF004D40</item>
+        <item name="colorOnTertiaryContainer">#FFB2DFDB</item>
+        <!-- Surface -->
+        <item name="android:colorBackground">@color/pure_black</item>
+        <item name="colorSurface">@color/surface_base</item>
+        <item name="colorOnSurface">@color/text_primary_strong</item>
+        <item name="colorSurfaceVariant">#FF1A1D23</item>
+        <item name="colorOnSurfaceVariant">#FF8B949E</item>
+        <item name="colorSurfaceInverse">#FFE0E0E0</item>
+        <item name="colorOnSurfaceInverse">#FF121212</item>
+        <!-- Outline -->
+        <item name="colorOutline">#FF2A2F36</item>
+        <item name="colorOutlineVariant">#FF1E232A</item>
+        <!-- Error -->
+        <item name="colorError">@color/accent_red</item>
+        <item name="colorOnError">#FF020405</item>
+        <item name="colorErrorContainer">#FF3A0A0A</item>
+        <item name="colorOnErrorContainer">#FFFFB4B4</item>
+        <!-- Window -->
+        <item name="android:windowBackground">@color/pure_black</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <!-- Elevation overlays -->
+        <item name="elevationOverlayEnabled">false</item>
+    </style>
+
+    <!-- API-specific Theme.NeoProCamX variants must inherit this complete camera theme instead of
+         replacing it with only their platform-specific window attribute. -->
+    <style name="Theme.NeoProCamX" parent="Theme.NeoProCamX.Base" />
+
+    <style name="Theme.NeoProCamX.SettingsFullScreen" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">@color/accent_blue</item>
+        <item name="colorOnPrimary">#FF020405</item>
+        <item name="colorSecondary">@color/accent_yellow</item>
+        <item name="colorSurface">@color/pure_black</item>
+        <item name="colorOnSurface">@color/text_primary_strong</item>
+        <item name="android:windowBackground">@color/pure_black</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowIsFloating">false</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
+
+    <style name="ProBtn">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">@dimen/touch_target</item>
+        <item name="android:textSize">11sp</item>
+        <item name="android:textColor">@color/text_primary_strong</item>
+        <item name="android:background">@drawable/bg_camera_chip_selector</item>
+        <item name="android:paddingHorizontal">@dimen/space_4</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:minWidth">0dp</item>
+        <item name="android:minHeight">0dp</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:gravity">center</item>
+    </style>
+
+    <style name="ZoomBtn">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">36dp</item>
+        <item name="android:textSize">12sp</item>
+        <item name="android:textColor">#FFF1F6FA</item>
+        <item name="android:background">@drawable/btn_zoom_preset</item>
+        <item name="android:paddingHorizontal">16dp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:layout_marginHorizontal">4dp</item>
+        <item name="android:minWidth">0dp</item>
+        <item name="android:minHeight">0dp</item>
+        <item name="android:textAllCaps">false</item>
+    </style>
+
+    <style name="ModeBtn">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">@dimen/touch_target</item>
+        <item name="android:textSize">12sp</item>
+        <item name="android:textColor">@color/text_secondary_strong</item>
+        <item name="android:background">@drawable/bg_camera_chip_selector</item>
+        <item name="android:paddingHorizontal">@dimen/space_4</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:minWidth">0dp</item>
+        <item name="android:minHeight">0dp</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:gravity">center</item>
+    </style>
+
+    <style name="ModeText">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">@dimen/touch_target</item>
+        <item name="android:layout_marginHorizontal">@dimen/space_1</item>
+        <item name="android:minWidth">0dp</item>
+        <item name="android:minHeight">0dp</item>
+        <item name="android:gravity">center</item>
+        <item name="android:background">@drawable/bg_camera_chip_selector</item>
+        <item name="android:paddingHorizontal">@dimen/space_4</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:textColor">@color/text_secondary_strong</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:textAllCaps">false</item>
+    </style>
+
+</resources>

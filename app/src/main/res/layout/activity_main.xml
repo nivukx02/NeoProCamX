@@ -1,0 +1,581 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/rootLayout"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/pure_black"
+    tools:ignore="Overdraw">
+
+    <com.neoproc.neoproccamx.rendering.CameraVulkanPreviewView
+        android:id="@+id/glSurface"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <com.neoproc.neoproccamx.ui.overlays.UIOverlay
+        android:id="@+id/cameraOverlay"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        app:layout_constraintBottom_toBottomOf="@id/glSurface"
+        app:layout_constraintEnd_toEndOf="@id/glSurface"
+        app:layout_constraintStart_toStartOf="@id/glSurface"
+        app:layout_constraintTop_toTopOf="@id/glSurface" />
+
+    <com.neoproc.neoproccamx.ui.overlays.ThermalWarningOverlay
+        android:id="@+id/thermalWarningOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:visibility="gone"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <TextView
+        android:id="@+id/tvPipelineDebug"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:layout_marginTop="12dp"
+        android:background="@drawable/bg_glass_panel"
+        android:fontFamily="monospace"
+        android:paddingHorizontal="10dp"
+        android:paddingVertical="8dp"
+        android:textColor="#E6FFFFFF"
+        android:textSize="11sp"
+        android:visibility="gone"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        tools:text="sensor=90  device=0  final=90&#10;lens=BACK  mirror=false  aspect=4:3&#10;crop=FULL" />
+
+    <!-- Transient plain numeric zoom indicator. Runtime translation follows modeGroup so it stays
+         directly above the active VIDEO/PRO/RAW label after preview-bound dock anchoring. -->
+    <TextView
+        android:id="@+id/btnZoomToggle"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="12dp"
+        android:background="@null"
+        android:clickable="false"
+        android:focusable="false"
+        android:gravity="center"
+        android:minWidth="52dp"
+        android:paddingHorizontal="14dp"
+        android:paddingVertical="6dp"
+        android:text="@string/zoom_default"
+        android:textColor="#FFFFFFFF"
+        android:textSize="15sp"
+        android:visibility="gone"
+        app:layout_constraintBottom_toTopOf="@id/modeGroup"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent" />
+
+    <HorizontalScrollView
+        android:id="@+id/topBarScroll"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="@dimen/space_4"
+        android:layout_marginTop="@dimen/space_2"
+        android:layout_marginEnd="@dimen/space_2"
+        android:background="@drawable/bg_top_rail_surface"
+        android:clipToPadding="false"
+        android:fillViewport="false"
+        android:paddingStart="@dimen/space_2"
+        android:paddingTop="@dimen/space_2"
+        android:paddingEnd="@dimen/space_2"
+        android:paddingBottom="@dimen/space_2"
+        android:scrollbars="none"
+        android:visibility="gone"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <LinearLayout
+            android:id="@+id/topControlsRow"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="0dp"
+            android:paddingEnd="2dp">
+
+            <TextView
+                android:id="@+id/btnFlash"
+                style="@style/ModeText"
+                android:text="@string/mode_auto" />
+
+            <TextView
+                android:id="@+id/btnHdr"
+                style="@style/ModeText"
+                android:layout_marginStart="@dimen/space_2"
+                android:text="@string/mode_hdr" />
+
+            <TextView
+                android:id="@+id/btnFeatureToggle"
+                style="@style/ModeText"
+                android:layout_marginStart="@dimen/space_2"
+                android:text="@string/control_ai" />
+
+            <TextView
+                android:id="@+id/btnRaw"
+                style="@style/ModeText"
+                android:layout_marginStart="@dimen/space_2"
+                android:text="@string/control_raw" />
+
+            <TextView
+                android:id="@+id/btnLog"
+                style="@style/ModeText"
+                android:layout_marginStart="@dimen/space_2"
+                android:text="@string/profile_log" />
+
+            <TextView
+                android:id="@+id/btnGrid"
+                style="@style/ModeText"
+                android:layout_marginStart="@dimen/space_2"
+                android:text="@string/control_grid" />
+
+            <TextView
+                android:id="@+id/btnColorProfile"
+                style="@style/ModeText"
+                android:layout_marginStart="@dimen/space_2"
+                android:text="@string/color_profile_rec709" />
+
+            <ImageView
+                android:id="@+id/btnSettings"
+                style="@style/TopBarIcon"
+                android:layout_marginStart="@dimen/space_2"
+                android:contentDescription="@string/cd_settings"
+                android:src="@drawable/ic_camera_settings_neo"
+                app:tint="#F2F5F8" />
+        </LinearLayout>
+    </HorizontalScrollView>
+
+    <LinearLayout
+        android:id="@+id/topStatusPanel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="@dimen/top_sensor_dock_margin_top"
+        android:background="@drawable/bg_preview_hud_chip"
+        android:gravity="center"
+        android:minHeight="@dimen/top_sensor_dock_height"
+        android:minWidth="@dimen/top_sensor_dock_min_width"
+        android:orientation="vertical"
+        android:paddingHorizontal="@dimen/top_sensor_dock_padding_horizontal"
+        android:paddingVertical="4dp"
+        android:visibility="gone"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <TextView
+            android:id="@+id/tvStatusPrimary"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:fontFamily="sans-serif-medium"
+            android:gravity="center"
+            android:includeFontPadding="false"
+            android:maxLines="1"
+            android:textColor="@color/text_primary_strong"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            tools:text="8192x6144 | 8K UHD | 4:3" />
+
+        <TextView
+            android:id="@+id/tvStatusSecondary"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:maxLines="1"
+            android:textColor="@color/text_secondary_strong"
+            android:textSize="11sp"
+            android:visibility="gone"
+            tools:text="Ready" />
+
+        <!-- Dynamic runtime-health indicators (PROV / P010 / LAB / NATIVE). State, colour, animation
+             and tap-to-diagnose are driven at runtime by RuntimeHealthMonitor; see ui/health/. -->
+        <LinearLayout
+            android:id="@+id/healthIndicatorRow"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="3dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/chipProvCore"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="4dp"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:includeFontPadding="true"
+                android:minHeight="@dimen/runtime_health_chip_min_height"
+                android:paddingHorizontal="6dp"
+                android:paddingVertical="2dp"
+                android:textSize="11sp"
+                android:textStyle="bold"
+                tools:text="● PROV" />
+
+            <TextView
+                android:id="@+id/chipP010"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="4dp"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:includeFontPadding="true"
+                android:minHeight="@dimen/runtime_health_chip_min_height"
+                android:paddingHorizontal="6dp"
+                android:paddingVertical="2dp"
+                android:textSize="11sp"
+                android:textStyle="bold"
+                tools:text="● P010" />
+
+            <TextView
+                android:id="@+id/chipLab"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="4dp"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:includeFontPadding="true"
+                android:minHeight="@dimen/runtime_health_chip_min_height"
+                android:paddingHorizontal="6dp"
+                android:paddingVertical="2dp"
+                android:textSize="11sp"
+                android:textStyle="bold"
+                tools:text="⚠ LAB" />
+
+            <TextView
+                android:id="@+id/chipNative"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:includeFontPadding="true"
+                android:minHeight="@dimen/runtime_health_chip_min_height"
+                android:paddingHorizontal="6dp"
+                android:paddingVertical="2dp"
+                android:textSize="11sp"
+                android:textStyle="bold"
+                tools:text="● NATIVE" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/topWarningPanel"
+        android:layout_width="0dp"
+        android:layout_height="30dp"
+        android:layout_marginTop="6dp"
+        android:background="@drawable/bg_save_watermark"
+        android:gravity="center"
+        android:minWidth="220dp"
+        android:orientation="vertical"
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="0dp"
+        android:visibility="gone"
+        app:layout_constraintEnd_toEndOf="@id/topStatusPanel"
+        app:layout_constraintStart_toStartOf="@id/topStatusPanel"
+        app:layout_constraintTop_toBottomOf="@id/topStatusPanel">
+
+        <TextView
+            android:id="@+id/tvTopWarning"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:fontFamily="sans-serif-medium"
+            android:gravity="center"
+            android:maxLines="1"
+            android:textColor="@color/accent_violet_bright"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            tools:text="THERMAL THROTTLING" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/tvSaveWatermark"
+        android:layout_width="wrap_content"
+        android:layout_height="36dp"
+        android:layout_marginBottom="18dp"
+        android:alpha="0"
+        android:background="@drawable/bg_save_watermark"
+        android:fontFamily="sans-serif-medium"
+        android:gravity="center"
+        android:includeFontPadding="false"
+        android:letterSpacing="0"
+        android:minWidth="142dp"
+        android:paddingHorizontal="18dp"
+        android:text="@string/msg_video_saved_banner"
+        android:textColor="@color/accent_yellow"
+        android:textSize="13sp"
+        android:visibility="gone"
+        app:layout_constraintBottom_toTopOf="@id/bottomBar"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent" />
+
+    <LinearLayout
+        android:id="@+id/videoLeftRail"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="@dimen/space_4"
+        android:background="@android:color/transparent"
+        android:orientation="vertical"
+        android:padding="0dp"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="@id/glSurface"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="@id/glSurface">
+
+        <TextView
+            android:id="@+id/btnSideAeLock"
+            style="@style/OverlayTextButton"
+            android:text="@string/control_ae" />
+
+        <TextView
+            android:id="@+id/btnSideFocusLock"
+            style="@style/OverlayTextButton"
+            android:layout_marginTop="10dp"
+            android:contentDescription="@string/focus_assist_tap"
+            app:drawableTopCompat="@drawable/ic_focus_tap"
+            android:text="" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/videoRightRail"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginEnd="@dimen/space_4"
+        android:background="@android:color/transparent"
+        android:orientation="vertical"
+        android:padding="0dp"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="@id/glSurface"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toTopOf="@id/glSurface">
+
+        <TextView
+            android:id="@+id/btnSideColorProfile"
+            style="@style/OverlayTextButton"
+            android:text="@string/color_profile_rec709" />
+
+        <TextView
+            android:id="@+id/btnSideLog"
+            style="@style/OverlayTextButton"
+            android:layout_marginTop="10dp"
+            android:text="@string/profile_log" />
+
+        <TextView
+            android:id="@+id/btnSideHdr"
+            style="@style/OverlayTextButton"
+            android:layout_marginTop="10dp"
+            android:text="@string/mode_hdr" />
+    </LinearLayout>
+
+    <FrameLayout
+        android:id="@+id/manualContainer"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="0dp"
+        android:layout_marginEnd="0dp"
+        android:layout_marginBottom="4dp"
+        android:visibility="gone"
+        app:layout_constraintBottom_toTopOf="@id/modeGroup"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent" />
+
+    <!-- Floating mode pill: hovers above the control panel with a gap (matches mockup). -->
+    <FrameLayout
+        android:id="@+id/modeGroup"
+        android:layout_width="match_parent"
+        android:layout_height="@dimen/mode_rail_height"
+        android:layout_marginStart="26dp"
+        android:layout_marginEnd="26dp"
+        android:layout_marginBottom="16dp"
+        android:background="@android:color/transparent"
+        app:layout_constraintBottom_toTopOf="@id/bottomBar"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent">
+
+        <!-- Outer selector receives rotary gestures; inner layer animates preset transitions. -->
+        <FrameLayout
+            android:id="@+id/modeRailScroll"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clickable="true"
+            android:focusable="true"
+            tools:ignore="UselessParent">
+
+            <FrameLayout
+                android:id="@+id/modeRailContent"
+                android:layout_width="match_parent"
+                android:layout_height="@dimen/mode_rail_height"
+                android:gravity="center"
+                android:paddingHorizontal="0dp"
+                android:paddingVertical="0dp">
+
+                <TextView
+                    android:id="@+id/btnModeVideoRail"
+                    style="@style/ModeRailText"
+                    android:layout_gravity="center"
+                    android:text="@string/mode_video" />
+
+                <TextView
+                    android:id="@+id/btnModeProRail"
+                    style="@style/ModeRailText"
+                    android:layout_gravity="center"
+                    android:visibility="gone"
+                    android:text="@string/mode_pro" />
+
+                <TextView
+                    android:id="@+id/btnModeHdrScene"
+                    style="@style/ModeRailText"
+                    android:layout_gravity="center"
+                    android:visibility="gone"
+                    android:text="@string/mode_hdr" />
+
+                <TextView
+                    android:id="@+id/btnModeLogVideo"
+                    style="@style/ModeRailText"
+                    android:layout_gravity="center"
+                    android:visibility="gone"
+                    android:text="@string/profile_log" />
+
+                <TextView
+                    android:id="@+id/btnModeRawPreset"
+                    style="@style/ModeRailText"
+                    android:layout_gravity="center"
+                    android:visibility="gone"
+                    android:text="@string/mode_raw" />
+            </FrameLayout>
+        </FrameLayout>
+    </FrameLayout>
+
+    <LinearLayout
+        android:id="@+id/bottomBar"
+        android:layout_width="@dimen/camera_dock_panel_width"
+        android:layout_height="wrap_content"
+        android:background="@drawable/bg_bottom_capture_panel"
+        android:clipChildren="false"
+        android:clipToPadding="false"
+        android:orientation="vertical"
+        android:layout_marginBottom="@dimen/camera_dock_bottom_margin"
+        android:paddingStart="16dp"
+        android:paddingTop="0dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="0dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent">
+
+        <LinearLayout
+            android:id="@+id/captureControlsRow"
+            android:layout_width="match_parent"
+            android:layout_height="@dimen/camera_dock_panel_height"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingTop="9dp"
+            android:paddingBottom="9dp">
+
+            <FrameLayout
+                android:layout_width="@dimen/camera_dock_button"
+                android:layout_height="@dimen/camera_dock_button"
+                android:layout_gravity="center_vertical"
+                android:clipToPadding="false">
+
+                <ImageView
+                    android:id="@+id/btnPhotoCapture"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:background="@drawable/bg_bottom_round_button"
+                    android:contentDescription="@string/capture_photo"
+                    android:padding="@dimen/camera_dock_icon_padding"
+                    android:scaleType="centerInside"
+                    android:src="@drawable/ic_photo_capture" />
+
+            </FrameLayout>
+
+            <Space
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
+
+            <FrameLayout
+                android:id="@+id/btnShutter"
+                android:layout_width="@dimen/shutter_outer_size"
+                android:layout_height="@dimen/shutter_outer_size"
+                android:layout_gravity="center_vertical"
+                android:clickable="true"
+                android:contentDescription="@string/cd_shutter_button"
+                android:focusable="true"
+                android:foregroundGravity="center">
+
+                <!-- Outer shutter ring -->
+                <View
+                    android:id="@+id/shutterOuterRing"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:background="@drawable/bg_shutter_ring_metallic" />
+
+                <!-- Inner shutter ring -->
+                <View
+                    android:id="@+id/shutterInnerRing"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:background="@drawable/bg_shutter_ring_highlight" />
+
+                <View
+                    android:id="@+id/shutterPulseRing"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:layout_gravity="center"
+                    android:alpha="0"
+                    android:background="@drawable/bg_recording_pulse_ring"
+                    android:visibility="gone" />
+
+                <!-- Center shutter button - switches between idle circle and recording stop square -->
+                <View
+                    android:id="@+id/shutterCenter"
+                    android:layout_width="@dimen/shutter_inner_size"
+                    android:layout_height="@dimen/shutter_inner_size"
+                    android:layout_gravity="center"
+                    android:clipToOutline="true"
+                    android:background="@drawable/bg_shutter_button_cinematic"
+                    tools:targetApi="s" />
+            </FrameLayout>
+
+            <Space
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
+
+            <ImageView
+                android:id="@+id/btnModePro"
+                android:layout_width="@dimen/camera_dock_button"
+                android:layout_height="@dimen/camera_dock_button"
+                android:layout_gravity="center_vertical"
+                android:background="@drawable/bg_bottom_round_button"
+                android:contentDescription="@string/cd_settings"
+                android:padding="@dimen/camera_dock_icon_padding"
+                android:src="@drawable/ic_glass_settings" />
+        </LinearLayout>
+
+        <ImageView
+            android:id="@+id/btnGallery"
+            android:layout_width="1dp"
+            android:layout_height="1dp"
+            android:visibility="gone"
+            android:contentDescription="@string/cd_gallery"
+            android:src="@android:drawable/ic_menu_gallery" />
+    </LinearLayout>
+
+</androidx.constraintlayout.widget.ConstraintLayout>

@@ -1,0 +1,230 @@
+#version 450
+
+// NIV99 CFA-aware sensor-linear denoise. The source R16_UINT image is read-only; all corrected
+// samples are written to a separate R32_SFLOAT mosaic for preview/developed pipelines only.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, r16ui) uniform readonly uimage2D rawInput;
+layout(binding = 1, rgba16f) uniform readonly image2D lensShadingMap;
+layout(binding = 2, r8ui) uniform readonly uimage2D persistentDefectMap;
+layout(binding = 3, r32f) uniform writeonly image2D denoisedRawOutput;
+
+struct Niv99TileStatisticsRecord {
+    vec4 meanRggb;
+    vec4 varianceRggb;
+    vec4 confidence;
+    vec4 chroma;
+};
+
+struct Niv99TileControlRecord {
+    vec4 denoise;     // raw, luma, chroma, temporal strengths
+    vec4 protection;  // edge, texture, skin, reconstruction sharpening
+    vec4 thresholds;  // fine, medium, coarse, residual-admission thresholds
+    vec4 illuminant;  // rendering-only local R/G/B gains and confidence
+};
+
+layout(std430, binding = 12) readonly buffer Niv99StatisticsBuffer {
+    Niv99TileStatisticsRecord records[];
+} statisticsInput;
+
+layout(std430, binding = 13) readonly buffer Niv99TileControlBuffer {
+    Niv99TileControlRecord controls[];
+} tileControlInput;
+
+layout(std140, binding = 15) uniform Niv99UniformBlock {
+    ivec4 frameExtent;
+    ivec4 tileAndCfa;
+    uvec4 identityLow;
+    uvec4 identityHigh;
+    uvec4 flags;
+    vec4 blackLevelRggb;
+    vec4 whiteAndThresholds;
+    vec4 shotNoiseRggb;
+    vec4 readNoiseRggb;
+    vec4 whiteBalanceRggb;
+    vec4 colorMatrixRow0;
+    vec4 colorMatrixRow1;
+    vec4 colorMatrixRow2;
+    vec4 motionParameters;
+    vec4 temporalParameters;
+    vec4 reconstructionParameters;
+} uniforms;
+
+const float MIN_RANGE = 1e-6;
+const float MIN_VARIANCE = 1e-12;
+const float MIN_WEIGHT = 1e-8;
+
+int cfaChannel(ivec2 coordinate) {
+    int base = ((coordinate.y & 1) << 1) | (coordinate.x & 1);
+    int pattern = uniforms.tileAndCfa.z;
+    if (pattern < 0 || pattern > 3) return -1;
+    return base ^ pattern;
+}
+
+float channelValue(vec4 value, int channel) {
+    if (channel == 0) return value.x;
+    if (channel == 1) return value.y;
+    if (channel == 2) return value.z;
+    return value.w;
+}
+
+ivec2 clampCoordinate(ivec2 coordinate) {
+    return clamp(coordinate, ivec2(0), uniforms.frameExtent.xy - ivec2(1));
+}
+
+float lensGain(ivec2 coordinate, int channel) {
+    if (uniforms.flags.x == 0u) return 1.0;
+    ivec2 mapSize = imageSize(lensShadingMap);
+    if (mapSize.x <= 0 || mapSize.y <= 0) return 1.0;
+    vec2 frameDenominator = max(vec2(uniforms.frameExtent.xy - ivec2(1)), vec2(1.0));
+    vec2 normalized = clamp(vec2(coordinate) / frameDenominator, vec2(0.0), vec2(1.0));
+    ivec2 mapCoordinate = ivec2(round(normalized * vec2(mapSize - ivec2(1))));
+    return clamp(channelValue(imageLoad(lensShadingMap, mapCoordinate), channel), 0.25, 8.0);
+}
+
+float calibratedSignal(ivec2 unclampedCoordinate, int channel) {
+    ivec2 coordinate = clampCoordinate(unclampedCoordinate);
+    float raw = float(imageLoad(rawInput, coordinate).r);
+    float black = channelValue(uniforms.blackLevelRggb, channel);
+    float range = max(uniforms.whiteAndThresholds.x - black, MIN_RANGE);
+    return clamp((raw - black) / range * lensGain(coordinate, channel), 0.0, 1.0);
+}
+
+float propagatedVariance(ivec2 coordinate, int channel, float signal) {
+    float gain = lensGain(clampCoordinate(coordinate), channel);
+    float shot = channelValue(uniforms.shotNoiseRggb, channel);
+    float read = channelValue(uniforms.readNoiseRggb, channel);
+    return max((shot * max(signal, 0.0) + read) * gain * gain, MIN_VARIANCE);
+}
+
+void compareSwap(inout float a, inout float b) {
+    float lower = min(a, b);
+    float upper = max(a, b);
+    a = lower;
+    b = upper;
+}
+
+float medianFive(float a, float b, float c, float d, float e) {
+    compareSwap(a, b);
+    compareSwap(d, e);
+    compareSwap(a, c);
+    compareSwap(b, c);
+    compareSwap(a, d);
+    compareSwap(c, d);
+    compareSwap(b, e);
+    compareSwap(b, c);
+    compareSwap(d, e);
+    return c;
+}
+
+float robustWeight(float normalizedResidual) {
+    float magnitude = abs(normalizedResidual);
+    if (magnitude >= 4.685) return 0.0;
+    float ratio = magnitude / 4.685;
+    float remaining = 1.0 - ratio * ratio;
+    return remaining * remaining;
+}
+
+uint tileIndexFor(ivec2 coordinate) {
+    ivec2 tileSize = max(uniforms.tileAndCfa.xy, ivec2(1));
+    ivec2 tile = min(coordinate / tileSize, uniforms.frameExtent.zw - ivec2(1));
+    return uint(tile.y * uniforms.frameExtent.z + tile.x);
+}
+
+void main() {
+    ivec2 coordinate = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(coordinate, uniforms.frameExtent.xy))) return;
+    int channel = cfaChannel(coordinate);
+    if (channel < 0) {
+        imageStore(denoisedRawOutput, coordinate, vec4(0.0));
+        return;
+    }
+
+    uint tileIndex = tileIndexFor(coordinate);
+    Niv99TileStatisticsRecord tileStatistics = statisticsInput.records[tileIndex];
+    Niv99TileControlRecord tileControl = tileControlInput.controls[tileIndex];
+    float center = calibratedSignal(coordinate, channel);
+    float left = calibratedSignal(coordinate + ivec2(-2, 0), channel);
+    float right = calibratedSignal(coordinate + ivec2(2, 0), channel);
+    float top = calibratedSignal(coordinate + ivec2(0, -2), channel);
+    float bottom = calibratedSignal(coordinate + ivec2(0, 2), channel);
+    float sameColorMedian = medianFive(center, left, right, top, bottom);
+    float horizontalGradient = abs(right - left) * 0.5;
+    float verticalGradient = abs(bottom - top) * 0.5;
+    float localGradient = max(horizontalGradient, verticalGradient);
+    float centerVariance = propagatedVariance(coordinate, channel, center);
+    float defectThreshold = 8.0 * sqrt(centerVariance) + 1.8 * localGradient + 1e-5;
+    bool persistentDefect = uniforms.flags.w != 0u &&
+        imageLoad(persistentDefectMap, coordinate).r != 0u;
+    bool statisticalDefect = abs(center - sameColorMedian) > defectThreshold;
+    float correctedCenter = (persistentDefect || statisticalDefect) ? sameColorMedian : center;
+
+    // A conservative row/column correction is admitted only in locally flat, statistically reliable
+    // regions. Scene structure therefore cannot be mistaken for fixed-pattern noise.
+    float rowReference = 0.5 * (left + right);
+    float columnReference = 0.5 * (top + bottom);
+    float rowBias = correctedCenter - rowReference;
+    float columnBias = correctedCenter - columnReference;
+    float flatGate = 1.0 - smoothstep(0.004, 0.075, localGradient);
+    float sigma = sqrt(centerVariance);
+    float rowEvidence = smoothstep(2.0, 5.5, abs(rowBias) / max(sigma, 1e-6));
+    float columnEvidence = smoothstep(2.0, 5.5, abs(columnBias) / max(sigma, 1e-6));
+    float correction = 0.20 * flatGate * (
+        rowBias * rowEvidence + columnBias * columnEvidence
+    );
+    correctedCenter = clamp(correctedCenter - correction, 0.0, 1.0);
+
+    float edgeProtection = clamp(tileControl.protection.x, 0.0, 1.0);
+    float textureProtection = clamp(tileControl.protection.y, 0.0, 1.0);
+    float detailGuard = max(edgeProtection, textureProtection);
+    float rawStrength = clamp(tileControl.denoise.x, 0.0, 1.0) *
+        clamp(tileStatistics.confidence.x, 0.0, 1.0) * (1.0 - 0.78 * detailGuard);
+    float rangeSigma = max(
+        sqrt(centerVariance) * mix(1.15, 2.65, rawStrength),
+        tileControl.thresholds.x * 0.35
+    );
+    float orientationX = 1.0 - smoothstep(0.004, 0.10, horizontalGradient);
+    float orientationY = 1.0 - smoothstep(0.004, 0.10, verticalGradient);
+    float weightedSum = correctedCenter;
+    float weightSum = 1.0;
+    float neighbourhoodMin = correctedCenter;
+    float neighbourhoodMax = correctedCenter;
+
+    for (int oy = -2; oy <= 2; ++oy) {
+        for (int ox = -2; ox <= 2; ++ox) {
+            if (ox == 0 && oy == 0) continue;
+            ivec2 offset = ivec2(ox * 2, oy * 2);
+            float sampleValue = calibratedSignal(coordinate + offset, channel);
+            float sampleVariance = propagatedVariance(coordinate + offset, channel, sampleValue);
+            float combinedSigma = sqrt(max(centerVariance + sampleVariance, MIN_VARIANCE));
+            float residual = (sampleValue - correctedCenter) /
+                max(max(combinedSigma, rangeSigma), 1e-6);
+            float distanceSquared = float(ox * ox + oy * oy);
+            float spatialWeight = exp(-0.34 * distanceSquared);
+            float directionalWeight = mix(1.0, orientationX, min(abs(ox), 1)) *
+                mix(1.0, orientationY, min(abs(oy), 1));
+            float weight = spatialWeight * directionalWeight * robustWeight(residual);
+            weightedSum += sampleValue * weight;
+            weightSum += weight;
+            neighbourhoodMin = min(neighbourhoodMin, sampleValue);
+            neighbourhoodMax = max(neighbourhoodMax, sampleValue);
+        }
+    }
+
+    float filtered = weightedSum / max(weightSum, MIN_WEIGHT);
+    float clippingGuard = 1.0 - smoothstep(
+        uniforms.whiteAndThresholds.z * 0.92,
+        1.0,
+        correctedCenter
+    );
+    float shadowPressure = 1.0 - smoothstep(
+        uniforms.whiteAndThresholds.y,
+        uniforms.whiteAndThresholds.y * 4.0,
+        correctedCenter
+    );
+    float effectiveStrength = rawStrength * clippingGuard * mix(0.82, 1.0, shadowPressure);
+    float outputValue = mix(correctedCenter, filtered, effectiveStrength);
+    // Convex neighbourhood clamping prevents pre-demosaic ringing and invented extrema.
+    outputValue = clamp(outputValue, neighbourhoodMin, neighbourhoodMax);
+    imageStore(denoisedRawOutput, coordinate, vec4(outputValue, 0.0, 0.0, 1.0));
+}

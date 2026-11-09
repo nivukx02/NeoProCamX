@@ -1,0 +1,13 @@
+{
+  "lookId": "clean_extreme_detail",
+  "formatVersion": "SINGULARITY_LOOK_1",
+  "displayName": "Clean Extreme Detail",
+  "creativeEffectsOptIn": true,
+  "grainEnabled": false,
+  "halationEnabled": false,
+  "bloomEnabled": false,
+  "anamorphicStreakEnabled": false,
+  "gateWeaveEnabled": false,
+  "vignetteEnabled": false,
+  "identityAtZeroStrength": true
+}

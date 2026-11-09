@@ -1,0 +1,154 @@
+import java.security.MessageDigest
+
+tasks.withType(Test).configureEach {
+    useJUnit()
+    failFast = true
+    maxHeapSize = '2048m'
+    maxParallelForks = 1
+    systemProperty 'java.awt.headless', 'true'
+
+    testLogging {
+        events 'FAILED', 'SKIPPED'
+        exceptionFormat = 'full'
+        showExceptions = true
+        showCauses = true
+        showStackTraces = true
+    }
+
+    reports {
+        junitXml.required = true
+        html.required = true
+    }
+}
+
+tasks.register('qualityGateDebug') {
+    group = 'verification'
+    description = 'Runs the core debug verification gate: Kotlin compile, unit tests, and debug assemble.'
+    dependsOn 'compileDebugKotlin', 'testDebugUnitTest', 'assembleDebug'
+}
+
+tasks.register('qualityGateFast') {
+    group = 'verification'
+    description = 'Runs the fast verification gate: Kotlin compile and unit tests.'
+    dependsOn 'compileDebugKotlin', 'testDebugUnitTest'
+}
+
+tasks.register('verifyDebugVerificationArtifacts') {
+    group = 'verification'
+    description = 'Verifies that debug test reports and distribution artifacts were produced.'
+    dependsOn 'packageFlowDebug'
+    def junitDirProvider = layout.buildDirectory.dir('test-results/testDebugUnitTest')
+    def htmlReportProvider = layout.buildDirectory.file('reports/tests/testDebugUnitTest/index.html')
+    def debugDistDirProvider = layout.buildDirectory.dir('dist/debug')
+    def debugApkProvider = layout.buildDirectory.file('outputs/apk/debug/app-debug.apk')
+
+    doLast {
+        def junitDir = junitDirProvider.get().asFile
+        def junitReports = junitDir.exists() ? junitDir.listFiles(new FilenameFilter() {
+            @Override
+            boolean accept(File dir, String name) {
+                name.endsWith('.xml')
+            }
+        }) : [] as File[]
+        if (!junitReports || junitReports.length == 0) {
+            throw new GradleException("No JUnit XML reports were generated in ${junitDir.absolutePath}")
+        }
+
+        def htmlReport = htmlReportProvider.get().asFile
+        if (!htmlReport.exists()) {
+            throw new GradleException("Missing HTML unit test report at ${htmlReport.absolutePath}")
+        }
+
+        def debugDistDir = debugDistDirProvider.get().asFile
+        def exportedApks = debugDistDir.exists() ? debugDistDir.listFiles(new FilenameFilter() {
+            @Override
+            boolean accept(File dir, String name) {
+                name.endsWith('.apk')
+            }
+        }) : [] as File[]
+        if (!exportedApks || exportedApks.length == 0) {
+            throw new GradleException("No exported debug APK was found in ${debugDistDir.absolutePath}")
+        }
+
+        def checksumFiles = debugDistDir.listFiles(new FilenameFilter() {
+            @Override
+            boolean accept(File dir, String name) {
+                name.endsWith('.apk.sha256')
+            }
+        }) ?: [] as File[]
+        if (checksumFiles.length == 0) {
+            throw new GradleException("No debug APK checksum was found in ${debugDistDir.absolutePath}")
+        }
+
+        def manifestFile = new File(debugDistDir, 'distribution-manifest.json')
+        if (!manifestFile.exists()) {
+            throw new GradleException("Missing distribution manifest at ${manifestFile.absolutePath}")
+        }
+
+        def manifest = new groovy.json.JsonSlurper().parse(manifestFile)
+        def declaredApk = manifest.fileName == null ? null : new File(debugDistDir, manifest.fileName.toString())
+        if (declaredApk == null || !declaredApk.exists()) {
+            throw new GradleException("Distribution manifest references missing APK ${manifest.fileName}")
+        }
+        def declaredChecksum = new File(debugDistDir, "${manifest.fileName}.sha256")
+        if (!declaredChecksum.exists()) {
+            throw new GradleException("Distribution manifest references APK without checksum ${declaredChecksum.absolutePath}")
+        }
+        def currentDebugApk = debugApkProvider.get().asFile
+        if (!currentDebugApk.exists()) {
+            throw new GradleException("Current debug APK is missing at ${currentDebugApk.absolutePath}")
+        }
+        def sha256 = { File file ->
+            def digest = MessageDigest.getInstance('SHA-256')
+            file.withInputStream { stream ->
+                byte[] buffer = new byte[8192]
+                int read
+                while ((read = stream.read(buffer)) != -1) {
+                    digest.update(buffer, 0, read)
+                }
+            }
+            digest.digest().collect { String.format('%02x', it) }.join()
+        }
+        def exportedHash = sha256(declaredApk)
+        def currentHash = sha256(currentDebugApk)
+        def checksumHash = declaredChecksum.text.trim().tokenize(' ')[0]
+        if (exportedHash != currentHash) {
+            throw new GradleException(
+                "Exported debug APK is stale: current=${currentHash} exported=${exportedHash}"
+            )
+        }
+        if (manifest.sha256 != exportedHash || checksumHash != exportedHash) {
+            throw new GradleException(
+                "Debug APK hash mismatch: manifest=${manifest.sha256} checksum=${checksumHash} actual=${exportedHash}"
+            )
+        }
+        if (manifest.fileSizeBytes != declaredApk.length()) {
+            throw new GradleException(
+                "Distribution manifest size ${manifest.fileSizeBytes} does not match APK size ${declaredApk.length()}"
+            )
+        }
+        def metadata = manifest?.metadata
+        def metadataElement = metadata?.elements?.find { it.outputFile != null }
+        if (manifest.applicationId != metadata.applicationId) {
+            throw new GradleException(
+                "Distribution manifest applicationId ${manifest.applicationId} does not match APK metadata ${metadata.applicationId}"
+            )
+        }
+        if (metadataElement != null && manifest.versionName != metadataElement.versionName) {
+            throw new GradleException(
+                "Distribution manifest versionName ${manifest.versionName} does not match APK metadata ${metadataElement.versionName}"
+            )
+        }
+        if (metadataElement != null && manifest.versionCode != metadataElement.versionCode) {
+            throw new GradleException(
+                "Distribution manifest versionCode ${manifest.versionCode} does not match APK metadata ${metadataElement.versionCode}"
+            )
+        }
+    }
+}
+
+tasks.register('qualityGateStrict') {
+    group = 'verification'
+    description = 'Runs the strict verification gate: debug/release Kotlin compile plus debug tests and packaged artifact verification.'
+    dependsOn 'compileDebugKotlin', 'compileReleaseKotlin', 'verifyDebugVerificationArtifacts'
+}

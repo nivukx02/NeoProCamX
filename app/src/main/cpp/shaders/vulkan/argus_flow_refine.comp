@@ -1,0 +1,104 @@
+#version 450
+
+// OmniClarity Engine — §2 Argus Hybrid Optical Flow, Stage B (variational refinement).
+//
+// 100% classical, zero learned weights. One Jacobi iteration of the smoothness-regularized energy
+//   E(u,v) = Sum ( I_prev(x - f) - I_cur(x) )^2 + lambda * ( |grad u|^2 + |grad v|^2 )
+// initialized from the Stage-A block-match field and dispatched K times, ping-ponging uFlowIn ->
+// uFlowOut. Closed-form incremental (warp-based) Horn-Schunck update, derived for the project's
+// forward-flow convention previous(p - f) ~= current(p):
+//
+//   G  = grad(I_prev) at (p - f)          (spatial gradient of the warped previous frame)
+//   r  = I_prev(p - f) - I_cur(p)         (brightness-constancy residual at the current estimate)
+//   f' = fbar + G * ( r + G . (f - fbar) ) / ( alpha^2 + |G|^2 )
+//
+// fbar is an edge-aware neighbour average (anisotropic smoothness) so motion boundaries are kept
+// sharp instead of being blurred across luma edges.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly uniform highp image2D uCurrentFrame;
+layout(binding = 1, rgba16f) readonly uniform highp image2D uPreviousFrame;
+layout(binding = 2, rg16f) readonly uniform highp image2D uFlowIn;
+layout(binding = 3, rg16f) writeonly uniform highp image2D uFlowOut;
+
+layout(push_constant) uniform ArgusRefineParams {
+    float regularization; // alpha^2 (lambda): larger => smoother flow
+    float maxFlow;        // clamp on |flow|, px
+    float previousValid;  // 0 => emit zero flow
+    float edgeStopSigma;  // anisotropic smoothness: down-weights smoothing across luma edges
+} uParams;
+
+float lumaOf(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+ivec2 clampCoord(ivec2 c, ivec2 s) {
+    return clamp(c, ivec2(0), s - ivec2(1));
+}
+
+float currentLuma(ivec2 c, ivec2 s) {
+    return lumaOf(imageLoad(uCurrentFrame, clampCoord(c, s)).rgb);
+}
+
+float previousLumaBilinear(vec2 c, ivec2 s) {
+    ivec2 b = ivec2(floor(c));
+    vec2 f = fract(c);
+    float a = lumaOf(imageLoad(uPreviousFrame, clampCoord(b, s)).rgb);
+    float bx = lumaOf(imageLoad(uPreviousFrame, clampCoord(b + ivec2(1, 0), s)).rgb);
+    float cy = lumaOf(imageLoad(uPreviousFrame, clampCoord(b + ivec2(0, 1), s)).rgb);
+    float d = lumaOf(imageLoad(uPreviousFrame, clampCoord(b + ivec2(1, 1), s)).rgb);
+    return mix(mix(a, bx, f.x), mix(cy, d, f.x), f.y);
+}
+
+vec2 flowAt(ivec2 c, ivec2 s) {
+    return imageLoad(uFlowIn, clampCoord(c, s)).rg;
+}
+
+void main() {
+    ivec2 s = imageSize(uFlowOut);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= s.x || p.y >= s.y) {
+        return;
+    }
+    if (uParams.previousValid < 0.5) {
+        imageStore(uFlowOut, p, vec4(0.0));
+        return;
+    }
+
+    vec2 f = flowAt(p, s);
+
+    // Edge-aware neighbour average for the smoothness term (anisotropic: weak across luma edges).
+    float centerLuma = currentLuma(p, s);
+    ivec2 offsets[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+    vec2 weightedFlow = vec2(0.0);
+    float weightSum = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        ivec2 q = p + offsets[i];
+        float dl = currentLuma(q, s) - centerLuma;
+        float w = exp(-(dl * dl) / max(uParams.edgeStopSigma, 1e-4));
+        weightedFlow += flowAt(q, s) * w;
+        weightSum += w;
+    }
+    vec2 fbar = weightSum > 1e-5 ? weightedFlow / weightSum : f;
+
+    // Brightness-constancy residual and spatial gradient of the warped previous frame.
+    vec2 src = vec2(p) - f;
+    float warped = previousLumaBilinear(src, s);
+    float residual = warped - centerLuma;
+    float gx = 0.5 * (previousLumaBilinear(src + vec2(1.0, 0.0), s) - previousLumaBilinear(src - vec2(1.0, 0.0), s));
+    float gy = 0.5 * (previousLumaBilinear(src + vec2(0.0, 1.0), s) - previousLumaBilinear(src - vec2(0.0, 1.0), s));
+    vec2 grad = vec2(gx, gy);
+
+    // Closed-form incremental Horn-Schunck Jacobi step (Sherman-Morrison of (alpha^2 I + G G^T)).
+    float numerator = residual + dot(grad, f - fbar);
+    float denom = uParams.regularization + dot(grad, grad) + 1e-6;
+    vec2 refined = fbar + grad * (numerator / denom);
+
+    float mag = length(refined);
+    if (mag > uParams.maxFlow && mag > 1e-5) {
+        refined *= uParams.maxFlow / mag;
+    }
+
+    imageStore(uFlowOut, p, vec4(refined, 0.0, 0.0));
+}

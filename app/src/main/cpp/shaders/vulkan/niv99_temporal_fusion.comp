@@ -1,0 +1,182 @@
+#version 450
+
+// NIV99 variance-weighted temporal fusion. History is warped with the same forward-flow convention
+// used by the confidence pass, clipped to a noise-expanded current-frame neighbourhood, and rejected
+// on scene cuts, inconsistency, occlusion, or large robust residuals.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 4, rgba16f) uniform readonly image2D currentLinearInput;
+layout(binding = 5, rgba16f) uniform readonly image2D historyLinearInput;
+layout(binding = 6, rg16f) uniform readonly image2D forwardFlowInput;
+layout(binding = 9, rgba16f) uniform readonly image2D motionConfidenceInput;
+layout(binding = 10, rgba16f) uniform writeonly image2D temporalOutput;
+
+struct Niv99TileControlRecord {
+    vec4 denoise;
+    vec4 protection;
+    vec4 thresholds;
+    vec4 illuminant;
+};
+
+layout(std430, binding = 13) readonly buffer Niv99TileControlBuffer {
+    Niv99TileControlRecord controls[];
+} tileControlInput;
+
+layout(std140, binding = 15) uniform Niv99UniformBlock {
+    ivec4 frameExtent;
+    ivec4 tileAndCfa;
+    uvec4 identityLow;
+    uvec4 identityHigh;
+    uvec4 flags;
+    vec4 blackLevelRggb;
+    vec4 whiteAndThresholds;
+    vec4 shotNoiseRggb;
+    vec4 readNoiseRggb;
+    vec4 whiteBalanceRggb;
+    vec4 colorMatrixRow0;
+    vec4 colorMatrixRow1;
+    vec4 colorMatrixRow2;
+    vec4 motionParameters;
+    vec4 temporalParameters;
+    vec4 reconstructionParameters;
+} uniforms;
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+const float MIN_VARIANCE = 1e-10;
+
+ivec2 clampCoordinate(ivec2 coordinate) {
+    return clamp(coordinate, ivec2(0), uniforms.frameExtent.xy - ivec2(1));
+}
+
+vec4 loadHistoryBilinear(vec2 coordinate) {
+    vec2 bounded = clamp(coordinate, vec2(0.0), vec2(uniforms.frameExtent.xy - ivec2(1)));
+    ivec2 base = ivec2(floor(bounded));
+    ivec2 next = min(base + ivec2(1), uniforms.frameExtent.xy - ivec2(1));
+    vec2 blend = fract(bounded);
+    vec4 upper = mix(imageLoad(historyLinearInput, base),
+        imageLoad(historyLinearInput, ivec2(next.x, base.y)), blend.x);
+    vec4 lower = mix(imageLoad(historyLinearInput, ivec2(base.x, next.y)),
+        imageLoad(historyLinearInput, next), blend.x);
+    return mix(upper, lower, blend.y);
+}
+
+uint tileIndexFor(ivec2 coordinate) {
+    ivec2 tileSize = max(uniforms.tileAndCfa.xy, ivec2(1));
+    ivec2 tile = min(coordinate / tileSize, uniforms.frameExtent.zw - ivec2(1));
+    return uint(tile.y * uniforms.frameExtent.z + tile.x);
+}
+
+vec3 propagatedOutputVariance(vec3 signal) {
+    vec3 rawVariance = vec3(
+        uniforms.shotNoiseRggb.x * signal.r + uniforms.readNoiseRggb.x,
+        0.5 * ((uniforms.shotNoiseRggb.y + uniforms.shotNoiseRggb.z) * signal.g +
+            uniforms.readNoiseRggb.y + uniforms.readNoiseRggb.z),
+        uniforms.shotNoiseRggb.w * signal.b + uniforms.readNoiseRggb.w
+    );
+    vec3 gains = vec3(
+        uniforms.whiteBalanceRggb.x,
+        0.5 * (uniforms.whiteBalanceRggb.y + uniforms.whiteBalanceRggb.z),
+        uniforms.whiteBalanceRggb.w
+    );
+    vec3 scaledVariance = max(rawVariance, vec3(0.0)) * gains * gains;
+    vec3 row0 = uniforms.colorMatrixRow0.xyz;
+    vec3 row1 = uniforms.colorMatrixRow1.xyz;
+    vec3 row2 = uniforms.colorMatrixRow2.xyz;
+    return max(vec3(
+        dot(row0 * row0, scaledVariance),
+        dot(row1 * row1, scaledVariance),
+        dot(row2 * row2, scaledVariance)
+    ), vec3(MIN_VARIANCE));
+}
+
+void currentNeighbourhood(ivec2 coordinate, out vec3 minimumValue, out vec3 maximumValue) {
+    minimumValue = vec3(1e20);
+    maximumValue = vec3(-1e20);
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            vec3 value = max(imageLoad(currentLinearInput,
+                clampCoordinate(coordinate + ivec2(x, y))).rgb, vec3(0.0));
+            minimumValue = min(minimumValue, value);
+            maximumValue = max(maximumValue, value);
+        }
+    }
+}
+
+vec3 toOpponent(vec3 rgb) {
+    float y = dot(rgb, LUMA);
+    return vec3(y, rgb.r - rgb.g, rgb.b - rgb.g);
+}
+
+vec3 fromOpponent(vec3 opponent) {
+    float green = opponent.x - LUMA.r * opponent.y - LUMA.b * opponent.z;
+    return vec3(green + opponent.y, green, green + opponent.z);
+}
+
+void main() {
+    ivec2 coordinate = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(coordinate, uniforms.frameExtent.xy))) return;
+    vec4 currentSample = imageLoad(currentLinearInput, coordinate);
+    vec3 current = max(currentSample.rgb, vec3(0.0));
+    if (uniforms.flags.y == 0u || uniforms.flags.z != 0u) {
+        imageStore(temporalOutput, coordinate, vec4(current, currentSample.a));
+        return;
+    }
+
+    float scanline = (float(coordinate.y) + 0.5) / max(float(uniforms.frameExtent.y), 1.0) - 0.5;
+    vec2 flow = imageLoad(forwardFlowInput, coordinate).xy * uniforms.motionParameters.w;
+    flow += uniforms.motionParameters.xy * scanline;
+    flow.x += uniforms.motionParameters.z * scanline;
+    vec2 historyCoordinate = vec2(coordinate) + flow;
+    vec2 upper = vec2(uniforms.frameExtent.xy - ivec2(1));
+    if (any(lessThan(historyCoordinate, vec2(0.0))) || any(greaterThan(historyCoordinate, upper))) {
+        imageStore(temporalOutput, coordinate, vec4(current, currentSample.a));
+        return;
+    }
+
+    vec4 motion = imageLoad(motionConfidenceInput, coordinate);
+    uint tileIndex = tileIndexFor(coordinate);
+    Niv99TileControlRecord control = tileControlInput.controls[tileIndex];
+    vec3 history = max(loadHistoryBilinear(historyCoordinate).rgb, vec3(0.0));
+    vec3 variance = propagatedOutputVariance(max(current, history));
+    vec3 sigma = sqrt(variance);
+    vec3 neighbourhoodMin;
+    vec3 neighbourhoodMax;
+    currentNeighbourhood(coordinate, neighbourhoodMin, neighbourhoodMax);
+    vec3 clampAllowance = sigma * mix(1.5, 3.0, clamp(motion.x, 0.0, 1.0));
+    vec3 clampedHistory = clamp(history, neighbourhoodMin - clampAllowance,
+        neighbourhoodMax + clampAllowance);
+
+    vec3 normalizedResidual = abs(clampedHistory - current) /
+        max(sigma * max(uniforms.temporalParameters.w, 0.5), vec3(1e-5));
+    float robustResidual = max(normalizedResidual.r,
+        max(normalizedResidual.g, normalizedResidual.b));
+    float residualGate = 1.0 - smoothstep(
+        max(control.thresholds.w, 1.5),
+        max(control.thresholds.w * 2.0, 4.5),
+        robustResidual
+    );
+    float motionGate = 1.0 - smoothstep(0.002, 0.08, motion.w);
+    float historyWeight = clamp(uniforms.temporalParameters.x, 0.0, 8.0);
+    float temporalStrength = clamp(uniforms.temporalParameters.y, 0.0, 1.0) *
+        clamp(control.denoise.w, 0.0, 1.0);
+    float commonWeight = historyWeight * temporalStrength * clamp(motion.x, 0.0, 1.0) *
+        clamp(motion.y, 0.0, 1.0) * residualGate * mix(0.72, 1.0, motionGate);
+    float lumaWeight = min(commonWeight, 0.82);
+    float chromaWeight = min(
+        commonWeight * mix(1.0, 1.35, clamp(uniforms.temporalParameters.z, 0.0, 1.0)),
+        mix(0.88, 0.72, clamp(control.protection.z, 0.0, 1.0))
+    );
+
+    vec3 currentOpponent = toOpponent(current);
+    vec3 historyOpponent = toOpponent(clampedHistory);
+    vec3 fusedOpponent = vec3(
+        mix(currentOpponent.x, historyOpponent.x, lumaWeight),
+        mix(currentOpponent.y, historyOpponent.y, chromaWeight),
+        mix(currentOpponent.z, historyOpponent.z, chromaWeight)
+    );
+    vec3 fused = max(fromOpponent(fusedOpponent), vec3(0.0));
+    // The output remains within a noise-expanded current neighbourhood, preventing persistent trails
+    // without flattening legitimate sub-noise temporal improvements.
+    fused = clamp(fused, neighbourhoodMin - 2.0 * sigma, neighbourhoodMax + 2.0 * sigma);
+    imageStore(temporalOutput, coordinate, vec4(fused, currentSample.a));
+}

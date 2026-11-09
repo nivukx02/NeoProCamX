@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <external-files-path name="camx_captures" path="DCIM/CamX/" />
+    <external-files-path name="camx_videos" path="Movies/CamX/" />
+    <external-cache-path name="camx_cache" path="." />
+    <files-path name="camx_npv10_masters" path="CamXNPV10/" />
+    <files-path name="camx_npv10_legacy_masters" path="npv10_masters/" />
+    <files-path name="camx_develop_sdr" path="CamXDevelopSDR/" />
+    <files-path name="camx_develop_ndr" path="CamXDevelopNDR/" />
+</paths>

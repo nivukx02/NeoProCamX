@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 2,
+  "name": "bounded-feature-extraction",
+  "sourceRoots": ["app/src/main/java", "app/src/main/cpp", "app/src/test/java"],
+  "sourceExtensions": [".kt", ".java", ".cpp", ".c", ".h", ".hpp"],
+  "excludedPathRegex": "(^|/)generated/",
+  "allowedFiles": [
+    "app/src/main/java/example/OversizedFacade.kt",
+    "app/src/main/java/example/ExtractedCoordinator.kt",
+    "app/src/test/java/example/ExtractedCoordinatorContractTest.kt"
+  ],
+  "protectedFiles": [
+    "app/src/main/java/example/QualityCriticalEncoder.kt"
+  ],
+  "transactionLimits": {
+    "maximumChangedFiles": 3,
+    "maximumAddedFiles": 2,
+    "maximumRemovedFiles": 0
+  },
+  "reductionBudgets": [
+    {
+      "hostFile": "app/src/main/java/example/OversizedFacade.kt",
+      "minimumHostLineReduction": 20,
+      "extractedFiles": ["app/src/main/java/example/ExtractedCoordinator.kt"],
+      "maximumExtractedFileLines": 160
+    }
+  ],
+  "lineRatchets": [
+    {"file": "app/src/main/java/example/OversizedFacade.kt", "maximumLines": 1000}
+  ],
+  "requiredContracts": [
+    {"file": "app/src/main/java/example/OversizedFacade.kt", "patterns": ["coordinator\\.start\\(\\)"]}
+  ],
+  "forbiddenContracts": [
+    {"file": "app/src/main/java/example/ExtractedCoordinator.kt", "patterns": ["MediaCodec", "8.bit"]}
+  ],
+  "preflightGates": [
+    {"name": "baseline", "executable": "gradlew.bat", "arguments": [":app:testDebugUnitTest", "--console=plain"]}
+  ],
+  "gates": [
+    {"name": "tests", "executable": "gradlew.bat", "arguments": [":app:testDebugUnitTest", "--console=plain"]},
+    {"name": "apk", "executable": "gradlew.bat", "arguments": [":app:assembleDebug", "--console=plain"]},
+    {"name": "lint", "executable": "gradlew.bat", "arguments": [":app:lintDebug", "--console=plain"]}
+  ]
+}

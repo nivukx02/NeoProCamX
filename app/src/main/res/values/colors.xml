@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Flagship Theme -->
+    <color name="pure_black">#000000</color>
+    <color name="glass_bg">#CC0A0A0A</color>
+    <color name="divider_subtle">#1A1A1A</color>
+    <color name="surface_base">#E60A0E12</color>
+    <color name="surface_raised">#EF10161C</color>
+    <color name="surface_high">#F2141A21</color>
+    <color name="surface_scrim">#A8000000</color>
+    <color name="surface_glass">#B8141B22</color>
+    <color name="outline_soft">#1FFFFFFF</color>
+    <color name="outline_strong">#33FFFFFF</color>
+    <color name="text_primary_strong">#FFF4F7FA</color>
+    <color name="text_secondary_strong">#B8E0E8EF</color>
+    <color name="text_tertiary">#80E0E8EF</color>
+
+    <!-- Accents -->
+    <color name="accent_violet">#FFB46CFF</color>
+    <color name="accent_violet_bright">#FFD2A9FF</color>
+    <color name="accent_violet_deep">#FF702FD6</color>
+    <color name="accent_violet_glow">#80B46CFF</color>
+    <!-- Legacy resource name retained for binary/source compatibility; the product accent is violet. -->
+    <color name="accent_yellow">#FFB46CFF</color>
+    <color name="accent_blue">#FF7AD3FF</color>   <!-- AI & Tracking -->
+    <color name="accent_red">#FFFF4A4A</color>    <!-- Recording -->
+    <color name="accent_mint">#FF96F0D1</color>
+
+    <!-- Liquid Glass UI (frosted control surfaces, iOS-18-style) -->
+    <color name="glass_flat_surface">#58FFFFFF</color>
+    <color name="glass_flat_button">#60FFFFFF</color>
+    <color name="glass_border">#94FFFFFF</color>
+    <color name="glass_button_pressed">#70FFFFFF</color>
+    <color name="glass_shutter_outer">#70FFFFFF</color>
+    <color name="glass_shutter_center_top">#5AFFFFFF</color>
+    <color name="glass_shutter_center_bottom">#34FFFFFF</color>
+
+    <!-- Typography -->
+    <color name="text_primary">#FFFFFF</color>
+    <color name="text_secondary">#99FFFFFF</color>
+    <color name="text_disabled">#4DFFFFFF</color>
+    <color name="launcher_bg">#000000</color>
+
+    <!-- Legacy / App Defaults -->
+    <color name="npc_bg_black">#000000</color>
+    <color name="npc_accent_focus_yellow">#FFB46CFF</color>
+    <color name="npc_accent_record_red">#FFFF3030</color>
+    <color name="npc_accent_tracking_blue">#FF76C7FF</color>
+</resources>

@@ -1,0 +1,75 @@
+#version 450
+
+// Recording-time RAW/NDR preview transport.
+//
+// The full-resolution cinema demosaic remains the immutable recording master. This pass derives a
+// preview-resolution, scene-linear ACEScg image in the SAME Vulkan command/fence as demosaic, so EGL
+// preview work can run later on an independent transport ring without delaying encoder ownership.
+// The ratio-aware four-footprint filter matches the established project-owned NDR preview simulation:
+// four bilinear footprints (16 contributing texels) suppress minification alias/wavy texture.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) uniform readonly image2D uAcesCgInput;
+layout(binding = 1, rgba16f) uniform writeonly image2D uPreviewOutput;
+
+layout(push_constant) uniform RawPreviewDownsampleParams {
+    ivec4 extents; // inputWidth, inputHeight, outputWidth, outputHeight
+} params;
+
+vec4 sampleBilinear(vec2 sourcePosition, ivec2 inputSize) {
+    vec2 clampedPosition = clamp(
+        sourcePosition, vec2(0.0), vec2(inputSize - ivec2(1)));
+    ivec2 p0 = ivec2(floor(clampedPosition));
+    vec2 fractionValue = fract(clampedPosition);
+    ivec2 p1 = min(p0 + ivec2(1), inputSize - ivec2(1));
+
+    vec4 top = mix(
+        imageLoad(uAcesCgInput, ivec2(p0.x, p0.y)),
+        imageLoad(uAcesCgInput, ivec2(p1.x, p0.y)),
+        fractionValue.x
+    );
+    vec4 bottom = mix(
+        imageLoad(uAcesCgInput, ivec2(p0.x, p1.y)),
+        imageLoad(uAcesCgInput, ivec2(p1.x, p1.y)),
+        fractionValue.x
+    );
+    return mix(top, bottom, fractionValue.y);
+}
+
+vec4 sampleInput(ivec2 destinationPixel) {
+    ivec2 inputSize = params.extents.xy;
+    ivec2 outputSize = params.extents.zw;
+    if (all(equal(inputSize, outputSize))) {
+        return imageLoad(uAcesCgInput, destinationPixel);
+    }
+
+    vec2 downsampleScale = vec2(inputSize) / vec2(outputSize);
+    vec2 sourceCenter = (vec2(destinationPixel) + vec2(0.5)) *
+        downsampleScale - vec2(0.5);
+    // Ratio-aware source-footprint quadrature: two sample centres per axis at +/- scale/4.
+    // Each centre is bilinear (4 texels), giving 4 bilinear samples / 16 contributing texels. For a
+    // 3.2x reduction the axis response's first zero matches the 3.2-pixel box-footprint first zero.
+    vec2 footprintOffset = vec2(
+        downsampleScale.x > 1.0 ? downsampleScale.x * 0.25 : 0.0,
+        downsampleScale.y > 1.0 ? downsampleScale.y * 0.25 : 0.0
+    );
+    vec4 sample00 = sampleBilinear(
+        sourceCenter + vec2(-footprintOffset.x, -footprintOffset.y), inputSize);
+    vec4 sample10 = sampleBilinear(
+        sourceCenter + vec2( footprintOffset.x, -footprintOffset.y), inputSize);
+    vec4 sample01 = sampleBilinear(
+        sourceCenter + vec2(-footprintOffset.x,  footprintOffset.y), inputSize);
+    vec4 sample11 = sampleBilinear(
+        sourceCenter + vec2( footprintOffset.x,  footprintOffset.y), inputSize);
+    return 0.25 * (sample00 + sample10 + sample01 + sample11);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 outputSize = params.extents.zw;
+    if (any(greaterThanEqual(pixel, outputSize))) return;
+
+    vec4 sceneLinear = sampleInput(pixel);
+    imageStore(uPreviewOutput, pixel, vec4(max(sceneLinear.rgb, vec3(0.0)), 1.0));
+}

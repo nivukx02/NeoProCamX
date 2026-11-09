@@ -1,0 +1,152 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Ingest up to 8 RAW frames (Bayer format) as a 2D Texture Array
+layout(binding = 0) uniform sampler2DArray inputRawFrames;
+
+// 1/4 res optical flow vector field (X, Y offsets in pixels per frame index)
+layout(binding = 1) uniform sampler2D opticalFlowOffsets;
+
+// Output merged and demosaiced linear RGB frame
+layout(binding = 2, rgba16f) uniform writeonly image2D outputLinearRGB;
+
+layout(push_constant) uniform PushConstants {
+    int activeFrameCount; // Typically 4 to 8
+    float noiseS;         // Shot noise coefficient
+    float noiseO;         // Read noise coefficient
+    float gyroOffsetScale;// Scales gyro sensor shifts
+} pcs;
+
+// Gaussian weight utility
+float gaussian(float x, float sigma) {
+    return exp(-(x * x) / (2.0 * sigma * sigma));
+}
+
+// Compute the structure tensor (Hessian of gradients) to obtain the steering kernel metric
+mat2 computeSteeringKernel(ivec2 pos) {
+    // Read local 3x3 gradients from the reference frame (Index 0)
+    float gX = 0.0;
+    float gY = 0.0;
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            vec2 uv = (vec2(pos + ivec2(dx, dy)) + vec2(0.5)) / vec2(textureSize(inputRawFrames, 0).xy);
+            float luma = texture(inputRawFrames, vec3(uv, 0.0)).r;
+            
+            gX += luma * float(dx);
+            gY += luma * float(dy);
+        }
+    }
+
+    // Gradient covariance matrix (Structure Tensor)
+    float jXX = gX * gX;
+    float jYY = gY * gY;
+    float jXY = gX * gY;
+
+    // Eigenvalue decomposition to find dominant edge orientation
+    float trace = jXX + jYY;
+    float det = jXX * jYY - jXY * jXY;
+    float diff = sqrt(trace * trace - 4.0 * det + 1e-6);
+
+    float l1 = 0.5 * (trace + diff); // Major eigenvalue
+    float l2 = 0.5 * (trace - diff); // Minor eigenvalue
+
+    // Avoid division by zero in flat regions
+    l1 = max(l1, 1e-4);
+    l2 = max(l2, 1e-4);
+
+    // Compute dominant orientation vector
+    vec2 v1 = vec2(jXY, l1 - jXX);
+    if (length(v1) < 1e-4) {
+        v1 = vec2(1.0, 0.0);
+    } else {
+        v1 = normalize(v1);
+    }
+    vec2 v2 = vec2(-v1.y, v1.x);
+
+    // Anisotropic scaling matrix C = U * S * U^T
+    // We stretch the kernel along v2 (the edge direction, where gradient is minimal)
+    float alpha = 2.0; // Anisotropic ratio multiplier
+    float s1 = 1.0 / (alpha * l1);
+    float s2 = alpha / l2;
+
+    mat2 U = mat2(v1, v2);
+    mat2 S = mat2(s1, 0.0, 0.0, s2);
+    mat2 C = U * S * transpose(U);
+
+    return C;
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outputLinearRGB);
+    if (pos.x >= size.x || pos.y >= size.y) return;
+
+    vec2 texSize = vec2(textureSize(inputRawFrames, 0).xy);
+
+    // Reference luma/variance calculation (Heteroscedastic sensor noise model)
+    vec2 refUV = (vec2(pos) + vec2(0.5)) / texSize;
+    float refRaw = texture(inputRawFrames, vec3(refUV, 0.0)).r;
+    float noiseVariance = pcs.noiseS * refRaw + pcs.noiseO;
+    float sigmaThresh = 3.0 * sqrt(noiseVariance);
+
+    // Compute localized anisotropic steering matrix
+    mat2 C = computeSteeringKernel(pos);
+
+    vec3 accumulatedRGB = vec3(0.0);
+    float sumWeights = 0.0;
+
+    // Align and blend multiple frames in the linear scene domain
+    for (int f = 0; f < pcs.activeFrameCount; ++f) {
+        // Read low-res optical flow offset vector for this frame
+        vec2 flow = texture(opticalFlowOffsets, refUV).xy;
+
+        // Total sub-pixel shift = optical flow + gyro integration shift
+        vec2 totalShift = flow; 
+
+        // Target sample coordinate
+        vec2 sampleUV = refUV + (totalShift / texSize);
+        float sampleRaw = texture(inputRawFrames, vec3(sampleUV, float(f))).r;
+
+        // 1. GHOST VETO MASK: Rejection check for temporal moving outliers
+        float delta = abs(sampleRaw - refRaw);
+        if (f > 0 && delta > sigmaThresh) {
+            continue; // Skip outlier pixel to avoid ghosting artifacts
+        }
+
+        // 2. Anisotropic Kernel Regression Weight
+        vec2 d = (sampleUV - refUV) * texSize;
+        float distMetric = dot(d, C * d); // Mahalanobis distance using Steering Tensor
+        float weight = exp(-0.5 * distMetric);
+
+        // Map Bayer channel to RGB (demosaicing step during fusion)
+        // Bayer arrangement: 2x2 pattern (Red, Green_Even, Green_Odd, Blue)
+        int patternX = int(gl_GlobalInvocationID.x) % 2;
+        int patternY = int(gl_GlobalInvocationID.y) % 2;
+
+        vec3 colorSample = vec3(0.0);
+        if (patternY == 0) {
+            if (patternX == 0) {
+                // R channel
+                colorSample = vec3(sampleRaw, 0.0, 0.0);
+            } else {
+                // Gr channel
+                colorSample = vec3(0.0, sampleRaw, 0.0);
+            }
+        } else {
+            if (patternX == 0) {
+                // Gb channel
+                colorSample = vec3(0.0, sampleRaw, 0.0);
+            } else {
+                // B channel
+                colorSample = vec3(0.0, 0.0, sampleRaw);
+            }
+        }
+
+        accumulatedRGB += colorSample * weight;
+        sumWeights += weight;
+    }
+
+    vec3 finalLinearRGB = sumWeights > 0.0 ? (accumulatedRGB / sumWeights) : vec3(refRaw);
+    imageStore(outputLinearRGB, pos, vec4(finalLinearRGB, 1.0));
+}

@@ -1,0 +1,88 @@
+--------- beginning of crash
+04-22 22:45:46.820  9187  9272 F libc    : Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x6c64f91030 in tid 9272 (CamBg), pid 9187 (roc.neoproccamx)
+04-22 22:45:49.375 10010 10010 F DEBUG   : Softversion: PD2453IF_EX_A_16.1.16.0.W30.V000L1
+04-22 22:45:49.375 10010 10010 F DEBUG   : Time: 2026-04-22 22:45:49
+04-22 22:45:49.375 10010 10010 F DEBUG   : *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***
+04-22 22:45:49.375 10010 10010 F DEBUG   : Build fingerprint: 'iQOO/I2405i/I2405:16/BP2A.250605.031.A3_V000L1/compiler260408175307:user/release-keys'
+04-22 22:45:49.375 10010 10010 F DEBUG   : Revision: '0'
+04-22 22:45:49.375 10010 10010 F DEBUG   : ABI: 'arm64'
+04-22 22:45:49.375 10010 10010 F DEBUG   : Timestamp: 2026-04-22 22:45:48.583309191+0530
+04-22 22:45:49.375 10010 10010 F DEBUG   : Process uptime: 37s
+04-22 22:45:49.375 10010 10010 F DEBUG   : Cmdline: com.neoproc.neoproccamx
+04-22 22:45:49.375 10010 10010 F DEBUG   : pid: 9187, tid: 9272, name: CamBg  >>> com.neoproc.neoproccamx <<<
+04-22 22:45:49.375 10010 10010 F DEBUG   : uid: 10141
+04-22 22:45:49.375 10010 10010 F DEBUG   : tagged_addr_ctrl: 0000000000000001 (PR_TAGGED_ADDR_ENABLE)
+04-22 22:45:49.375 10010 10010 F DEBUG   : pac_enabled_keys: 000000000000000f (PR_PAC_APIAKEY, PR_PAC_APIBKEY, PR_PAC_APDAKEY, PR_PAC_APDBKEY)
+04-22 22:45:49.375 10010 10010 F DEBUG   : signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0000006c64f91030
+04-22 22:45:49.375 10010 10010 F DEBUG   :     x0  000000004c61400c  x1  0000006c64f90fc0  x2  00000000000eefb0  x3  000000004c7c7fcc
+04-22 22:45:49.375 10010 10010 F DEBUG   :     x4  0000006c65080000  x5  000000004c8b700c  x6  0000006c64ddd000  x7  0000000000000000
+04-22 22:45:49.375 10010 10010 F DEBUG   :     x8  000000004c614000  x9  4e85d884e5280873  x10 0000000070550280  x11 0000000000000000
+04-22 22:45:49.375 10010 10010 F DEBUG   :     x12 000000702daaac28  x13 000000702daaac78  x14 0000000000000000  x15 000000004c614000
+04-22 22:45:49.375 10010 10010 F DEBUG   :     x16 000000702e230d98  x17 00000072f151d540  x18 0000006f838a8000  x19 00000000002a3000
+04-22 22:45:49.375 10010 10010 F DEBUG   :     x20 0000006c64ddd000  x21 0000000000000000  x22 b4000071c27ff2d0  x23 b4000071c27ff2d0
+04-22 22:45:49.375 10010 10010 F DEBUG   :     x24 0000000000000002  x25 0000006f84788740  x26 b4000071a2812780  x27 00000000002a3000
+04-22 22:45:49.375 10010 10010 F DEBUG   :     x28 0000006f84788740  x29 0000006f84785bd0
+04-22 22:45:49.375 10010 10010 F DEBUG   :     lr  000000702dceb08c  sp  0000006f84785b80  pc  00000072f151d65c  pst 0000000020001000
+04-22 22:45:49.375 10010 10010 F DEBUG   : 61 total frames
+04-22 22:45:49.375 10010 10010 F DEBUG   : backtrace:
+04-22 22:45:49.375 10010 10010 F DEBUG   :       #00 pc 00000000000b465c  /apex/com.android.runtime/lib64/bionic/libc.so (__memcpy_aarch64_simd+284) (BuildId: d791ec771dcf8ff35203892b98bc3c9c)
+04-22 22:45:49.375 10010 10010 F DEBUG   :       #01 pc 00000000004eb088  /apex/com.android.art/lib64/libart.so (void art::JNI<true>::SetPrimitiveArrayRegion<_jbyteArray*, signed char, art::mirror::PrimitiveArray<signed char>>(_JNIEnv*, _jbyteArray*, int, int, signed char const*)+196) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.375 10010 10010 F DEBUG   :       #02 pc 0000000000328068  /apex/com.android.art/lib64/libart.so (art::(anonymous namespace)::CheckJNI::SetPrimitiveArrayRegion(char const*, art::Primitive::Type, _JNIEnv*, _jarray*, int, int, void const*) (.__uniq.99033978352804627313491551960229047428)+296) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #03 pc 0000000000757f9c  [anon_shmem:dalvik-jit-code-cache] (offset 0x2000000) (art_jni_trampoline+140)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #04 pc 00000000000ce89c  [anon_shmem:dalvik-jit-code-cache] (offset 0x2000000) (java.nio.DirectByteBuffer.get+364)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #05 pc 00000000000ce674  [anon_shmem:dalvik-jit-code-cache] (offset 0x2000000) (java.nio.ByteBuffer.get+132)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #06 pc 00000000002aad94  /apex/com.android.art/lib64/libart.so (art_quick_invoke_stub+612) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #07 pc 0000000000586548  /apex/com.android.art/lib64/libart.so (bool art::interpreter::DoCall<false>(art::ArtMethod*, art::Thread*, art::ShadowFrame&, art::Instruction const*, unsigned short, bool, art::JValue*)+2688) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #08 pc 0000000000490f5c  /apex/com.android.art/lib64/libart.so (void art::interpreter::ExecuteSwitchImplCpp<false>(art::interpreter::SwitchImplContext*)+1484) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #09 pc 00000000003d12b8  /apex/com.android.art/lib64/libart.so (ExecuteSwitchImplAsm+8) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #10 pc 0000000000d07768  /data/app/~~c_o_eJHjALZbcAjzheQpeg==/com.neoproc.neoproccamx-0O6ZOlhSy7a6xwXl0cT0Cw==/oat/arm64/base.vdex (com.neoproc.neoproccamx.ai.Yuv420ImageTools.copyPlaneBytes+0)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #11 pc 00000000003d0f18  /apex/com.android.art/lib64/libart.so (art::interpreter::Execute(art::Thread*, art::CodeItemDataAccessor const&, art::ShadowFrame&, art::JValue, bool, bool) (.__uniq.112435418011751916792819755956732575238.llvm.4073957672844042480)+364) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #12 pc 00000000003d064c  /apex/com.android.art/lib64/libart.so (artQuickToInterpreterBridge+1020) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #13 pc 00000000002c2238  /apex/com.android.art/lib64/libart.so (art_quick_to_interpreter_bridge+88) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #14 pc 00000000008811ec  [anon_shmem:dalvik-jit-code-cache] (offset 0x2000000) (com.neoproc.neoproccamx.ai.Yuv420ImageTools.snapshot+684)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #15 pc 00000000008a3b70  [anon_shmem:dalvik-jit-code-cache] (offset 0x2000000) (com.neoproc.neoproccamx.pipeline.FramePipelineManager.snapshotRawYuvFrame+320)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #16 pc 000000000084ad3c  [anon_shmem:dalvik-jit-code-cache] (offset 0x2000000) (com.neoproc.neoproccamx.pipeline.FramePipelineManager.enqueue+2076)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #17 pc 00000000002aad94  /apex/com.android.art/lib64/libart.so (art_quick_invoke_stub+612) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #18 pc 0000000000586548  /apex/com.android.art/lib64/libart.so (bool art::interpreter::DoCall<false>(art::ArtMethod*, art::Thread*, art::ShadowFrame&, art::Instruction const*, unsigned short, bool, art::JValue*)+2688) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #19 pc 0000000000490f5c  /apex/com.android.art/lib64/libart.so (void art::interpreter::ExecuteSwitchImplCpp<false>(art::interpreter::SwitchImplContext*)+1484) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #20 pc 00000000003d12b8  /apex/com.android.art/lib64/libart.so (ExecuteSwitchImplAsm+8) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #21 pc 0000000000dfcce8  /data/app/~~c_o_eJHjALZbcAjzheQpeg==/com.neoproc.neoproccamx-0O6ZOlhSy7a6xwXl0cT0Cw==/oat/arm64/base.vdex (com.neoproc.neoproccamx.ui.CameraViewModel._init_$lambda$8+0)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #22 pc 00000000003d1e84  /apex/com.android.art/lib64/libart.so (art::interpreter::ArtInterpreterToInterpreterBridge(art::Thread*, art::CodeItemDataAccessor const&, art::ShadowFrame*, art::JValue*)+448) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #23 pc 0000000000586938  /apex/com.android.art/lib64/libart.so (bool art::interpreter::DoCall<false>(art::ArtMethod*, art::Thread*, art::ShadowFrame&, art::Instruction const*, unsigned short, bool, art::JValue*)+3696) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #24 pc 0000000000490b64  /apex/com.android.art/lib64/libart.so (void art::interpreter::ExecuteSwitchImplCpp<false>(art::interpreter::SwitchImplContext*)+468) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #25 pc 00000000003d12b8  /apex/com.android.art/lib64/libart.so (ExecuteSwitchImplAsm+8) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #26 pc 0000000000dfcc24  /data/app/~~c_o_eJHjALZbcAjzheQpeg==/com.neoproc.neoproccamx-0O6ZOlhSy7a6xwXl0cT0Cw==/oat/arm64/base.vdex (com.neoproc.neoproccamx.ui.CameraViewModel.$r8$lambda$qHMpmEf7H_qqfDSLczHcBelC3tU+0)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #27 pc 00000000003d1e84  /apex/com.android.art/lib64/libart.so (art::interpreter::ArtInterpreterToInterpreterBridge(art::Thread*, art::CodeItemDataAccessor const&, art::ShadowFrame*, art::JValue*)+448) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #28 pc 0000000000586938  /apex/com.android.art/lib64/libart.so (bool art::interpreter::DoCall<false>(art::ArtMethod*, art::Thread*, art::ShadowFrame&, art::Instruction const*, unsigned short, bool, art::JValue*)+3696) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #29 pc 0000000000490b64  /apex/com.android.art/lib64/libart.so (void art::interpreter::ExecuteSwitchImplCpp<false>(art::interpreter::SwitchImplContext*)+468) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #30 pc 00000000003d12b8  /apex/com.android.art/lib64/libart.so (ExecuteSwitchImplAsm+8) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #31 pc 0000000000dece98  /data/app/~~c_o_eJHjALZbcAjzheQpeg==/com.neoproc.neoproccamx-0O6ZOlhSy7a6xwXl0cT0Cw==/oat/arm64/base.vdex (com.neoproc.neoproccamx.ui.CameraViewModel$$ExternalSyntheticLambda35.invoke+0)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #32 pc 00000000003d1e84  /apex/com.android.art/lib64/libart.so (art::interpreter::ArtInterpreterToInterpreterBridge(art::Thread*, art::CodeItemDataAccessor const&, art::ShadowFrame*, art::JValue*)+448) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #33 pc 0000000000586938  /apex/com.android.art/lib64/libart.so (bool art::interpreter::DoCall<false>(art::ArtMethod*, art::Thread*, art::ShadowFrame&, art::Instruction const*, unsigned short, bool, art::JValue*)+3696) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #34 pc 0000000000491124  /apex/com.android.art/lib64/libart.so (void art::interpreter::ExecuteSwitchImplCpp<false>(art::interpreter::SwitchImplContext*)+1940) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #35 pc 00000000003d12b8  /apex/com.android.art/lib64/libart.so (ExecuteSwitchImplAsm+8) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #36 pc 0000000000c0659c  /data/app/~~c_o_eJHjALZbcAjzheQpeg==/com.neoproc.neoproccamx-0O6ZOlhSy7a6xwXl0cT0Cw==/oat/arm64/base.vdex (com.neoproc.neoproccamx.camera.CameraController.setupReaders$lambda$74$lambda$73+0)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #37 pc 00000000003d1e84  /apex/com.android.art/lib64/libart.so (art::interpreter::ArtInterpreterToInterpreterBridge(art::Thread*, art::CodeItemDataAccessor const&, art::ShadowFrame*, art::JValue*)+448) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #38 pc 0000000000586938  /apex/com.android.art/lib64/libart.so (bool art::interpreter::DoCall<false>(art::ArtMethod*, art::Thread*, art::ShadowFrame&, art::Instruction const*, unsigned short, bool, art::JValue*)+3696) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #39 pc 0000000000490b64  /apex/com.android.art/lib64/libart.so (void art::interpreter::ExecuteSwitchImplCpp<false>(art::interpreter::SwitchImplContext*)+468) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #40 pc 00000000003d12b8  /apex/com.android.art/lib64/libart.so (ExecuteSwitchImplAsm+8) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #41 pc 0000000000c0041c  /data/app/~~c_o_eJHjALZbcAjzheQpeg==/com.neoproc.neoproccamx-0O6ZOlhSy7a6xwXl0cT0Cw==/oat/arm64/base.vdex (com.neoproc.neoproccamx.camera.CameraController.$r8$lambda$Ce0HhKauJdVvr2nstPo3xd5K5BI+0)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #42 pc 00000000003d1e84  /apex/com.android.art/lib64/libart.so (art::interpreter::ArtInterpreterToInterpreterBridge(art::Thread*, art::CodeItemDataAccessor const&, art::ShadowFrame*, art::JValue*)+448) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #43 pc 0000000000586938  /apex/com.android.art/lib64/libart.so (bool art::interpreter::DoCall<false>(art::ArtMethod*, art::Thread*, art::ShadowFrame&, art::Instruction const*, unsigned short, bool, art::JValue*)+3696) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #44 pc 0000000000490b64  /apex/com.android.art/lib64/libart.so (void art::interpreter::ExecuteSwitchImplCpp<false>(art::interpreter::SwitchImplContext*)+468) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #45 pc 00000000003d12b8  /apex/com.android.art/lib64/libart.so (ExecuteSwitchImplAsm+8) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #46 pc 0000000000bf94bc  /data/app/~~c_o_eJHjALZbcAjzheQpeg==/com.neoproc.neoproccamx-0O6ZOlhSy7a6xwXl0cT0Cw==/oat/arm64/base.vdex (com.neoproc.neoproccamx.camera.CameraController$$ExternalSyntheticLambda18.onImageAvailable+0)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #47 pc 00000000003d0f18  /apex/com.android.art/lib64/libart.so (art::interpreter::Execute(art::Thread*, art::CodeItemDataAccessor const&, art::ShadowFrame&, art::JValue, bool, bool) (.__uniq.112435418011751916792819755956732575238.llvm.4073957672844042480)+364) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #48 pc 00000000003d064c  /apex/com.android.art/lib64/libart.so (artQuickToInterpreterBridge+1020) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #49 pc 00000000002c2238  /apex/com.android.art/lib64/libart.so (art_quick_to_interpreter_bridge+88) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #50 pc 000000000074478c  [anon_shmem:dalvik-jit-code-cache] (offset 0x2000000) (android.media.ImageReader$1.run+156)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #51 pc 00000000002178ac  [anon_shmem:dalvik-jit-code-cache] (offset 0x2000000) (android.os.Handler.handleCallback+140)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #52 pc 0000000000080968  [anon_shmem:dalvik-jit-code-cache] (offset 0x2000000) (android.os.Handler.dispatchMessage+136)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #53 pc 000000000007c944  [anon_shmem:dalvik-jit-code-cache] (offset 0x2000000) (android.os.Looper.loopOnce+1540)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #54 pc 000000000007a6bc  [anon_shmem:dalvik-jit-code-cache] (offset 0x2000000) (android.os.Looper.loop+252)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #55 pc 00000000000eb508  [anon_shmem:dalvik-jit-code-cache] (offset 0x2000000) (android.os.HandlerThread.run+312)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #56 pc 00000000002aad94  /apex/com.android.art/lib64/libart.so (art_quick_invoke_stub+612) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #57 pc 00000000002707ac  /apex/com.android.art/lib64/libart.so (art::ArtMethod::Invoke(art::Thread*, unsigned int*, unsigned int, art::JValue*, char const*)+220) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #58 pc 00000000004bdc28  /apex/com.android.art/lib64/libart.so (art::Thread::CreateCallback(void*)+1184) (BuildId: 7087b2f2160bfbf3335d54ba9779e325)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #59 pc 00000000000cc418  /apex/com.android.runtime/lib64/bionic/libc.so (__pthread_start(void*)+184) (BuildId: d791ec771dcf8ff35203892b98bc3c9c)
+04-22 22:45:49.376 10010 10010 F DEBUG   :       #60 pc 00000000000be774  /apex/com.android.runtime/lib64/bionic/libc.so (__start_thread+68) (BuildId: d791ec771dcf8ff35203892b98bc3c9c)

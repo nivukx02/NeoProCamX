@@ -1,0 +1,33 @@
+{
+  "formatVersion": "SINGULARITY_ASSET_MANIFEST_1",
+  "kind": "LUT",
+  "entries": [
+    {
+      "assetId": "nvx_cinema_neutral",
+      "file": "nivukx_vision/luts/nvx_cinema_neutral.cube",
+      "fileHashSha256": "8354a8c5532f3f76edbcbcd396ed5228a8892af564355f11caabfaac257e8bd1",
+      "stageIds": [204, 205, 206, 217],
+      "minimumReleaseClass": "SINGULARITY-50",
+      "identityAtZeroStrength": true,
+      "available": true
+    },
+    {
+      "assetId": "nvx_filmic_warm",
+      "file": "nivukx_vision/luts/nvx_filmic_warm.cube",
+      "fileHashSha256": "3e88af13e5484502f8c293f7c21615400aa87fc6e9f054e6a73de7612b23fb73",
+      "stageIds": [204, 205, 206, 217],
+      "minimumReleaseClass": "SINGULARITY-50",
+      "identityAtZeroStrength": true,
+      "available": true
+    },
+    {
+      "assetId": "nvx_vivid_neon",
+      "file": "nivukx_vision/luts/nvx_vivid_neon.cube",
+      "fileHashSha256": "038eb64755588f58567ef3dc64c9b6854c4167612721ffadca9c9fe3bdb62d30",
+      "stageIds": [200, 204, 205, 206],
+      "minimumReleaseClass": "SINGULARITY-50",
+      "identityAtZeroStrength": true,
+      "available": true
+    }
+  ]
+}

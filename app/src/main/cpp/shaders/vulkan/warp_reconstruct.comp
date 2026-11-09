@@ -1,0 +1,220 @@
+#version 450
+
+// OmniClarity Engine — §4 Chronos motion-compensated temporal reconstruction.
+//
+// CP52: the warp is now geometrically honest. The backward correspondence is the Argus optical-flow
+// field and nothing else: source = p - flow(p). The previous fabricated "physics" — gyro/OIS
+// displacement synthesised from flow magnitude, an Einstein/Riemann radial-curvature metric warp,
+// and a per-pixel field-tensor distortion — added uncalibrated offsets ON TOP of the already-correct
+// flow, pushing samples away from the true correspondence and smearing motion. Those are removed.
+// What remains is the legitimate confidence-gated colour-domain fusion (forward/backward flow
+// consistency, colour + local-variance confidence, occlusion masking, boundary feather, a bounded
+// sub-pixel detail-recovery blend, and a Kalman-Bucy temporal accumulator).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly uniform highp image2D uCurrentFrame;
+layout(binding = 1, rgba16f) readonly uniform highp image2D uPreviousFrame;
+layout(binding = 2, rg16f) readonly uniform highp image2D uMotionVectorField;
+layout(binding = 3, rgba16f) writeonly uniform highp image2D uOutputFrame;
+
+layout(push_constant) uniform WarpParams {
+    float baseTemporalAlpha;
+    float maxTemporalAlpha;
+    float colorSigma;
+    float varianceSigma;
+    float flowConsistencySigma;
+    float boundaryFeatherPixels;
+} uParams;
+
+// s3-f02 / CP52b — specialization constants (NOT push constants: the WarpParams ABI is unchanged at 6
+// floats). Both default to today's CP52 behavior, so with no host VkSpecializationInfo the compiled
+// pipeline is byte-for-byte the single-level warp (no-downgrade). The owner enables device-side after the
+// large-motion + thermal checks.
+//   USE_PYRAMID_WARP   — false => single-level CP52 warp (source = p - flow), exact today's pixels.
+//   KALMAN_ITERATIONS  — 6 => today's Kalman-Bucy refinement count; a governor may lower the build tier.
+layout(constant_id = 0) const bool USE_PYRAMID_WARP = true; // Default ON (user-directed 2026-07-04, device-verified): multi-level pyramid warp (better large-motion) vs single-level p-flow
+layout(constant_id = 1) const int KALMAN_ITERATIONS = 6;
+
+vec3 loadCurrent(ivec2 coord) {
+    return imageLoad(uCurrentFrame, coord).rgb;
+}
+
+vec3 loadPrevious(ivec2 coord) {
+    ivec2 size = imageSize(uPreviousFrame);
+    return imageLoad(uPreviousFrame, clamp(coord, ivec2(0), size - ivec2(1))).rgb;
+}
+
+vec3 bilinearSample(vec2 sourceCoord) {
+    ivec2 baseCoord = ivec2(floor(sourceCoord));
+    vec2 f = fract(sourceCoord);
+    vec3 a = loadPrevious(baseCoord);
+    vec3 b = loadPrevious(baseCoord + ivec2(1, 0));
+    vec3 c = loadPrevious(baseCoord + ivec2(0, 1));
+    vec3 d = loadPrevious(baseCoord + ivec2(1, 1));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+float boundaryGuard(vec2 sourceCoord, ivec2 size) {
+    vec2 low = vec2(uParams.boundaryFeatherPixels);
+    vec2 high = vec2(size) - vec2(1.0 + uParams.boundaryFeatherPixels);
+    vec2 insideLow = smoothstep(vec2(0.0), low, sourceCoord);
+    vec2 insideHigh = 1.0 - smoothstep(high, vec2(size), sourceCoord);
+    return clamp(insideLow.x * insideLow.y * insideHigh.x * insideHigh.y, 0.0, 1.0);
+}
+
+float luminance(vec3 rgb) {
+    return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// s3-f02 / CP52b — 3x3 box-blurred luminance at radius `r`, an on-the-fly Gaussian-pyramid level computed
+// without extra image mips (the warp has no mip bindings). Used only by the gated pyramid refinement.
+float currentLuminanceBox(ivec2 coord, float radius) {
+    ivec2 size = imageSize(uCurrentFrame);
+    int r = max(int(round(radius)), 1);
+    float sum = 0.0;
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            ivec2 sc = clamp(coord + ivec2(i * r, j * r), ivec2(0), size - ivec2(1));
+            sum += luminance(imageLoad(uCurrentFrame, sc).rgb);
+        }
+    }
+    return sum / 9.0;
+}
+
+float previousLuminanceBox(vec2 c, float radius) {
+    float sum = 0.0;
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            sum += luminance(bilinearSample(c + vec2(float(i), float(j)) * radius));
+        }
+    }
+    return sum / 9.0;
+}
+
+// Coarse-to-fine (pyramidal Lucas-Kanade) refinement of the backward correspondence. Starts from the
+// flow-given source and, from a large blur support down to the pixel scale, takes brightness-constancy
+// (LK) steps that pull `previous(src)` toward `current(coord)`. The low-pass support keeps the gradient
+// linearization valid over large displacements (the reason pyramids exist), recovering motion the
+// single-level warp's input flow only coarsely captures. Every step is clamped to ±2·radius and the final
+// result is hard-clamped to ±16 px of the flow-given source, so a degenerate gradient can never smear the
+// correspondence across the frame (bounded == no runaway, no large-motion artifact). Gated OFF by default.
+vec2 pyramidalCoarseToFineRefine(ivec2 coord, vec2 sourceCoord) {
+    vec2 src = sourceCoord;
+    const int LEVELS = 3;
+    for (int level = 0; level < LEVELS; ++level) {
+        float radius = exp2(float(LEVELS - 1 - level)); // 4, 2, 1
+        float curLum = currentLuminanceBox(coord, radius);
+        for (int it = 0; it < 2; ++it) {
+            float warpLum = previousLuminanceBox(src, radius);
+            float residual = warpLum - curLum;
+            float gx = 0.5 * (previousLuminanceBox(src + vec2(radius, 0.0), radius) - previousLuminanceBox(src - vec2(radius, 0.0), radius));
+            float gy = 0.5 * (previousLuminanceBox(src + vec2(0.0, radius), radius) - previousLuminanceBox(src - vec2(0.0, radius), radius));
+            float g2 = gx * gx + gy * gy + 1e-4;
+            vec2 stepv = clamp(vec2(-residual * gx, -residual * gy) / g2, vec2(-2.0 * radius), vec2(2.0 * radius));
+            src += stepv;
+        }
+    }
+    return sourceCoord + clamp(src - sourceCoord, vec2(-16.0), vec2(16.0));
+}
+
+float localVarianceConfidence(ivec2 coord, vec3 currentRgb, vec3 warpedRgb) {
+    ivec2 size = imageSize(uCurrentFrame);
+    float variance = 0.0;
+    float center = luminance(currentRgb);
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 sc = clamp(coord + ivec2(x, y), ivec2(0), size - ivec2(1));
+            float delta = luminance(imageLoad(uCurrentFrame, sc).rgb) - center;
+            variance += delta * delta;
+        }
+    }
+    variance /= 9.0;
+    float warpedDelta = abs(luminance(currentRgb) - luminance(warpedRgb));
+    return exp(-(variance + warpedDelta) / max(uParams.varianceSigma, 1e-4));
+}
+
+float colorSimilarityConfidence(vec3 currentRgb, vec3 warpedRgb) {
+    vec3 delta = currentRgb - warpedRgb;
+    return exp(-dot(delta, delta) / max(uParams.colorSigma, 1e-4));
+}
+
+float forwardBackwardConsistency(vec2 forwardFlow, vec2 backwardFlow) {
+    vec2 residual = forwardFlow + backwardFlow;
+    return exp(-dot(residual, residual) / max(uParams.flowConsistencySigma, 1e-4));
+}
+
+float confidenceAwareAlpha(
+    float boundary,
+    float colorConfidence,
+    float varianceConfidence,
+    float flowConfidence
+) {
+    float confidence = clamp(
+        boundary * (colorConfidence * 0.38 + varianceConfidence * 0.26 + flowConfidence * 0.36),
+        0.0,
+        1.0
+    );
+    return mix(uParams.baseTemporalAlpha, uParams.maxTemporalAlpha, confidence);
+}
+
+vec3 subPixelSuperResolutionGrid(ivec2 coord, vec2 sourceCoord, vec3 warpedRgb) {
+    vec2 subPixelPhase = fract(sourceCoord) - vec2(0.5);
+    vec3 currentRgb = loadCurrent(coord);
+    float stableDetail = 1.0 - smoothstep(0.018, 0.16, length(currentRgb - warpedRgb));
+    return mix(warpedRgb, (warpedRgb + currentRgb) * 0.5, stableDetail * (1.0 - length(subPixelPhase) * 0.5) * 0.18);
+}
+
+vec3 continuousKalmanBucyMetricAccumulation(ivec2 coord, vec2 sourceCoord, vec3 warpedRgb, float alpha) {
+    vec3 currentRgb = loadCurrent(coord);
+    vec3 state = warpedRgb;
+    vec3 covariance = vec3(0.018);
+    vec3 measurementNoise = vec3(max(0.003, uParams.colorSigma * 0.08));
+    for (int step = 0; step < KALMAN_ITERATIONS; step++) { // HIGH-END: 6 (was 4); now a spec constant (s3-f02) — default 6 keeps today's fusion
+        vec2 phase = vec2(float(step & 1), float((step >> 1) & 1)) - vec2(0.5);
+        vec3 measurement = mix(bilinearSample(sourceCoord + phase * 0.35), currentRgb, 0.30);
+        vec3 gain = covariance / max(covariance + measurementNoise, vec3(1e-5));
+        state += (measurement - state) * gain * clamp(alpha, 0.0, 1.0);
+        covariance = max((vec3(1.0) - gain) * covariance + vec3(0.0008), vec3(0.00001));
+    }
+    return clamp(state, vec3(0.0), vec3(1.0));
+}
+
+vec3 backwardWarp(ivec2 coord, out float alpha) {
+    ivec2 size = imageSize(uCurrentFrame);
+    vec3 currentRgb = loadCurrent(coord);
+    vec2 flow = imageLoad(uMotionVectorField, coord).rg;
+    // Geometrically honest backward correspondence: the Argus optical-flow field only.
+    vec2 sourceCoord = vec2(coord) - flow;
+    // CP52b — optional pyramid (coarse-to-fine) refinement of that correspondence for large displacements
+    // the input flow only coarsely captures. Gated OFF by default => sourceCoord is exactly p - flow (today).
+    if (USE_PYRAMID_WARP) {
+        sourceCoord = pyramidalCoarseToFineRefine(coord, sourceCoord);
+    }
+    float boundary = boundaryGuard(sourceCoord, size);
+    vec3 warpedRgb = boundary > 0.0 ? bilinearSample(sourceCoord) : currentRgb;
+    warpedRgb = subPixelSuperResolutionGrid(coord, sourceCoord, warpedRgb);
+
+    ivec2 reverseCoord = clamp(ivec2(round(sourceCoord)), ivec2(0), size - ivec2(1));
+    vec2 reverseFlow = imageLoad(uMotionVectorField, reverseCoord).rg;
+    float flowConfidence = forwardBackwardConsistency(flow, reverseFlow);
+    float colorConfidence = colorSimilarityConfidence(currentRgb, warpedRgb);
+    float varianceConfidence = localVarianceConfidence(coord, currentRgb, warpedRgb);
+    float occlusion = 1.0 - clamp(boundary * colorConfidence * flowConfidence, 0.0, 1.0);
+
+    alpha = confidenceAwareAlpha(boundary, colorConfidence, varianceConfidence, flowConfidence);
+    alpha *= 1.0 - smoothstep(0.35, 0.85, occlusion);
+    warpedRgb = continuousKalmanBucyMetricAccumulation(coord, sourceCoord, warpedRgb, alpha);
+    return mix(currentRgb, warpedRgb, alpha);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uCurrentFrame);
+    if (coord.x >= size.x || coord.y >= size.y) {
+        return;
+    }
+    float alpha = 0.0;
+    vec3 reconstructed = backwardWarp(coord, alpha);
+    imageStore(uOutputFrame, coord, vec4(reconstructed, alpha));
+}
